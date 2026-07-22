@@ -15,7 +15,8 @@ An HTTP/1.1, HTTP/2, and HTTP/3 library for Zig 0.17, built on the `std.Io` asyn
 - **HTTPS / TLS** — server and client TLS via [OpenSSL](https://github.com/openssl/openssl)
 - **CONNECT Proxy** — SSRF protection with private IP blocking and host/port allowlists
 - **Cookies** — RFC 6265 cookie parsing and Set-Cookie generation with Secure, HttpOnly, SameSite, Max-Age, Domain, Path
-- **RFC 2616 / RFC 9113 Compliant** — HTTP date parsing, path traversal protection, TRACE support (off by default)
+- **High Performance** — SIMD-accelerated ASCII lowercasing & CR/LF scanning (@Vector 16-byte SIMD), zero-allocation request parsing, lock-free CLOSE-WAIT sweeper
+- **RFC 2616 / RFC 9113 / RFC 9114 Compliant** — HTTP date parsing, path traversal protection, TRACE support (off by default)
 
 ## Quick Start
 
@@ -532,12 +533,25 @@ try h3.quic.enableQLog("trace.qlog"); // Wireshark-compatible
 defer h3.quic.disableQLog();
 ```
 
+### Alt-Svc Advertisement (HTTP/3 Discovery)
+
+Advertise your HTTP/3 endpoint to HTTP/1.1 and HTTP/2 clients via the `Alt-Svc` header (RFC 7838 / RFC 9114):
+
+```zig
+var server = httpz.Server.init(.{
+    .port = 443,
+    .address = "0.0.0.0",
+    .alt_svc_port = 4433, // Advertises Alt-Svc: h3=":4433"; ma=86400
+}, handler);
+```
+
 ### Protocol Details
 
 - QUIC transport via ngtcp2 (UDP, TLS 1.3, stream multiplexing)
 - HTTP/3 framing via nghttp3 (QPACK header compression)
 - 0-RTT early data support
 - Connection migration (CID rotation, path validation)
+- Automatic `Alt-Svc` header advertisement on HTTPS responses
 - QLog output for Wireshark/qvis analysis
 
 ### Dependencies

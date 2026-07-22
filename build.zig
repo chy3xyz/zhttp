@@ -67,6 +67,7 @@ pub fn build(b: *std.Build) void {
     httpz_mod.linkSystemLibrary("crypto", .{});
     if (h3) {
         httpz_mod.linkSystemLibrary("ngtcp2", .{});
+        httpz_mod.linkSystemLibrary("ngtcp2_crypto_ossl", .{});
         httpz_mod.linkSystemLibrary("nghttp3", .{});
     }
     httpz_mod.link_libc = true;
@@ -81,6 +82,8 @@ pub fn build(b: *std.Build) void {
         "server_router",
         "server_streaming",
         "server_repro",
+        "server_h3",
+        "client_h3",
     };
 
     inline for (examples) |name| {
@@ -101,7 +104,6 @@ pub fn build(b: *std.Build) void {
         const run_step = b.step("example_" ++ name, "Run the " ++ name ++ " example");
         const run_cmd = b.addRunArtifact(example_exe);
         run_step.dependOn(&run_cmd.step);
-        run_cmd.step.dependOn(b.getInstallStep());
     }
 
     // Module tests

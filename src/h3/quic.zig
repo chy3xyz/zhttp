@@ -128,7 +128,7 @@ pub const Connection = struct {
     }
 };
 
-fn recvStreamDataCb(
+pub fn recvStreamDataCb(
     conn: ?*ngtcp2.ngtcp2_conn,
     flags: u32,
     stream_id: i64,
@@ -238,8 +238,8 @@ pub fn connect(host: []const u8, port: u16, stream_ctx: ?StreamDataCtx, _: ?[]co
     var scid: ngtcp2.ngtcp2_cid = undefined;
     dcid.datalen = 18;
     scid.datalen = 18;
-    _ = posix.system.getrandom(&dcid.data, 18, 0);
-    _ = posix.system.getrandom(&scid.data, 18, 0);
+    std.c.arc4random_buf(&dcid.data, 18);
+    std.c.arc4random_buf(&scid.data, 18);
 
     var callbacks: ngtcp2.ngtcp2_callbacks = std.mem.zeroes(ngtcp2.ngtcp2_callbacks);
     callbacks.client_initial = ngtcp2.ngtcp2_crypto_client_initial_cb;
@@ -294,7 +294,8 @@ pub fn connect(host: []const u8, port: u16, stream_ctx: ?StreamDataCtx, _: ?[]co
 
     const user_data: ?*anyopaque = if (stream_ctx_ptr) |ptr| @ptrCast(ptr) else null;
     var conn_ptr: ?*ngtcp2.ngtcp2_conn = null;
-    const ret = ngtcp2.ngtcp2_conn_client_new(&conn_ptr, &dcid, &scid, &path, ngtcp2.NGTCP2_PROTO_VER_V1, &callbacks, &settings, &params, user_data, null);
+    const mem: ?*const ngtcp2.struct_ngtcp2_mem = null;
+    const ret = ngtcp2.ngtcp2_conn_client_new(&conn_ptr, &dcid, &scid, &path, ngtcp2.NGTCP2_PROTO_VER_V1, &callbacks, &settings, &params, mem, user_data);
     if (ret != 0) return error.QuicError;
 
     // Enable 0-RTT early data with remembered transport params (deferred)
@@ -339,6 +340,9 @@ pub const Listener = struct {
         const sock: posix.fd_t = @intCast(posix.system.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP));
         if (sock < 0) return error.QuicError;
         errdefer _ = std.c.close(sock);
+
+        const enable: c_int = 1;
+        _ = posix.system.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, @ptrCast(&enable), @sizeOf(c_int));
 
         const addr = posix.sockaddr.in{
             .family = posix.AF.INET,

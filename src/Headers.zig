@@ -122,8 +122,16 @@ fn isTokenChar(c: u8) bool {
 /// Check if a string contains CR or LF characters.
 /// RFC 7230 Section 3.2.6: Field values must not contain bare CR or LF.
 fn containsCrlf(s: []const u8) bool {
-    for (s) |c| {
-        if (c == '\r' or c == '\n') return true;
+    var i: usize = 0;
+    // SIMD 16-byte vector scan for \r or \n
+    while (i + 16 <= s.len) : (i += 16) {
+        const chunk: @Vector(16, u8) = s[i..][0..16].*;
+        const is_cr = chunk == @as(@Vector(16, u8), @splat('\r'));
+        const is_lf = chunk == @as(@Vector(16, u8), @splat('\n'));
+        if (@reduce(.Or, is_cr | is_lf)) return true;
+    }
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '\r' or s[i] == '\n') return true;
     }
     return false;
 }
@@ -132,8 +140,25 @@ fn containsCrlf(s: []const u8) bool {
 /// RFC 2616 Section 4.2: Field names are case-insensitive.
 pub fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (toLower(ca) != toLower(cb)) return false;
+    var i: usize = 0;
+    // SIMD 16-byte vector lowercasing & comparison
+    while (i + 16 <= a.len) : (i += 16) {
+        const va: @Vector(16, u8) = a[i..][0..16].*;
+        const vb: @Vector(16, u8) = b[i..][0..16].*;
+
+        const is_upper_a = (va >= @as(@Vector(16, u8), @splat('A'))) & (va <= @as(@Vector(16, u8), @splat('Z')));
+        const is_upper_b = (vb >= @as(@Vector(16, u8), @splat('A'))) & (vb <= @as(@Vector(16, u8), @splat('Z')));
+
+        const add_32: @Vector(16, u8) = @splat(32);
+        const add_0: @Vector(16, u8) = @splat(0);
+
+        const lower_a = va + @select(u8, is_upper_a, add_32, add_0);
+        const lower_b = vb + @select(u8, is_upper_b, add_32, add_0);
+
+        if (@reduce(.Or, lower_a != lower_b)) return false;
+    }
+    while (i < a.len) : (i += 1) {
+        if (toLower(a[i]) != toLower(b[i])) return false;
     }
     return true;
 }

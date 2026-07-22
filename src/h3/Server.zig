@@ -104,7 +104,20 @@ pub const Server = struct {
 
         var conn_ptr: ?*ngtcp2.ngtcp2_conn = null;
         const mem: ?*const ngtcp2.struct_ngtcp2_mem = null;
-        const ret = ngtcp2.ngtcp2_conn_server_new(&conn_ptr, &client_dcid, &server_scid, &path, ngtcp2.NGTCP2_PROTO_VER_V1, &callbacks, &settings, &params, mem, @as(?*anyopaque, @ptrCast(&self.listener)));
+        // Create H3 server session and serve
+        var h3_session = http3.Session.initServer(self.allocator) catch return;
+        defer h3_session.deinit();
+
+        const ctx_ptr = try self.allocator.create(quic.StreamDataCtx);
+        ctx_ptr.* = quic.StreamDataCtx{
+            .h3_conn = @ptrCast(h3_session.conn),
+            .recv_stream_data = onQuicServerStreamData,
+        };
+        errdefer self.allocator.destroy(ctx_ptr);
+
+        callbacks.recv_stream_data = quic.recvStreamDataCb;
+
+        const ret = ngtcp2.ngtcp2_conn_server_new(&conn_ptr, &client_dcid, &server_scid, &path, ngtcp2.NGTCP2_PROTO_VER_V1, &callbacks, &settings, &params, mem, @as(?*anyopaque, @ptrCast(ctx_ptr)));
         if (ret != 0) return error.QuicError;
         errdefer ngtcp2.ngtcp2_conn_del(conn_ptr.?);
 
@@ -119,7 +132,9 @@ pub const Server = struct {
             .socket = self.listener.socket,
         };
 
-        try self.listener.connections.put(server_scid.data, conn);
+        var scid_key: [18]u8 = undefined;
+        @memcpy(&scid_key, server_scid.data[0..18]);
+        try self.listener.connections.put(scid_key, conn);
         _ = try quic.flushPackets(conn);
 
         // Drive handshake
@@ -129,18 +144,55 @@ pub const Server = struct {
             sleepNs(10 * std.time.ns_per_ms);
         }
 
-        // Create H3 server session and serve
-        var h3_session = http3.Session.initServer(self.allocator) catch return;
-        defer h3_session.deinit();
+        conn.stream_ctx_alloc = ctx_ptr;
 
-        // Poll for H3 data
-        for (0..200) |_| {
+        // Poll for H3 data and dispatch requests
+        const start = nowNanos();
+        while (nowNanos() - start < 10 * std.time.ns_per_s) {
             quic.readPacket(conn) catch {};
+            pumpServerWrites(&h3_session, conn);
             _ = quic.flushPackets(conn) catch {};
-            sleepNs(10 * std.time.ns_per_ms);
+            sleepNs(1 * std.time.ns_per_ms);
         }
     }
 };
+
+fn onQuicServerStreamData(h3_conn: *anyopaque, stream_id: i64, data: []const u8, fin: bool) void {
+    const conn: *nghttp3.nghttp3_conn = @alignCast(@ptrCast(h3_conn));
+    _ = nghttp3.nghttp3_conn_read_stream2(conn, stream_id, data.ptr, data.len, @intFromBool(fin), 0);
+}
+
+fn pumpServerWrites(session: *http3.Session, quic_conn: *quic.Connection) void {
+    while (true) {
+        var write_stream_id: i64 = -1;
+        var write_fin: c_int = 0;
+        var vec: nghttp3.nghttp3_vec = undefined;
+        const nvec = nghttp3.nghttp3_conn_writev_stream(session.conn, &write_stream_id, &write_fin, &vec, 1);
+        if (nvec < 0) break;
+        if (write_stream_id == -1) break;
+        if (nvec > 0) {
+            var pi: ngtcp2.ngtcp2_pkt_info = undefined;
+            var dest: ngtcp2.ngtcp2_path = .{ .local = .{}, .remote = .{} };
+            const nwritten = ngtcp2.ngtcp2_conn_write_stream_versioned(
+                quic_conn.conn,
+                &dest,
+                ngtcp2.NGTCP2_PKT_INFO_VERSION,
+                &pi,
+                &quic_conn.buf,
+                quic_conn.buf.len,
+                null,
+                0,
+                write_stream_id,
+                vec.base,
+                vec.len,
+                nowNanos(),
+            );
+            _ = nghttp3.nghttp3_conn_add_write_offset(session.conn, write_stream_id, if (nwritten > 0) @as(usize, @intCast(nwritten)) else 0);
+        } else if (write_fin != 0) {
+            _ = nghttp3.nghttp3_conn_add_write_offset(session.conn, write_stream_id, 0);
+        }
+    }
+}
 
 fn sleepNs(ns: u64) void {
     const req = posix.timespec{

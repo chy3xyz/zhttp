@@ -210,7 +210,7 @@ src/
 
 # HTTP/3 Development Record (RFC 9114)
 
-> **Status: Phase 1 Complete** — QUIC transport + H3 session layer implemented. Request/response dispatch pending.
+> **Status: Complete** — QUIC transport, H3 session layer, client request/response, and server dispatch fully implemented.
 
 ## Approach
 
@@ -232,12 +232,12 @@ Bound to ngtcp2 (QUIC) and nghttp3 (HTTP/3) via translate-C, same pattern as Ope
 
 ## Remaining
 
-- [ ] **Client request/response** — nghttp3 submit_request + recv_data callbacks → httpz.Response
-- [ ] **Server dispatch** — CID routing + accept loop + nghttp3 recv_header → httpz.Request → handler
-- [ ] **QPACK integration** — nghttp3 encoder/decoder stream binding
+- [x] **Client request/response** — nghttp3 submit_request + recv_data callbacks → httpz.Response
+- [x] **Server dispatch** — CID routing + accept loop + nghttp3 recv_header → httpz.Request → handler
+- [x] **QPACK integration** — nghttp3 encoder/decoder stream binding
 - [ ] **0-RTT** — early data support
 - [ ] **Connection migration** — path validation
-- [ ] **QLog / debugging** — ngtcp2 QLog integration for Wireshark
+- [x] **QLog / debugging** — ngtcp2 QLog integration for Wireshark
 
 ## File Structure
 

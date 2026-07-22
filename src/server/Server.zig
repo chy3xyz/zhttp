@@ -76,6 +76,10 @@ pub const Config = struct {
     /// When set, the server performs a TLS handshake on each accepted
     /// connection and serves HTTP over the encrypted channel.
     tls_config: ?tls.config.Server = null,
+    /// Optional HTTP/3 UDP port for Alt-Svc header advertisement (RFC 7838 / RFC 9114).
+    /// When non-zero, the server automatically appends `Alt-Svc: h3=":port"; ma=86400`
+    /// to HTTPS responses.
+    alt_svc_port: u16 = 0,
     /// CLOSE-WAIT sweeper interval, in milliseconds. The sweeper polls all
     /// active connection fds for POLLRDHUP and forces `shutdown(SHUT_RDWR)`
     /// on any that the peer has closed. This breaks a handler thread that
@@ -535,6 +539,18 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
         // RFC 2616 Section 14.45: Add Via header for proxied responses.
         if (self.config.enable_proxy) {
             Proxy.addViaHeader(&response, request.version);
+        }
+
+        // RFC 7838 / RFC 9114: Advertise HTTP/3 Alt-Svc if configured.
+        if (self.config.alt_svc_port > 0) {
+            var alt_svc_buf: [64]u8 = undefined;
+            const alt_svc_val = std.fmt.bufPrint(&alt_svc_buf, "h3=\":{d}\"; ma=86400", .{self.config.alt_svc_port}) catch null;
+            if (alt_svc_val) |val| {
+                const val_dupe = request_allocator.dupe(u8, val) catch null;
+                if (val_dupe) |vd| {
+                    response.headers.appendServer("Alt-Svc", vd);
+                }
+            }
         }
 
         // Serialize and send response

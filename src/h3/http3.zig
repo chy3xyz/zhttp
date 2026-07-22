@@ -41,8 +41,11 @@ pub const Session = struct {
         callbacks.recv_data = recvDataCb;
         callbacks.end_stream = endStreamCb;
 
+        var settings: nghttp3.nghttp3_settings = undefined;
+        nghttp3.nghttp3_settings_default(&settings);
+
         var conn_ptr: ?*nghttp3.nghttp3_conn = null;
-        const ret = nghttp3.nghttp3_conn_client_new(&conn_ptr, &callbacks, null, null, null);
+        const ret = nghttp3.nghttp3_conn_client_new(&conn_ptr, &callbacks, &settings, null, null);
         if (ret != 0) return error.H3Error;
 
         return .{
@@ -60,8 +63,11 @@ pub const Session = struct {
         callbacks.recv_data = recvDataCb;
         callbacks.end_stream = endStreamCb;
 
+        var settings: nghttp3.nghttp3_settings = undefined;
+        nghttp3.nghttp3_settings_default(&settings);
+
         var conn_ptr: ?*nghttp3.nghttp3_conn = null;
-        const ret = nghttp3.nghttp3_conn_server_new(&conn_ptr, &callbacks, null, null, null);
+        const ret = nghttp3.nghttp3_conn_server_new(&conn_ptr, &callbacks, &settings, null, null);
         if (ret != 0) return error.H3Error;
 
         return .{
