@@ -223,6 +223,80 @@ httpz.middleware.cors.init(.{
 });
 ```
 
+### Security Headers Middleware
+
+Applies standard security hardening headers to HTTP responses:
+
+```zig
+const sec = httpz.middleware.security_headers;
+
+// In your handler or middleware chain:
+sec.apply(&response, .{
+    .x_content_type_options = "nosniff",
+    .x_frame_options = "DENY",
+    .hsts = "max-age=31536000; includeSubDomains",
+    .content_security_policy = "default-src 'self'",
+});
+```
+
+### Rate Limiter Middleware
+
+Token-bucket rate limiter per IP or custom key:
+
+```zig
+var limiter = httpz.middleware.rate_limit.RateLimiter.init(allocator, 100, 10); // max 100 tokens, 10 tokens/sec refill
+defer limiter.deinit();
+
+// Returns false and sets 429 status when limit exceeded:
+if (!try limiter.enforce(client_ip, &response)) return response;
+```
+
+### Compression Options
+
+Configure minimum body size threshold before applying Gzip compression:
+
+```zig
+const compress = httpz.middleware.compression;
+
+// Only compress responses >= 1024 bytes (1 KB):
+const handler = compress.wrapWithOptions(innerHandler, .{ .min_size_bytes = 1024 });
+```
+
+## Request & Response Helpers
+
+### JSON Helper
+
+```zig
+// Parse JSON request body
+const payload = try request.json(MyStruct, allocator);
+defer payload.deinit();
+
+// Send JSON response
+return try httpz.Response.json(allocator, .{ .success = true, .data = "hello" }, .ok);
+```
+
+### Query Parameters & Header Helpers
+
+```zig
+// Query parameter: GET /search?q=zig&page=2
+const query_str = request.query("q") orelse "";
+
+// Header inspection:
+if (request.isJson()) { ... }
+if (request.isForm()) { ... }
+if (request.isMultipart()) { ... }
+
+// Auth token helpers:
+const token = request.bearerToken(); // extracts token from "Authorization: Bearer <token>"
+
+var buf: [64]u8 = undefined;
+if (request.basicAuth(&buf)) |creds| {
+    // creds.username, creds.password
+} else {
+    return httpz.Response.requireBasicAuth("Admin Realm");
+}
+```
+
 ## Cookies
 
 `httpz.Cookie` provides RFC 6265 cookie parsing from requests and `Set-Cookie` header generation for responses.
@@ -633,6 +707,9 @@ sudo dnf install openssl-devel libngtcp2-devel libnghttp3-devel
 ```sh
 # Run all tests (unit + integration)
 zig build test
+
+# Run micro-benchmarks
+zig build bench
 
 # Run integration tests only
 zig build test-integration
