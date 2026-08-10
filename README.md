@@ -1,4 +1,4 @@
-# httpz
+# zhttp
 
 An HTTP/1.1, HTTP/2, and HTTP/3 library for Zig 0.17, built on the `std.Io` async model.
 
@@ -11,7 +11,7 @@ An HTTP/1.1, HTTP/2, and HTTP/3 library for Zig 0.17, built on the `std.Io` asyn
 - **Router** — path parameters (`:id`), catch-all segments (`*rest`), AIP-136 custom methods (`:archive`), comptime dispatch, custom 404 handlers
 - **WebSocket** — RFC 6455 upgrade, text/binary frames, fragmentation reassembly, per-route handlers
 - **Streaming Responses** — chunked encoding, Server-Sent Events, zero-copy file serving
-- **Middleware** — CORS and gzip compression via composable `wrap` functions
+- **Middleware** — CORS, security headers, rate limiting, and gzip compression via composable `wrap` functions
 - **HTTPS / TLS** — server and client TLS via [OpenSSL](https://github.com/openssl/openssl)
 - **CONNECT Proxy** — SSRF protection with private IP blocking and host/port allowlists
 - **Cookies** — RFC 6265 cookie parsing and Set-Cookie generation with Secure, HttpOnly, SameSite, Max-Age, Domain, Path
@@ -22,10 +22,10 @@ An HTTP/1.1, HTTP/2, and HTTP/3 library for Zig 0.17, built on the `std.Io` asyn
 
 ```zig
 const std = @import("std");
-const httpz = @import("httpz");
+const zhttp = @import("zhttp");
 
 pub fn main(init: std.process.Init) !void {
-    var server = httpz.Server.init(.{
+    var server = zhttp.Server.init(.{
         .port = 8080,
         .address = "127.0.0.1",
     }, handler);
@@ -38,11 +38,11 @@ pub fn main(init: std.process.Init) !void {
     };
 }
 
-fn handler(_: std.mem.Allocator, _: std.Io, request: *const httpz.Request) httpz.Response {
+fn handler(_: std.mem.Allocator, _: std.Io, request: *const zhttp.Request) zhttp.Response {
     if (std.mem.eql(u8, request.uri, "/")) {
-        return httpz.Response.init(.ok, "text/plain", "Hello from httpz!");
+        return zhttp.Response.init(.ok, "text/plain", "Hello from zhttp!");
     }
-    return httpz.Response.init(.not_found, "text/plain", "Not Found");
+    return zhttp.Response.init(.not_found, "text/plain", "Not Found");
 }
 ```
 
@@ -51,15 +51,15 @@ Handlers receive a per-request arena allocator, an `std.Io` instance, and the pa
 ## Using as a Dependency
 
 ```sh
-zig fetch --save git+https://github.com/allain/httpz.zig
+zig fetch --save git+https://github.com/chy3xyz/zhttp.git
 ```
 
 Then in your `build.zig`:
 
 ```zig
-const httpz_dep = b.dependency("httpz", .{ .target = target });
-const httpz_mod = httpz_dep.module("httpz");
-exe.root_module.addImport("httpz", httpz_mod);
+const zhttp_dep = b.dependency("zhttp", .{ .target = target });
+const zhttp_mod = zhttp_dep.module("zhttp");
+exe.root_module.addImport("zhttp", zhttp_mod);
 ```
 
 ## Routing

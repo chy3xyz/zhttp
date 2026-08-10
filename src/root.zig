@@ -1,4 +1,4 @@
-/// httpz - HTTP/1.1, HTTP/2, and HTTP/3 library for Zig 0.17
+/// zhttp - HTTP/1.1, HTTP/2, and HTTP/3 library for Zig 0.17
 ///
 /// Implements RFC 2616 (HTTP/1.1) with the new std.Io async model.
 ///

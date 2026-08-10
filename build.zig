@@ -57,20 +57,20 @@ pub fn build(b: *std.Build) void {
     }
 
     // Library module
-    const httpz_mod = b.addModule("httpz", .{
+    const zhttp_mod = b.addModule("zhttp", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = imports.toOwnedSlice(b.allocator) catch @panic("OOM"),
     });
-    httpz_mod.linkSystemLibrary("ssl", .{});
-    httpz_mod.linkSystemLibrary("crypto", .{});
+    zhttp_mod.linkSystemLibrary("ssl", .{});
+    zhttp_mod.linkSystemLibrary("crypto", .{});
     if (h3) {
-        httpz_mod.linkSystemLibrary("ngtcp2", .{});
-        httpz_mod.linkSystemLibrary("ngtcp2_crypto_ossl", .{});
-        httpz_mod.linkSystemLibrary("nghttp3", .{});
+        zhttp_mod.linkSystemLibrary("ngtcp2", .{});
+        zhttp_mod.linkSystemLibrary("ngtcp2_crypto_ossl", .{});
+        zhttp_mod.linkSystemLibrary("nghttp3", .{});
     }
-    httpz_mod.link_libc = true;
+    zhttp_mod.link_libc = true;
 
     // Example executables
     const examples = [_][]const u8{
@@ -92,7 +92,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "httpz", .module = httpz_mod },
+                .{ .name = "zhttp", .module = zhttp_mod },
             },
         });
         const example_exe = b.addExecutable(.{
@@ -108,7 +108,7 @@ pub fn build(b: *std.Build) void {
 
     // Module tests
     const mod_tests = b.addTest(.{
-        .root_module = httpz_mod,
+        .root_module = zhttp_mod,
     });
 
     const run_mod_tests = b.addRunArtifact(mod_tests);
@@ -120,7 +120,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "httpz", .module = httpz_mod },
+                .{ .name = "zhttp", .module = zhttp_mod },
             },
         }),
     });
@@ -142,7 +142,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
         .imports = &.{
-            .{ .name = "httpz", .module = httpz_mod },
+            .{ .name = "zhttp", .module = zhttp_mod },
         },
     });
     const bench_exe = b.addExecutable(.{
@@ -157,7 +157,7 @@ pub fn build(b: *std.Build) void {
     const coverage_step = b.step("coverage", "Run tests with kcov code coverage");
 
     const cov_mod_test = b.addTest(.{
-        .root_module = httpz_mod,
+        .root_module = zhttp_mod,
         .use_llvm = true,
         .use_lld = true,
     });

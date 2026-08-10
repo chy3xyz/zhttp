@@ -1,5 +1,6 @@
 const std = @import("std");
-const httpz = @import("httpz");
+const zhttp = @import("zhttp");
+const httpz = zhttp;
 
 fn nowNs() u64 {
     var ts: std.c.timespec = undefined;

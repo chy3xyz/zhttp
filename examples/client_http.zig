@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
-const httpz = @import("httpz");
+const zhttp = @import("zhttp");
+const httpz = zhttp;
 const Client = httpz.Client;
 
 pub fn main(init: std.process.Init) !void {

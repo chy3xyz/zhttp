@@ -1,5 +1,6 @@
 const std = @import("std");
-const httpz = @import("httpz");
+const zhttp = @import("zhttp");
+const httpz = zhttp;
 const Io = std.Io;
 const testing = std.testing;
 

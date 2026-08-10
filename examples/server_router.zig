@@ -1,5 +1,6 @@
 const std = @import("std");
-const httpz = @import("httpz");
+const zhttp = @import("zhttp");
+const httpz = zhttp;
 
 const cors = httpz.middleware.cors.init(.{
     .origin = "*",

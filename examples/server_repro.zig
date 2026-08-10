@@ -12,7 +12,8 @@
 //! readHeaders. Until then the FD sits in CLOSE-WAIT.
 
 const std = @import("std");
-const httpz = @import("httpz");
+const zhttp = @import("zhttp");
+const httpz = zhttp;
 
 const SLOW_MS: u64 = 200;
 
