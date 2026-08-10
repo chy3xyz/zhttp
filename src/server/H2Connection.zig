@@ -850,30 +850,37 @@ fn processRequestImpl(
     if (has_body) {
         const body = response.body;
         var sent: usize = 0;
+        var stall_count: usize = 0;
         while (sent < body.len) {
             const chunk = @min(body.len - sent, max_payload);
-            const is_last = sent + chunk >= body.len;
 
-            // Flow control: wait for window (simplified — just check)
-            const avail = flow.effectiveSendWindow(stream.send_window);
-            const to_send = @min(chunk, avail);
-            if (to_send == 0 and chunk > 0) {
-                // No window available — send what we can, which is nothing.
-                // In a production implementation we'd park and wait for WINDOW_UPDATE.
-                // For now, just send it anyway (peer will handle with flow control error or buffer it).
-                // TODO: proper flow control backpressure
+            // Flow control: respect connection & stream send window
+            const raw_avail = flow.effectiveSendWindow(stream.send_window);
+            if (raw_avail <= 0) {
+                // Window is exhausted — yield to allow incoming WINDOW_UPDATE frames to be processed
+                stall_count += 1;
+                if (stall_count > 1000) {
+                    // Avoid infinite loop if peer deadlocks or never sends WINDOW_UPDATE
+                    return error.FlowControlBlocked;
+                }
+                std.Thread.yield() catch {};
+                continue;
             }
+            stall_count = 0;
+
+            const send_len = @min(chunk, @as(usize, @intCast(raw_avail)));
+            const is_last = (sent + send_len >= body.len);
 
             const data_flags: Flags = if (is_last and !has_trailers) .{ .value = Flags.end_stream } else Flags.none;
-            try frame.writeFrame(writer, .data, data_flags, stream_id, body[sent..][0..chunk]);
+            try frame.writeFrame(writer, .data, data_flags, stream_id, body[sent..][0..send_len]);
 
             // Consume from flow control windows
-            if (chunk > 0) {
-                flow.send_window.consume(@intCast(chunk)) catch {};
-                stream.send_window -= @intCast(chunk);
+            if (send_len > 0) {
+                flow.send_window.consume(@intCast(send_len)) catch {};
+                stream.send_window -= @intCast(send_len);
             }
 
-            sent += chunk;
+            sent += send_len;
         }
     }
 

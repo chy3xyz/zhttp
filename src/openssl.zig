@@ -414,6 +414,23 @@ pub const SniContext = struct {
         try self.domain_contexts.put(owned_domain, ctx);
     }
 
+    /// Dynamically reload the default server TLS certificate without restarting the server.
+    pub fn reloadDefaultCert(self: *SniContext, cert_pem: []const u8, key_pem: []const u8) !void {
+        const new_ctx = c.SSL_CTX_new(c.TLS_server_method()) orelse return error.TlsHandshakeFailure;
+        errdefer c.SSL_CTX_free(new_ctx);
+
+        try loadCertIntoCtx(new_ctx, cert_pem, key_pem);
+        c.SSL_CTX_set_alpn_select_cb(new_ctx, alpnSelectCallback, null);
+
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+
+        const old_ctx = self.default_ctx;
+        self.default_ctx = new_ctx;
+        self.installSniCallback();
+        c.SSL_CTX_free(old_ctx);
+    }
+
     /// Remove a domain's TLS certificate.
     pub fn removeDomain(self: *SniContext, domain: []const u8) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();

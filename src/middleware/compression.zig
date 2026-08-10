@@ -5,9 +5,20 @@ const Connection = @import("../server/Connection.zig");
 const Compression = @import("../server/Compression.zig");
 const flate = std.compress.flate;
 
-/// Wrap a handler to automatically gzip-compress responses
-/// when the client accepts gzip and the content type is compressible.
+/// Options for response compression.
+pub const Options = struct {
+    /// Minimum body length in bytes required to trigger compression.
+    /// Default: 0 bytes (compress all non-empty responses). Set to e.g. 1024 to skip tiny responses.
+    min_size_bytes: usize = 0,
+};
+
+/// Wrap a handler to automatically gzip-compress responses with default options.
 pub fn wrap(comptime inner: Connection.Handler) Connection.Handler {
+    return wrapWithOptions(inner, .{});
+}
+
+/// Wrap a handler to automatically gzip-compress responses using custom Options.
+pub fn wrapWithOptions(comptime inner: Connection.Handler, comptime options: Options) Connection.Handler {
     return struct {
         fn handle(allocator: std.mem.Allocator, io: std.Io, req: *const Request) Response {
             var resp = inner(allocator, io, req);
@@ -16,7 +27,7 @@ pub fn wrap(comptime inner: Connection.Handler) Connection.Handler {
                 if (Compression.isCompressible(ct)) {
                     if (resp.stream_fn != null) {
                         wrapStreamingGzip(&resp);
-                    } else {
+                    } else if (resp.body.len >= options.min_size_bytes) {
                         compressBody(&resp, allocator);
                     }
                 }
@@ -100,7 +111,7 @@ test "compression middleware: wraps route handler and compresses" {
         }
     }.h;
 
-    const wrapped = wrap(inner);
+    const wrapped = wrapWithOptions(inner, .{ .min_size_bytes = 0 });
     const req = try Request.parseConst(
         "GET / HTTP/1.1\r\n" ++
             "Host: localhost\r\n" ++
@@ -147,6 +158,25 @@ test "compression middleware: skips non-compressible content types" {
     }.h;
 
     const wrapped = wrap(inner);
+    const req = try Request.parseConst(
+        "GET / HTTP/1.1\r\n" ++
+            "Host: localhost\r\n" ++
+            "Accept-Encoding: gzip\r\n" ++
+            "\r\n",
+    );
+    const test_io: std.Io = .{ .userdata = null, .vtable = undefined };
+    const resp = wrapped(std.testing.allocator, test_io, &req);
+    try testing.expect(resp.headers.get("Content-Encoding") == null);
+}
+
+test "compression middleware: respects min_size_bytes threshold" {
+    const inner = struct {
+        fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
+            return Response.init(.ok, "text/plain", "short payload");
+        }
+    }.h;
+
+    const wrapped = wrapWithOptions(inner, .{ .min_size_bytes = 1024 });
     const req = try Request.parseConst(
         "GET / HTTP/1.1\r\n" ++
             "Host: localhost\r\n" ++

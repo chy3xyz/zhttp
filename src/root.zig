@@ -20,6 +20,8 @@ pub const Handler = @import("server/Connection.zig").Handler;
 pub const middleware = struct {
     pub const compression = @import("middleware/compression.zig");
     pub const cors = @import("middleware/cors.zig");
+    pub const security_headers = @import("middleware/security_headers.zig");
+    pub const rate_limit = @import("middleware/rate_limit.zig");
 };
 pub const h2 = @import("h2/root.zig");
 const httpz_options = @import("httpz_options");

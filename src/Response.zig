@@ -340,6 +340,15 @@ pub fn redirect(status: StatusCode, location: []const u8) Response {
     return resp;
 }
 
+/// RFC 2616 Section 14.47: Return a 401 Unauthorized response requiring Basic Auth.
+pub fn requireBasicAuth(realm: []const u8) Response {
+    var resp = Response.init(.unauthorized, "text/plain", "401 Unauthorized\n");
+    var realm_buf: [256]u8 = undefined;
+    const realm_hdr = std.fmt.bufPrint(&realm_buf, "Basic realm=\"{s}\"", .{realm}) catch "Basic";
+    resp.headers.append("WWW-Authenticate", realm_hdr) catch {};
+    return resp;
+}
+
 /// Create a simple response with status, content-type, and body.
 pub fn init(status: StatusCode, content_type: []const u8, body: []const u8) Response {
     var resp: Response = .{
@@ -348,6 +357,14 @@ pub fn init(status: StatusCode, content_type: []const u8, body: []const u8) Resp
     };
     resp.headers.append("Content-Type", content_type) catch unreachable;
     // We format Content-Length inline in serialize for dynamic responses
+    return resp;
+}
+
+/// Serialize a Zig value into JSON and create a Response with Content-Type application/json.
+pub fn json(allocator: std.mem.Allocator, value: anytype, status: StatusCode) !Response {
+    const stringified = try std.json.stringifyAlloc(allocator, value, .{});
+    var resp = Response.init(status, "application/json", stringified);
+    resp._body_allocated = stringified;
     return resp;
 }
 

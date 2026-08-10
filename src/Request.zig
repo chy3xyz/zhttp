@@ -468,6 +468,88 @@ pub fn isNotModifiedSince(self: *const Request, resource_timestamp: i64) bool {
     return resource_timestamp <= ims_timestamp;
 }
 
+/// Parse the request body as JSON into type T.
+pub fn json(self: *const Request, comptime T: type, allocator: std.mem.Allocator) !std.json.Parsed(T) {
+    const body = self.body orelse return error.MissingBody;
+    return std.json.parseFromSlice(T, allocator, body, .{});
+}
+
+/// Extract Bearer token from "Authorization: Bearer <token>" header.
+pub fn bearerToken(self: *const Request) ?[]const u8 {
+    const auth = self.headers.get("Authorization") orelse return null;
+    const trimmed = trimOws(auth);
+    if (trimmed.len > 7 and std.ascii.startsWithIgnoreCase(trimmed, "bearer ")) {
+        return trimOws(trimmed[7..]);
+    }
+    return null;
+}
+
+/// Returns true if Content-Type header indicates JSON payload.
+pub fn isJson(self: *const Request) bool {
+    const ct = self.headers.get("Content-Type") orelse return false;
+    return std.mem.indexOf(u8, ct, "application/json") != null;
+}
+
+/// Returns true if Content-Type header indicates form-urlencoded payload.
+pub fn isForm(self: *const Request) bool {
+    const ct = self.headers.get("Content-Type") orelse return false;
+    return std.mem.indexOf(u8, ct, "application/x-www-form-urlencoded") != null;
+}
+
+/// Returns true if Content-Type header indicates multipart form payload.
+pub fn isMultipart(self: *const Request) bool {
+    const ct = self.headers.get("Content-Type") orelse return false;
+    return std.mem.indexOf(u8, ct, "multipart/form-data") != null;
+}
+
+/// Extract a query parameter value by name from the Request URI. Zero-copy.
+/// Example: GET /search?q=zig&page=2 -> req.query("q") returns "zig"
+pub fn query(self: *const Request, name: []const u8) ?[]const u8 {
+    const qpos = std.mem.indexOfScalar(u8, self.uri, '?') orelse return null;
+    var raw_query = self.uri[qpos + 1 ..];
+    if (std.mem.indexOfScalar(u8, raw_query, '#')) |fpos| {
+        raw_query = raw_query[0..fpos];
+    }
+
+    var iter = std.mem.splitScalar(u8, raw_query, '&');
+    while (iter.next()) |pair| {
+        if (pair.len == 0) continue;
+        const eq_pos = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+        const key = pair[0..eq_pos];
+        if (std.mem.eql(u8, key, name)) {
+            return if (eq_pos < pair.len) pair[eq_pos + 1 ..] else "";
+        }
+    }
+    return null;
+}
+
+pub const BasicAuth = struct {
+    username: []const u8,
+    password: []const u8,
+};
+
+/// Extract and Base64-decode Basic Auth credentials from "Authorization: Basic <base64>" header.
+/// Uses the provided `out_buf` to hold the decoded "username:password" string.
+pub fn basicAuth(self: *const Request, out_buf: []u8) ?BasicAuth {
+    const auth = self.headers.get("Authorization") orelse return null;
+    const trimmed = trimOws(auth);
+    if (trimmed.len <= 6 or !std.ascii.startsWithIgnoreCase(trimmed, "basic ")) return null;
+    const b64_str = trimOws(trimmed[6..]);
+
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = decoder.calcSizeForSlice(b64_str) catch return null;
+    if (decoded_len > out_buf.len) return null;
+
+    decoder.decode(out_buf[0..decoded_len], b64_str) catch return null;
+    const decoded = out_buf[0..decoded_len];
+
+    const colon = std.mem.indexOfScalar(u8, decoded, ':') orelse return null;
+    return .{
+        .username = decoded[0..colon],
+        .password = decoded[colon + 1 ..],
+    };
+}
+
 /// RFC 2616 Section 14.35: Parse a byte Range header.
 /// Format: "bytes=0-499", "bytes=500-999", "bytes=-500", "bytes=500-"
 /// Returns the first range as start/end byte positions.
@@ -1372,6 +1454,49 @@ test "Request: isNotModifiedSince returns false when header absent" {
 
     const req = try Request.parseConst(raw);
     try testing.expect(!req.isNotModifiedSince(0));
+}
+
+test "Request: query parameter parser" {
+    const raw =
+        "GET /search?q=zig+lang&page=2&sort=desc#top HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "\r\n";
+
+    const req = try Request.parseConst(raw);
+    try testing.expectEqualStrings("zig+lang", req.query("q").?);
+    try testing.expectEqualStrings("2", req.query("page").?);
+    try testing.expectEqualStrings("desc", req.query("sort").?);
+    try testing.expect(req.query("nonexistent") == null);
+}
+
+test "Request: basicAuth credentials decoding" {
+    // "admin:secret123" Base64 encoded is "YWRtaW46c2VjcmV0MTIz"
+    const raw =
+        "GET /protected HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Authorization: Basic YWRtaW46c2VjcmV0MTIz\r\n" ++
+        "\r\n";
+
+    const req = try Request.parseConst(raw);
+    var buf: [64]u8 = undefined;
+    const creds = req.basicAuth(&buf).?;
+    try testing.expectEqualStrings("admin", creds.username);
+    try testing.expectEqualStrings("secret123", creds.password);
+}
+
+test "Request: bearerToken and Content-Type helpers" {
+    const raw =
+        "POST /api/data HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Authorization: Bearer my_jwt_token_xyz\r\n" ++
+        "Content-Type: application/json; charset=utf-8\r\n" ++
+        "\r\n";
+
+    const req = try Request.parseConst(raw);
+    try testing.expectEqualStrings("my_jwt_token_xyz", req.bearerToken().?);
+    try testing.expect(req.isJson());
+    try testing.expect(!req.isForm());
+    try testing.expect(!req.isMultipart());
 }
 
 // RFC 2616 Section 14.26: If-None-Match ETag comparison

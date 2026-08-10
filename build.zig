@@ -136,6 +136,23 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_integration_tests.step);
 
+    // Benchmark step
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("benches/bench_http.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "httpz", .module = httpz_mod },
+        },
+    });
+    const bench_exe = b.addExecutable(.{
+        .name = "bench_http",
+        .root_module = bench_mod,
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run httpz micro-benchmarks");
+    bench_step.dependOn(&run_bench.step);
+
     // Coverage step using kcov
     const coverage_step = b.step("coverage", "Run tests with kcov code coverage");
 
