@@ -494,12 +494,31 @@ var server = httpz.Server.init(.{
 ### Client
 
 ```zig
-var client = httpz.Client.init(allocator, .{
+var client = zhttp.Client.init(allocator, .{
     .host = "example.com",
     .port = 443,
     .tls_config = .{
         .host = "example.com",
         .root_ca = .system,
+    },
+});
+```
+
+#### Mutual TLS (mTLS) with Client Certificate & Key
+
+For APIs requiring client certificate authentication (e.g. WeChat Pay `zwechat`, payment gateways, microservices):
+
+```zig
+var client_auth = try zhttp.tls.config.CertKeyPair.fromFilePath(allocator, io, cert_dir, "apiclient_cert.pem", "apiclient_key.pem");
+defer client_auth.deinit(allocator);
+
+var client = zhttp.Client.init(allocator, .{
+    .host = "api.mch.weixin.qq.com",
+    .port = 443,
+    .tls_config = .{
+        .host = "api.mch.weixin.qq.com",
+        .root_ca = .system,
+        .auth = &client_auth, // or .cert = &client_auth
     },
 });
 ```

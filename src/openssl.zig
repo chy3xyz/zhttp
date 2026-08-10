@@ -100,6 +100,10 @@ pub const config = struct {
     pub const Client = struct {
         host: []const u8,
         root_ca: cert.Bundle = .system,
+        /// Client certificate & private key for mTLS (Mutual TLS authentication).
+        auth: ?*const CertKeyPair = null,
+        /// Alias for `auth` for client certificate keypair.
+        cert: ?*const CertKeyPair = null,
         insecure_skip_verify: bool = false,
         /// When true, only advertise http/1.1 via ALPN (skip h2).
         disable_h2: bool = false,
@@ -298,6 +302,12 @@ pub fn client(fd: posix.fd_t, opts: config.Client) !Connection {
                 c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_NONE, null);
             },
         }
+    }
+
+    // Client certificate & key for mTLS (Mutual TLS)
+    const client_auth = opts.auth orelse opts.cert;
+    if (client_auth) |auth| {
+        try loadCertIntoCtx(ctx, auth.cert_pem, auth.key_pem);
     }
 
     // ALPN: advertise http/1.1 (and optionally h2)
