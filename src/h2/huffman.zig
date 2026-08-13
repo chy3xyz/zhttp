@@ -337,6 +337,11 @@ pub fn decode(dst: []u8, src: []const u8) !usize {
     var bits_left: u7 = 0;
 
     for (src) |byte| {
+        // `accumulator` is a u64: at most 64 bits of pending input are
+        // representable. If more than 56 bits are still unmatched, shifting
+        // in another byte would discard the high bits and later make `shift`
+        // exceed the 6-bit shift operand range. Treat it as invalid data.
+        if (bits_left > 56) return error.HpackDecodingError;
         accumulator = (accumulator << 8) | byte;
         bits_left += 8;
 

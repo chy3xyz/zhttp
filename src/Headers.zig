@@ -31,7 +31,9 @@ pub const Error = error{
 /// User-facing headers are limited to (max_headers - reserved_headers)
 /// to ensure server-generated headers always have room.
 pub fn append(self: *Headers, name: []const u8, value: []const u8) Error!void {
-    if (self.len >= max_headers) return error.TooManyHeaders;
+    // User-facing headers are limited to (max_headers - reserved_headers)
+    // so server-generated headers always have room.
+    if (self.len >= max_headers - reserved_headers) return error.TooManyHeaders;
     if (name.len == 0 or name.len > max_name_len) return error.InvalidHeaderName;
     if (!isValidToken(name)) return error.InvalidHeaderName;
     if (value.len > max_value_len) return error.InvalidHeaderValue;
@@ -218,7 +220,9 @@ test "Headers: get returns first match" {
 // /// RFC 2616 Section 4.2: Too many headers should be rejected.
 test "Headers: too many headers" {
     var h: Headers = .{};
-    for (0..max_headers) |i| {
+    // User headers are limited to (max_headers - reserved_headers) so the
+    // reserved slots stay available for server-generated headers.
+    for (0..max_headers - reserved_headers) |i| {
         _ = i;
         try h.append("X-Header", "value");
     }

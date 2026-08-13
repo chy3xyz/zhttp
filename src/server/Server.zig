@@ -907,6 +907,9 @@ fn readChunkedBody(reader: *Io.Reader, buf: *[]u8, start: usize, max_size: usize
             }
         }
 
+        // chunk_size comes from parseInt and may be as large as maxInt(usize);
+        // guard the addition with saturating subtraction to avoid overflow.
+        if (chunk_size > max_size -| total -| 2) return error.BodyTooLarge;
         try ensureRequestCapacity(buf, total + chunk_size + 2, max_size);
         reader.readSliceAll(buf.*[total..][0 .. chunk_size + 2]) catch |err| switch (err) {
             error.EndOfStream => return error.EndOfStream,

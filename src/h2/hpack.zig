@@ -89,22 +89,25 @@ fn decodeInt(data: []const u8, comptime prefix_bits: u4) !struct { value: u32, c
     if (data.len == 0) return error.HpackDecodingError;
 
     const mask: u8 = if (prefix_bits == 8) 0xFF else (@as(u8, 1) << @intCast(prefix_bits)) - 1;
-    var value: u32 = data[0] & mask;
+    var value: u64 = data[0] & mask;
 
     if (value < mask) {
-        return .{ .value = value, .consumed = 1 };
+        return .{ .value = @intCast(value), .consumed = 1 };
     }
 
     var i: usize = 1;
-    var shift: u5 = 0;
+    var shift: u6 = 0;
     while (i < data.len) : (i += 1) {
+        // Cap M at 28 (RFC 7541 §5.1) so `(b & 0x7F) << M` cannot overflow
+        // u64; the value itself is additionally bounded to u32 below.
+        if (shift > 28) return error.HpackDecodingError;
         const b = data[i];
-        value += @as(u32, b & 0x7F) << shift;
+        value += @as(u64, b & 0x7F) << @intCast(shift);
+        if (value > std.math.maxInt(u32)) return error.HpackDecodingError;
         if (b & 0x80 == 0) {
-            return .{ .value = value, .consumed = i + 1 };
+            return .{ .value = @intCast(value), .consumed = i + 1 };
         }
         shift += 7;
-        if (shift > 28) return error.HpackDecodingError; // overflow protection
     }
     return error.HpackDecodingError; // incomplete
 }
@@ -185,23 +188,25 @@ pub const DynamicTable = struct {
     /// Add a new entry, evicting oldest entries if needed.
     pub fn add(self: *DynamicTable, name: []const u8, value: []const u8) void {
         const new_size = entrySize(name.len, value.len);
+        const total_data = name.len + value.len;
 
         // If the new entry is too large for the table, clear everything
-        if (new_size > self.max_size) {
-            self.len = 0;
-            self.current_size = 0;
-            self.buf_pos = 0;
-            self.head = 0;
+        // (RFC 7541 §4.4). Also refuse entries that cannot physically fit in
+        // the storage buffer — a peer may raise SETTINGS_HEADER_TABLE_SIZE
+        // above our fixed buffer capacity.
+        if (new_size > self.max_size or total_data > self.buffer.len) {
+            self.clear();
             return;
         }
 
-        // Evict until there's room
-        while (self.current_size + new_size > self.max_size and self.len > 0) {
+        // Evict until there's room in size units and in the entry ring.
+        while ((self.current_size + new_size > self.max_size or
+            self.len >= self.entries.len) and self.len > 0)
+        {
             self.evict();
         }
 
         // Write name + value into buffer
-        const total_data = name.len + value.len;
         if (self.buf_pos + total_data > self.buffer.len) {
             self.buf_pos = 0; // wrap around
         }
@@ -219,6 +224,13 @@ pub const DynamicTable = struct {
         };
         self.len += 1;
         self.current_size += new_size;
+    }
+
+    fn clear(self: *DynamicTable) void {
+        self.len = 0;
+        self.current_size = 0;
+        self.buf_pos = 0;
+        self.head = 0;
     }
 
     fn evict(self: *DynamicTable) void {

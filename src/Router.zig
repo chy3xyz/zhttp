@@ -217,6 +217,19 @@ pub fn extractPath(uri: []const u8) []const u8 {
 ///             before `*name` must be followed by `/` in the request path.
 pub fn matchPath(comptime pattern: []const u8, path: []const u8) ?Params {
     const segments = comptime splitSegments(pattern);
+
+    // The number of `:param` / `*rest` segments is known at comptime; reject
+    // patterns that would overflow Params.entries at runtime.
+    comptime {
+        var param_count: usize = 0;
+        for (segments) |seg| {
+            if (seg.len > 0 and (seg[0] == ':' or seg[0] == '*')) param_count += 1;
+        }
+        if (param_count > Params.max_params) {
+            @compileError(std.fmt.comptimePrint("route pattern '{s}' captures {d} parameters, exceeding Params.max_params ({d})", .{ pattern, param_count, Params.max_params }));
+        }
+    }
+
     const has_catch_all = comptime blk: {
         if (segments.len == 0) break :blk false;
         break :blk segments[segments.len - 1][0] == '*';

@@ -868,18 +868,25 @@ fn decodeUriChar(path: []const u8, i: *usize) u8 {
             i.* += 3;
 
             // Detect overlong UTF-8 encoding of '.' (U+002E):
-            //   %c0%ae = 0xC0 0xAE (overlong 2-byte)
-            //   %e0%80%ae = 0xE0 0x80 0xAE (overlong 3-byte)
-            if (byte == 0xC0 and i.* + 2 < path.len and
-                path[i.*] == '%')
-            {
-                const h2 = hexVal(path[i.* + 1]);
-                const l2 = hexVal(path[i.* + 2]);
-                if (h2 != null and l2 != null) {
-                    const byte2 = h2.? * 16 + l2.?;
+            //   %c0%ae      = 0xC0 0xAE        (overlong 2-byte)
+            //   %e0%80%ae   = 0xE0 0x80 0xAE   (overlong 3-byte)
+            if (byte == 0xC0) {
+                if (peekEncodedByte(path, i.*)) |byte2| {
                     if (byte2 == 0xAE) {
                         i.* += 3;
                         return '.';
+                    }
+                }
+            } else if (byte == 0xE0) {
+                if (peekEncodedByte(path, i.*)) |byte2| {
+                    if (byte2 == 0x80) {
+                        const after = i.* + 3;
+                        if (peekEncodedByte(path, after)) |byte3| {
+                            if (byte3 == 0xAE) {
+                                i.* = after + 3;
+                                return '.';
+                            }
+                        }
                     }
                 }
             }
@@ -891,6 +898,17 @@ fn decodeUriChar(path: []const u8, i: *usize) u8 {
     const ch = path[i.*];
     i.* += 1;
     return ch;
+}
+
+/// Peek a single percent-encoded byte at `idx` without advancing.
+/// Returns null when there is no valid %XX sequence at that position.
+fn peekEncodedByte(path: []const u8, idx: usize) ?u8 {
+    if (idx + 2 < path.len and path[idx] == '%') {
+        const h = hexVal(path[idx + 1]);
+        const l = hexVal(path[idx + 2]);
+        if (h != null and l != null) return h.? * 16 + l.?;
+    }
+    return null;
 }
 
 fn hexVal(c: u8) ?u8 {
@@ -1006,7 +1024,7 @@ pub fn parseChunkedBody(data: []const u8, out: []u8) ParseError!ChunkedResult {
                 }
                 const trailer_end = findCrlf(data, pos) orelse return error.UnexpectedEndOfInput;
                 const trailer_line = data[pos..trailer_end];
-                parseHeaderLine(&result.trailers, trailer_line) catch {};
+                try parseHeaderLine(&result.trailers, trailer_line);
                 pos = trailer_end + 2;
             }
             result.body_len = out_pos;
@@ -1014,8 +1032,11 @@ pub fn parseChunkedBody(data: []const u8, out: []u8) ParseError!ChunkedResult {
             return result;
         }
 
-        if (out_pos + chunk_size > out.len) return error.BodyTooLarge;
-        if (pos + chunk_size + 2 > data.len) return error.UnexpectedEndOfInput;
+        // chunk_size comes from parseInt and may be as large as maxInt(usize);
+        // use saturating subtraction to avoid overflow in the bounds checks
+        // and the additions below.
+        if (chunk_size > out.len -| out_pos) return error.BodyTooLarge;
+        if (chunk_size > data.len -| pos -| 2) return error.UnexpectedEndOfInput;
 
         @memcpy(out[out_pos..][0..chunk_size], data[pos..][0..chunk_size]);
         out_pos += chunk_size;
