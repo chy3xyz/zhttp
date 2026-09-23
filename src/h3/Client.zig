@@ -45,9 +45,39 @@ pub const Client = struct {
         self.quic_conn.deinit();
     }
 
-    /// Send a GET request, return response body as bytes.
-    /// Caller owns the returned slice (allocated with self.allocator).
+    /// What a request brought back. `header_text` and `body` are owned by the
+    /// caller and have to be freed with its allocator.
+    pub const Answer = struct {
+        status: u16,
+        /// The header fields as they arrived, as `name: value` lines separated
+        /// by CRLF, `:status` first.
+        header_text: []const u8,
+        body: []const u8,
+    };
+
+    /// One header field to send. The name has to be lowercase (RFC 9114
+    /// Section 4.2).
+    pub const Header = http3.HeaderField;
+
+    /// Send a GET request. The caller owns the returned body.
     pub fn get(self: *Client, path: []const u8) ![]const u8 {
+        const answer = try self.request(path);
+        // The body is what the caller asked for; the header text is not.
+        self.allocator.free(answer.header_text);
+        return answer.body;
+    }
+
+    /// Send a GET request and return everything that came back, status and
+    /// headers included. The caller owns `header_text` and `body`.
+    pub fn request(self: *Client, path: []const u8) !Answer {
+        return self.send("GET", path, &.{}, "");
+    }
+
+    /// Send a request of any method, with headers and an optional body, and
+    /// return what came back. The body is sent before the response can arrive,
+    /// so the caller only has to keep it alive until this returns; the caller
+    /// owns `header_text` and `body` in the answer.
+    pub fn send(self: *Client, method: []const u8, path: []const u8, headers: []const Header, body: []const u8) !Answer {
         // 1. Open a bidirectional QUIC stream (retry up to 100 times)
         var stream_id: i64 = -1;
         for (0..100) |_| {
@@ -67,7 +97,7 @@ pub const Client = struct {
         defer ctx.deinit();
 
         // 3. Submit HTTP/3 request
-        try self.h3_session.submitRequest(stream_id, path, self.host, &ctx);
+        try self.h3_session.submitRequest(stream_id, method, path, self.host, headers, body, &ctx);
 
         // 4. I/O loop: pump writes, wait for the socket or the next QUIC timer,
         // take everything that arrived, and repeat. The wait is a poll() whose
@@ -108,9 +138,11 @@ pub const Client = struct {
             quic.handleExpiryIfDue(&self.quic_conn);
         }
 
-        // 5. Return body (copy to heap since ctx is stack-local)
-        const result = try self.allocator.dupe(u8, ctx.body.items);
-        return result;
+        // 5. Copy both out: they live in `ctx`, which is stack-local.
+        const response_body = try self.allocator.dupe(u8, ctx.body.items);
+        errdefer self.allocator.free(response_body);
+        const header_text = try self.allocator.dupe(u8, ctx.headers.items);
+        return .{ .status = ctx.status, .header_text = header_text, .body = response_body };
     }
 };
 

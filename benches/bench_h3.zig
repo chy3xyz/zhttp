@@ -19,9 +19,9 @@ const port: u16 = 14881;
 var small_body_buf: [small_body_size]u8 = undefined;
 var large_body_buf: [large_body_size]u8 = undefined;
 
-fn handle(allocator: std.mem.Allocator, path: []const u8) []const u8 {
-    const body: []const u8 = if (std.mem.eql(u8, path, "/large")) &large_body_buf else &small_body_buf;
-    return allocator.dupe(u8, body) catch &.{};
+fn handle(_: std.mem.Allocator, request: *const h3.Request) h3.Response {
+    const body: []const u8 = if (std.mem.eql(u8, request.path, "/large")) &large_body_buf else &small_body_buf;
+    return .{ .body = body };
 }
 
 /// The server's run loop never returns, so it keeps serving until the process

@@ -18,8 +18,8 @@ fn nowNanos() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
-fn handler(allocator: std.mem.Allocator, _: []const u8) []const u8 {
-    return allocator.dupe(u8, "OK") catch "OK";
+fn handler(_: std.mem.Allocator, _: *const server_mod.Request) server_mod.Response {
+    return .{ .body = "OK" };
 }
 
 fn serve(server: *Server) void {
@@ -83,6 +83,68 @@ test "h3: client gets the handler's response" {
     const again = try client.get("/");
     defer allocator.free(again);
     try std.testing.expectEqualStrings("OK", again);
+}
+
+/// Answers 201 with the value of `x-test` — but only once it has seen the
+/// method, the path and the body the request-inspection tests send, so the
+/// answer alone says which of them arrived.
+fn echoHandler(_: std.mem.Allocator, request: *const server_mod.Request) server_mod.Response {
+    if (request.method != .POST) return .{ .status = .method_not_allowed, .body = "method" };
+    if (!std.mem.eql(u8, request.path, "/echo")) return .{ .status = .not_found, .body = "path" };
+    const seen = request.headers.get("x-test") orelse return .{ .status = .bad_request, .body = "no x-test" };
+    if (!std.mem.eql(u8, request.body, "payload")) return .{ .status = .bad_request, .body = "body" };
+    return .{ .status = .created, .content_type = "text/x-seen", .body = seen };
+}
+
+test "h3: the method, path, headers and body of a request reach the handler" {
+    try quic.setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
+
+    const allocator = std.heap.page_allocator;
+    const server = try allocator.create(Server);
+    server.* = try Server.init(allocator, 0, echoHandler, .{});
+    const port = std.mem.bigToNative(u16, server.listener.local_addr.port);
+    _ = try std.Thread.spawn(.{}, serve, .{server});
+
+    var client = try Client.init(allocator, "127.0.0.1", port, .{ .insecure_skip_verify = true });
+    defer client.deinit();
+
+    const answer = try client.send("POST", "/echo", &.{
+        .{ .name = "x-test", .value = "seen-value" },
+        .{ .name = "user-agent", .value = "httpz-test" },
+    }, "payload");
+    defer allocator.free(answer.header_text);
+    defer allocator.free(answer.body);
+
+    try std.testing.expectEqual(@as(u16, 201), answer.status);
+    try std.testing.expect(std.mem.indexOf(u8, answer.header_text, "content-type: text/x-seen") != null);
+    try std.testing.expectEqualStrings("seen-value", answer.body);
+}
+
+test "h3: a body over the limit is answered with 413" {
+    try quic.setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
+
+    const allocator = std.heap.page_allocator;
+    const server = try allocator.create(Server);
+    server.* = try Server.init(allocator, 0, handler, .{ .max_request_body_bytes = 4 });
+    const port = std.mem.bigToNative(u16, server.listener.local_addr.port);
+    _ = try std.Thread.spawn(.{}, serve, .{server});
+
+    var client = try Client.init(allocator, "127.0.0.1", port, .{ .insecure_skip_verify = true });
+    defer client.deinit();
+
+    // Five bytes into a four-byte limit. The request is answered rather than
+    // dropped, so the connection stays usable: a request that fits is served
+    // right after it.
+    const too_big = try client.send("POST", "/", &.{}, "12345");
+    defer allocator.free(too_big.header_text);
+    defer allocator.free(too_big.body);
+    try std.testing.expectEqual(@as(u16, 413), too_big.status);
+
+    const ok = try client.send("POST", "/", &.{}, "1234");
+    defer allocator.free(ok.header_text);
+    defer allocator.free(ok.body);
+    try std.testing.expectEqual(@as(u16, 200), ok.status);
+    try std.testing.expectEqualStrings("OK", ok.body);
 }
 
 test "h3: serves a second client while the first is still connected" {
@@ -182,10 +244,21 @@ fn responseByte(i: usize) u8 {
 /// second one.
 const bulk_len = 2 * 1024 * 1024;
 
-fn bulkHandler(allocator: std.mem.Allocator, _: []const u8) []const u8 {
-    const body = allocator.alloc(u8, bulk_len) catch return "";
-    for (body, 0..) |*b, i| b.* = responseByte(i);
-    return body;
+fn bulkHandler(_: std.mem.Allocator, _: *const server_mod.Request) server_mod.Response {
+    return .{ .body = bulkBody() };
+}
+
+/// The bulk response is the same bytes on every call, so it is built once and
+/// handed out as a view the server copies.
+var bulk_body_buf: [bulk_len]u8 = undefined;
+var bulk_body_ready = false;
+
+fn bulkBody() []const u8 {
+    if (!bulk_body_ready) {
+        for (&bulk_body_buf, 0..) |*b, i| b.* = responseByte(i);
+        bulk_body_ready = true;
+    }
+    return &bulk_body_buf;
 }
 
 test "h3: a response larger than the flow control window arrives complete" {
@@ -212,12 +285,9 @@ test "h3: a response larger than the flow control window arrives complete" {
 /// The bulk body for "/large" and the small one for anything else, so one
 /// connection can be kept busy transferring while another asks for something
 /// small.
-fn bulkOrOkHandler(allocator: std.mem.Allocator, request: []const u8) []const u8 {
-    if (!std.mem.eql(u8, request, "/large")) return allocator.dupe(u8, "OK") catch "OK";
-
-    const body = allocator.alloc(u8, bulk_len) catch return "";
-    for (body, 0..) |*b, i| b.* = responseByte(i);
-    return body;
+fn bulkOrOkHandler(_: std.mem.Allocator, request: *const server_mod.Request) server_mod.Response {
+    if (!std.mem.eql(u8, request.path, "/large")) return .{ .body = "OK" };
+    return .{ .body = bulkBody() };
 }
 
 /// One client's whole request run on its own thread, so the test can watch how

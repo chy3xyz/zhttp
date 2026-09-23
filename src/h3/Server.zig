@@ -5,10 +5,38 @@ const ngtcp2 = @import("ngtcp2_c");
 const nghttp3 = @import("nghttp3_c");
 const posix = std.posix;
 
-/// Handler called for each completed HTTP/3 request. `request` is the request
-/// path, and the returned body is owned by the server, which frees it once the
-/// response has been sent — allocate it with |allocator|.
-pub const Handler = *const fn (allocator: std.mem.Allocator, request: []const u8) []const u8;
+const h1 = @import("../Request.zig");
+
+/// The request method, from the same enum the HTTP/1.1 and HTTP/2 sides use.
+pub const Method = h1.Method;
+/// Header fields of a request or response.
+pub const Headers = @import("../Headers.zig");
+/// Response status, from the same enum the other protocols use.
+pub const StatusCode = @import("../Response.zig").StatusCode;
+
+/// A received HTTP/3 request, as the handler sees it: `:method` and `:path`
+/// arrive folded into `method` and `path`, and every other field in `headers`,
+/// in the order the client sent it. Pseudo-headers other than those two are
+/// dropped. All of it stays valid until the handler returns.
+pub const Request = struct {
+    method: Method,
+    path: []const u8,
+    headers: Headers = .{},
+    /// The request body, empty for a request that has none.
+    body: []const u8 = "",
+};
+
+/// What a handler answers with. `body` is copied by the server before it is
+/// sent, so it may be a literal or a buffer the handler owns.
+pub const Response = struct {
+    status: StatusCode = .ok,
+    content_type: []const u8 = "text/plain",
+    body: []const u8 = "",
+};
+
+/// Handler called for each completed HTTP/3 request. The returned body is
+/// copied, so the handler keeps ownership of everything it hands over.
+pub const Handler = *const fn (allocator: std.mem.Allocator, request: *const Request) Response;
 
 /// Server state for one accepted connection: the HTTP/3 session on top of it,
 /// the endpoint's own H3 streams, and when it last heard from the client.
@@ -37,6 +65,10 @@ pub const Options = struct {
     /// How long a closing connection sticks around to answer the peer, used when
     /// ngtcp2 does not provide a closing deadline of its own.
     closing_period_ns: u64 = 3 * std.time.ns_per_s,
+    /// Largest request body accepted; a larger one is answered with 413. The
+    /// body is buffered in full before the handler runs, so this is also what
+    /// bounds the memory one request can hold.
+    max_request_body_bytes: usize = http3.Session.default_max_request_body_bytes,
 };
 
 pub const Server = struct {
@@ -255,7 +287,7 @@ pub const Server = struct {
         errdefer if (path_storage) |ps| std.heap.page_allocator.destroy(ps);
         quic.initPath(path_storage.?, &self.listener.local_addr, peer_addr);
 
-        var h3_alloc: ?*H3Conn = try newH3Conn(self.allocator, params.initial_max_streams_bidi);
+        var h3_alloc: ?*H3Conn = try newH3Conn(self.allocator, params.initial_max_streams_bidi, self.options.max_request_body_bytes);
         errdefer if (h3_alloc) |h| h.deinit();
         const h3 = h3_alloc.?;
 
@@ -450,13 +482,13 @@ pub const Server = struct {
 };
 
 /// Creates the H3 state for a new connection.
-fn newH3Conn(allocator: std.mem.Allocator, max_client_streams_bidi: u64) !*H3Conn {
+fn newH3Conn(allocator: std.mem.Allocator, max_client_streams_bidi: u64, max_request_body_bytes: usize) !*H3Conn {
     const h3 = try allocator.create(H3Conn);
     errdefer allocator.destroy(h3);
 
     h3.* = .{
         .allocator = allocator,
-        .session = try http3.Session.initServer(allocator, max_client_streams_bidi),
+        .session = try http3.Session.initServer(allocator, max_client_streams_bidi, max_request_body_bytes),
         .last_activity_ns = nowNanos(),
     };
     return h3;
@@ -482,18 +514,49 @@ fn openUniStream(conn: *quic.Connection) !i64 {
     return stream_id;
 }
 
-/// Runs the handler for every complete request and queues its response. The
-/// request bytes handed to the handler are the request path.
+/// Runs the handler for every complete request and queues its response.
 fn serveRequests(self: *Server, session: *http3.Session) void {
     for (session.requests.items) |req| {
         if (!req.complete or req.responded) continue;
-        const body = self.handler(self.allocator, req.path.items);
-        session.submitResponse(req, 200, "text/plain", body) catch {
-            self.allocator.free(body);
+
+        const answer: Response = if (req.body_too_large)
+            .{
+                .status = .request_entity_too_large,
+                .body = "Request Entity Too Large",
+            }
+        else
+            callHandler(self, req);
+
+        // The handler keeps what it handed over, and the body has to outlive the
+        // response, so this is the one copy made on the response path.
+        const body = self.allocator.dupe(u8, answer.body) catch {
             req.responded = true; // nothing to send; don't retry it forever
             continue;
         };
+        session.submitResponse(req, @backingInt(answer.status), answer.content_type, body) catch {
+            self.allocator.free(body);
+            req.responded = true;
+            continue;
+        };
     }
+}
+
+/// Hands one complete request to the handler, as a `Request` it can read.
+fn callHandler(self: *Server, req: *http3.ServerRequest) Response {
+    const method = Method.fromString(req.method) orelse
+        return .{ .status = .not_implemented, .body = "Not Implemented" };
+
+    var request: Request = .{
+        .method = method,
+        .path = req.path,
+        .body = req.body.items,
+    };
+    for (req.headers.items) |field| {
+        // A handler reads headers with `request.headers.get(...)`; a field the
+        // table cannot hold is dropped rather than failing the request.
+        request.headers.append(field.name, field.value) catch break;
+    }
+    return self.handler(self.allocator, &request);
 }
 
 /// Bridge: ngtcp2 recv_stream_data callback → nghttp3 conn_read_stream2.
@@ -543,11 +606,52 @@ fn nowNanos() u64 {
 
 test "H3 Server init/deinit" {
     var server = try Server.init(std.testing.allocator, 14433, struct {
-        fn h(allocator: std.mem.Allocator, _: []const u8) []const u8 {
-            return allocator.dupe(u8, "OK") catch "OK";
+        fn h(_: std.mem.Allocator, _: *const Request) Response {
+            return .{ .body = "OK" };
         }
     }.h, .{});
     defer server.deinit();
+}
+
+test "H3: an unknown method is answered with 501" {
+    var server = try Server.init(std.testing.allocator, 14434, struct {
+        fn h(_: std.mem.Allocator, _: *const Request) Response {
+            return .{ .body = "OK" };
+        }
+    }.h, .{});
+    defer server.deinit();
+
+    const req = try http3.ServerRequest.init(std.testing.allocator, 0, 1024);
+    defer req.deinit();
+    req.method = "BREW";
+    const answer = callHandler(&server, req);
+    try std.testing.expectEqual(StatusCode.not_implemented, answer.status);
+}
+
+test "H3: the handler sees the method, path, headers and body" {
+    var server = try Server.init(std.testing.allocator, 14435, struct {
+        fn h(_: std.mem.Allocator, request: *const Request) Response {
+            const seen = request.headers.get("x-test").?;
+            if (request.method != .POST) return .{ .status = .bad_request, .body = "method" };
+            if (!std.mem.eql(u8, request.path, "/submit")) return .{ .status = .bad_request, .body = "path" };
+            if (!std.mem.eql(u8, request.body, "payload")) return .{ .status = .bad_request, .body = "body" };
+            return .{ .status = .created, .content_type = "text/x-seen", .body = seen };
+        }
+    }.h, .{});
+    defer server.deinit();
+
+    const req = try http3.ServerRequest.init(std.testing.allocator, 0, 1024);
+    defer req.deinit();
+    const a = req.arena.allocator();
+    req.method = "POST";
+    req.path = "/submit";
+    try req.headers.append(a, .{ .name = "x-test", .value = "seen-value" });
+    try req.body.appendSlice(a, "payload");
+
+    const answer = callHandler(&server, req);
+    try std.testing.expectEqual(StatusCode.created, answer.status);
+    try std.testing.expectEqualStrings("text/x-seen", answer.content_type);
+    try std.testing.expectEqualStrings("seen-value", answer.body);
 }
 
 test "H3: TLS cert loading" {

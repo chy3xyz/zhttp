@@ -30,9 +30,14 @@ pub fn main(init: std.process.Init) !void {
     try httpz.h3.quic.setServerCert(auth.cert_pem, auth.key_pem);
 
     var server = try httpz.h3.Server.init(allocator, 8443, struct {
-        fn handle(alloc: std.mem.Allocator, req: []const u8) []const u8 {
-            _ = req;
-            return alloc.dupe(u8, "Hello from httpz HTTP/3 Server!") catch "Hello from httpz HTTP/3 Server!";
+        fn handle(alloc: std.mem.Allocator, req: *const httpz.h3.Request) httpz.h3.Response {
+            _ = alloc;
+            // `req.method`, `req.path`, `req.headers.get("...")` and `req.body`
+            // are the whole request the client sent.
+            if (req.method != .GET) {
+                return .{ .status = .method_not_allowed, .body = "only GET\n" };
+            }
+            return .{ .body = "Hello from httpz HTTP/3 Server!\n" };
         }
     }.handle, .{});
     defer server.deinit();

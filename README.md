@@ -599,14 +599,20 @@ Building it requires the system libraries `libngtcp2` and `libnghttp3`; they are
 ```zig
 const h3 = httpz.h3;
 
-fn handler(allocator: std.mem.Allocator, request: []const u8) []const u8 {
-    return allocator.dupe(u8, "Hello from H3!") catch "error";
+fn handler(allocator: std.mem.Allocator, request: *const h3.Request) h3.Response {
+    if (request.method != .GET) return .{ .status = .method_not_allowed, .body = "only GET\n" };
+    // request.path, request.headers.get("user-agent"), request.body
+    return .{ .body = "Hello from H3!\n" };
 }
 
 var server = try h3.Server.init(allocator, 4433, handler, .{});
 defer server.deinit();
 try server.run(); // event loop: routes packets, serves requests, reaps idle connections
 ```
+
+The handler answers with `h3.Response` — `status`, `content_type` and `body`, and
+the body is copied, so a literal is fine. `h3.Request.method` and
+`h3.Response.status` are the same enums the HTTP/1.1 and HTTP/2 sides use.
 
 ### Client
 
@@ -617,6 +623,13 @@ var client = try h3.Client.init(allocator, "example.com", 443, .{});
 defer client.deinit();
 const body = try client.get("/");
 defer allocator.free(body);
+
+// Any method, with header fields and a body; the answer carries the status too.
+const answer = try client.send("POST", "/submit", &.{
+    .{ .name = "content-type", .value = "application/json" },
+}, "{\"ok\":true}");
+defer allocator.free(answer.header_text);
+defer allocator.free(answer.body);
 ```
 
 `Client.init` takes a `httpz.h3.quic.ClientTls`: it verifies the peer against the
