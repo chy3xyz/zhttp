@@ -565,7 +565,7 @@ fn alpnSelectCallback(
 ) callconv(.c) c_int {
     const server_protos = "\x02h2\x08http/1.1";
     const ret = c.SSL_select_next_proto(
-        @constCast(@ptrCast(out)),
+        @ptrCast(@constCast(out)),
         @ptrCast(outlen),
         server_protos,
         server_protos.len,

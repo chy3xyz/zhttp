@@ -274,9 +274,17 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
                     if (f.header.flags.has(Flags.end_stream)) {
                         // No body — process immediately
                         processRequest(
-                            &registry, &decoder, &encoder, &flow,
-                            &settings_sync.peer, fragment,
-                            f.header.stream_id, &.{}, writer, handler, io,
+                            &registry,
+                            &decoder,
+                            &encoder,
+                            &flow,
+                            &settings_sync.peer,
+                            fragment,
+                            f.header.stream_id,
+                            &.{},
+                            writer,
+                            handler,
+                            io,
                         );
                     } else {
                         // Body will follow via DATA frames — store headers
@@ -321,9 +329,17 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
                     const assembled = header_block_buf[0..header_block_len];
                     if (header_block_end_stream) {
                         processRequest(
-                            &registry, &decoder, &encoder, &flow,
-                            &settings_sync.peer, assembled,
-                            header_block_stream_id, &.{}, writer, handler, io,
+                            &registry,
+                            &decoder,
+                            &encoder,
+                            &flow,
+                            &settings_sync.peer,
+                            assembled,
+                            header_block_stream_id,
+                            &.{},
+                            writer,
+                            handler,
+                            io,
                         );
                     } else {
                         // Body will follow — store headers
@@ -435,11 +451,17 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
                 // END_STREAM on DATA — request is complete, dispatch to handler
                 if (f.header.flags.has(Flags.end_stream) and pending_stream_id == f.header.stream_id and pending_header_block_len > 0) {
                     processRequest(
-                        &registry, &decoder, &encoder, &flow,
+                        &registry,
+                        &decoder,
+                        &encoder,
+                        &flow,
                         &settings_sync.peer,
                         pending_header_block[0..pending_header_block_len],
-                        pending_stream_id, if (body_heap) |h| h[0..body_len] else body_stack_buf[0..body_len],
-                        writer, handler, io,
+                        pending_stream_id,
+                        if (body_heap) |h| h[0..body_len] else body_stack_buf[0..body_len],
+                        writer,
+                        handler,
+                        io,
                     );
                     pending_stream_id = 0;
                     pending_header_block_len = 0;

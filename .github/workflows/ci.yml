@@ -25,6 +25,11 @@ jobs:
       - name: Run Tests
         run: zig build test
 
+      # The formatter is part of the toolchain: keep the tree in the shape it
+      # produces so a `zig fmt --check` never fails for unrelated reasons.
+      - name: Check Formatting
+        run: zig fmt --check src benches tests examples
+
       - name: Build Examples
         run: zig build
 

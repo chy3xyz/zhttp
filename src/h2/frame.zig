@@ -79,7 +79,7 @@ pub const FrameHeader = struct {
         const length: u24 = @as(u24, buf[0]) << 16 | @as(u24, buf[1]) << 8 | @as(u24, buf[2]);
         return .{
             .length = length,
-            .frame_type = @enumFromInt(buf[3]),
+            .frame_type = @fromBackingInt(@intCast(buf[3])),
             .flags = .{ .value = buf[4] },
             .stream_id = @intCast(mem.readInt(u32, buf[5..9], .big) & 0x7FFFFFFF),
         };
@@ -91,7 +91,7 @@ pub const FrameHeader = struct {
         buf[0] = @intCast((self.length >> 16) & 0xFF);
         buf[1] = @intCast((self.length >> 8) & 0xFF);
         buf[2] = @intCast(self.length & 0xFF);
-        buf[3] = @intFromEnum(self.frame_type);
+        buf[3] = @backingInt(self.frame_type);
         buf[4] = self.flags.value;
         mem.writeInt(u32, buf[5..9], @as(u32, self.stream_id), .big);
         return buf;
@@ -149,7 +149,7 @@ pub fn writeSettings(writer: *Io.Writer, settings: []const Setting) !void {
     const hdr = header.encode();
     try writer.writeAll(&hdr);
     for (settings) |s| {
-        try writer.writeInt(u16, @intFromEnum(s.id), .big);
+        try writer.writeInt(u16, @backingInt(s.id), .big);
         try writer.writeInt(u32, s.value, .big);
     }
 }
@@ -163,7 +163,7 @@ pub fn writeSettingsAck(writer: *Io.Writer) !void {
 pub fn writeGoaway(writer: *Io.Writer, last_stream_id: u31, error_code: ErrorCode, debug_data: []const u8) !void {
     var buf: [8]u8 = undefined;
     mem.writeInt(u32, buf[0..4], @as(u32, last_stream_id), .big);
-    mem.writeInt(u32, buf[4..8], @intFromEnum(error_code), .big);
+    mem.writeInt(u32, buf[4..8], @backingInt(error_code), .big);
 
     const header = FrameHeader{
         .length = @intCast(8 + debug_data.len),
@@ -189,7 +189,7 @@ pub fn writeWindowUpdate(writer: *Io.Writer, stream_id: u31, increment: u31) !vo
 /// Write a RST_STREAM frame.
 pub fn writeRstStream(writer: *Io.Writer, stream_id: u31, error_code: ErrorCode) !void {
     var buf: [4]u8 = undefined;
-    mem.writeInt(u32, buf[0..4], @intFromEnum(error_code), .big);
+    mem.writeInt(u32, buf[0..4], @backingInt(error_code), .big);
     try writeFrame(writer, .rst_stream, Flags.none, stream_id, &buf);
 }
 
@@ -220,7 +220,7 @@ pub const SettingsIterator = struct {
         const value: u32 = mem.readInt(u32, self.data[self.offset + 2 ..][0..4], .big);
         self.offset += 6;
         return .{
-            .id = @enumFromInt(id),
+            .id = @fromBackingInt(@intCast(id)),
             .value = value,
         };
     }
@@ -236,7 +236,7 @@ pub const GoawayPayload = struct {
         if (payload.len < 8) return error.FrameSizeError;
         return .{
             .last_stream_id = @intCast(mem.readInt(u32, payload[0..4], .big) & 0x7FFFFFFF),
-            .error_code = @enumFromInt(mem.readInt(u32, payload[4..8], .big)),
+            .error_code = @fromBackingInt(@intCast(mem.readInt(u32, payload[4..8], .big))),
             .debug_data = payload[8..],
         };
     }
@@ -253,7 +253,7 @@ pub fn parseWindowUpdate(payload: []const u8) !u31 {
 /// Parse RST_STREAM payload.
 pub fn parseRstStream(payload: []const u8) !ErrorCode {
     if (payload.len != 4) return error.FrameSizeError;
-    return @enumFromInt(mem.readInt(u32, payload[0..4], .big));
+    return @fromBackingInt(@intCast(mem.readInt(u32, payload[0..4], .big)));
 }
 
 /// Parse PING payload.

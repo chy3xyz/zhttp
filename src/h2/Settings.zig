@@ -96,7 +96,7 @@ pub fn encode(self: *const Settings, buf: []u8) !usize {
 
         if (self_val != default_val) {
             if (pos + 6 > buf.len) return error.BufferTooSmall;
-            std.mem.writeInt(u16, buf[pos..][0..2], @intFromEnum(id), .big);
+            std.mem.writeInt(u16, buf[pos..][0..2], @backingInt(id), .big);
             std.mem.writeInt(u32, buf[pos + 2 ..][0..4], self_val, .big);
             pos += 6;
         }
@@ -223,7 +223,7 @@ test "apply invalid max_frame_size" {
 
 test "apply unknown setting is ignored" {
     var s: Settings = .{};
-    try s.apply(@enumFromInt(0xFF), 42);
+    try s.apply(@fromBackingInt(@intCast(0xFF)), 42);
     // No crash, no change to known fields
     try testing.expectEqual(@as(u32, 4096), s.header_table_size);
 }

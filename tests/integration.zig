@@ -26,7 +26,9 @@ fn plainHandler(_: std.mem.Allocator, _: std.Io, request: *const httpz.Request) 
         return .{ .status = .no_content };
     }
     if (std.mem.eql(u8, request.uri, "/gzip")) {
-        return httpz.Response.init(.ok, "text/plain",
+        return httpz.Response.init(
+            .ok,
+            "text/plain",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
@@ -62,7 +64,9 @@ fn routeCreateUser(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request) htt
 }
 
 fn routeCompressed(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request) httpz.Response {
-    return httpz.Response.init(.ok, "text/plain",
+    return httpz.Response.init(
+        .ok,
+        "text/plain",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
@@ -318,7 +322,8 @@ test "integration: redirect returns 302 with Location" {
 
 test "integration: 204 No Content has no body" {
     ensurePlainServer();
-    const raw = try rawRequest(plain_port,
+    const raw = try rawRequest(
+        plain_port,
         "GET /empty HTTP/1.1\r\n" ++
             "Host: 127.0.0.1\r\n" ++
             "Connection: close\r\n" ++
@@ -333,7 +338,8 @@ test "integration: 204 No Content has no body" {
 
 test "integration: gzip compression" {
     ensurePlainServer();
-    const raw = try rawRequest(plain_port,
+    const raw = try rawRequest(
+        plain_port,
         "GET /gzip HTTP/1.1\r\n" ++
             "Host: 127.0.0.1\r\n" ++
             "Accept-Encoding: gzip\r\n" ++
@@ -372,7 +378,8 @@ test "integration: Content-Length header is set" {
 
 test "integration: HEAD returns headers but no body" {
     ensurePlainServer();
-    const raw = try rawRequest(plain_port,
+    const raw = try rawRequest(
+        plain_port,
         "HEAD / HTTP/1.1\r\n" ++
             "Host: 127.0.0.1\r\n" ++
             "Connection: close\r\n" ++
@@ -453,7 +460,8 @@ test "integration: router 404 for unmatched route" {
 
 test "integration: router compression middleware" {
     ensureRouterServer();
-    const raw = try rawRequest(router_port,
+    const raw = try rawRequest(
+        router_port,
         "GET /compressed HTTP/1.1\r\n" ++
             "Host: 127.0.0.1\r\n" ++
             "Accept-Encoding: gzip\r\n" ++
@@ -470,7 +478,8 @@ test "integration: router compression middleware" {
 
 test "integration: streaming chunked response" {
     ensureRouterServer();
-    const raw = try rawRequest(router_port,
+    const raw = try rawRequest(
+        router_port,
         "GET /stream/chunks HTTP/1.1\r\n" ++
             "Host: 127.0.0.1\r\n" ++
             "Connection: close\r\n" ++
@@ -487,7 +496,8 @@ test "integration: streaming chunked response" {
 
 test "integration: streaming SSE response" {
     ensureRouterServer();
-    const raw = try rawRequest(router_port,
+    const raw = try rawRequest(
+        router_port,
         "GET /stream/events HTTP/1.1\r\n" ++
             "Host: 127.0.0.1\r\n" ++
             "Connection: close\r\n" ++
@@ -504,7 +514,8 @@ test "integration: streaming SSE response" {
 
 test "integration: streaming large response" {
     ensureRouterServer();
-    const raw = try rawRequest(router_port,
+    const raw = try rawRequest(
+        router_port,
         "GET /stream/large HTTP/1.1\r\n" ++
             "Host: 127.0.0.1\r\n" ++
             "Connection: close\r\n" ++
@@ -610,7 +621,7 @@ fn sendMaskedFrame(writer: *Io.Writer, opcode: httpz.WebSocket.Opcode, payload: 
     var header: [14]u8 = undefined;
     var header_len: usize = 2;
 
-    header[0] = 0x80 | @as(u8, @intFromEnum(opcode));
+    header[0] = 0x80 | @as(u8, @backingInt(opcode));
     if (payload.len < 126) {
         header[1] = 0x80 | @as(u8, @intCast(payload.len));
     } else if (payload.len <= 65535) {

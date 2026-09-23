@@ -1090,7 +1090,7 @@ test "Request.Method: fromString parses all standard methods" {
 test "Request.Method: toBytes roundtrip" {
     const enum_info = @typeInfo(Method).@"enum";
     inline for (enum_info.field_names, enum_info.field_values) |_, value| {
-        const m: Method = @enumFromInt(value);
+        const m: Method = @fromBackingInt(@intCast(value));
         try testing.expectEqual(m, Method.fromString(m.toBytes()).?);
     }
 }

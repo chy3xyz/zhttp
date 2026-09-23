@@ -102,7 +102,9 @@ test "compression middleware: wraps route handler and compresses" {
     const inner = struct {
         fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             // Use a body large enough that gzip actually shrinks it
-            return Response.init(.ok, "text/plain",
+            return Response.init(
+                .ok,
+                "text/plain",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
@@ -129,7 +131,9 @@ test "compression middleware: wraps route handler and compresses" {
 test "compression middleware: skips when not accepted" {
     const inner = struct {
         fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
-            return Response.init(.ok, "text/plain",
+            return Response.init(
+                .ok,
+                "text/plain",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             );
@@ -150,7 +154,9 @@ test "compression middleware: skips when not accepted" {
 test "compression middleware: skips non-compressible content types" {
     const inner = struct {
         fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
-            return Response.init(.ok, "image/png",
+            return Response.init(
+                .ok,
+                "image/png",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             );

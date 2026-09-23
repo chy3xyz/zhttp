@@ -87,7 +87,7 @@ pub const Conn = struct {
                         if (frame.payload.len >= 2)
                             std.mem.readInt(u16, frame.payload[0..2], .big)
                         else
-                            @intFromEnum(CloseCode.normal),
+                            @backingInt(CloseCode.normal),
                         "",
                     ) catch {};
                     self.closed = true;
@@ -162,7 +162,7 @@ pub const Conn = struct {
         self.reader.readSliceAll(&header) catch return error.ConnectionClosed;
 
         const fin = (header[0] & 0x80) != 0;
-        const opcode: Opcode = @enumFromInt(@as(u4, @truncate(header[0] & 0x0f)));
+        const opcode: Opcode = @fromBackingInt(@intCast(@as(u4, @truncate(header[0] & 0x0f))));
         const masked = (header[1] & 0x80) != 0;
         // RFC 6455 Section 5.1: client frames MUST be masked
         if (!masked) return error.ProtocolError;
@@ -206,7 +206,7 @@ pub const Conn = struct {
         var header: [10]u8 = undefined;
         var header_len: usize = 2;
 
-        header[0] = @as(u8, if (fin) 0x80 else 0) | @as(u8, @intFromEnum(opcode));
+        header[0] = @as(u8, if (fin) 0x80 else 0) | @as(u8, @backingInt(opcode));
 
         // Server frames are NOT masked (mask bit = 0)
         if (payload.len < 126) {
