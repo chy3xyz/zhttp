@@ -141,13 +141,20 @@ fn wsEchoHandler(conn: *httpz.WebSocket.Conn, _: *const httpz.Request) void {
 
 // ─── Helpers ────────────────────────────────────────────────────
 
-/// Kernel-level sleep that doesn't go through Io.
+// Kernel-level sleep that doesn't go through Io.
+//
+// `std.posix.system` is the C library's own nanosleep on Darwin: `std.os.linux`
+// issues syscalls in the Linux register convention, which the Darwin kernel does
+// not read — a syscall it does not recognise there is a SIGSYS, "bad system
+// call", and it kills the test process. That went unnoticed because the one
+// caller probes a port that is ready on the first try, so the sleep is rarely
+// reached.
 fn osSleep(ms: u32) void {
-    const ts = std.posix.timespec{
+    var ts = std.posix.timespec{
         .sec = @intCast(ms / 1000),
         .nsec = @intCast(@as(u64, ms % 1000) * 1_000_000),
     };
-    _ = std.os.linux.nanosleep(@ptrCast(&ts), null);
+    while (std.posix.errno(std.posix.system.nanosleep(&ts, &ts)) == .INTR) {}
 }
 
 /// Shared server state — start each server type exactly once.
@@ -527,6 +534,73 @@ test "integration: streaming large response" {
     try testing.expect(std.mem.indexOf(u8, raw, "Transfer-Encoding: chunked") != null);
     try testing.expect(raw.len > 22000);
     try testing.expect(std.mem.indexOf(u8, raw, "All work and no play") != null);
+}
+
+// ─── Server Lifecycle Tests ─────────────────────────────────────
+
+// A stopped server has to give back what it took: `run` returns, the
+// connections it was serving and the sweeper thread are gone with it, and an
+// allocator that saw every allocation the server made is empty again.
+//
+// The allocator is checked here rather than in a `defer`: a defer runs after
+// the check and its frees would then be reported as leaks.
+test "integration: stopping the server returns from run and leaks nothing" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var threaded = Io.Threaded.init(gpa.allocator(), .{});
+    const io = threaded.io();
+
+    var server = httpz.Server.init(.{
+        .port = 0, // ephemeral: two test processes must not fight over a port
+        .address = "127.0.0.1",
+        .max_connections = 8,
+        // Short, so that a stop is not held up by a whole sweeper interval and
+        // the accept loop looks at the stop flag often.
+        .sweeper_interval_ms = 20,
+        .accept_poll_interval_ms = 20,
+    }, plainHandler);
+
+    const Runner = struct {
+        fn run(srv: *httpz.Server, sio: Io) void {
+            srv.run(sio) catch {};
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ &server, io });
+
+    // The config asked for an ephemeral port, so wait for `run` to bind and
+    // then ask the server which port it got.
+    var port: u16 = 0;
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        port = server.boundPort();
+        if (port != 0) break;
+        osSleep(10);
+    }
+    try testing.expect(port != 0);
+
+    const raw = try rawRequest(port, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    defer testing.allocator.free(raw);
+    try testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200 OK"));
+    try testing.expect(std.mem.endsWith(u8, raw, "Hello, World!"));
+
+    // A second connection that sends nothing and stays open: the server is
+    // holding it and blocked in a read on it when it is asked to stop. Wait for
+    // the accept loop to take it rather than guessing a delay.
+    const addr = Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return error.InvalidAddress;
+    const idle = Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.ConnectionFailed;
+    attempts = 0;
+    while (attempts < 200 and server.active_connections.load(.monotonic) == 0) : (attempts += 1) {
+        osSleep(5);
+    }
+    try testing.expect(server.active_connections.load(.monotonic) > 0);
+
+    server.stop();
+    thread.join(); // never returns if the stop did not reach the accept loop
+
+    idle.close(io);
+    server.deinit();
+    threaded.deinit();
+
+    try testing.expectEqual(std.heap.Check.ok, gpa.deinit());
 }
 
 // ─── WebSocket Tests ────────────────────────────────────────────

@@ -89,6 +89,11 @@ pub const Config = struct {
     /// 0 disables the sweeper. Default 2000ms balances responsiveness with
     /// poll() syscall overhead.
     sweeper_interval_ms: u32 = 2000,
+    /// How long the accept loop waits for a pending connection before it looks
+    /// at the stop flag again. `Io.net.Server.accept` blocks with no timeout
+    /// and a listening socket cannot be woken from another thread, so this is
+    /// the upper bound on how long `Server.stop` takes to be noticed.
+    accept_poll_interval_ms: u32 = 100,
 };
 
 const min_initial_request_buffer_size = 16 * 1024;
@@ -97,6 +102,10 @@ const min_initial_request_buffer_size = 16 * 1024;
 /// Linux-specific. Not currently exposed via `std.posix.POLL`, but the
 /// kernel ABI value is stable at 0x2000 on all supported architectures.
 const POLLRDHUP: i16 = 0x2000;
+
+/// Longest single sleep in the sweeper's wait loop, and so the delay a stop
+/// can suffer from the sweeper's own interval.
+const sweeper_max_sleep_ns = 50 * std.time.ns_per_ms;
 
 /// CLOSE-WAIT sweeper config.
 ///
@@ -143,15 +152,25 @@ const ConnSweeper = struct {
         defer pollfds.deinit(self.allocator);
 
         while (!self.stop.load(.acquire)) {
-            // Sleep the interval. Use posix nanosleep — std.Thread.sleep was
-            // removed in Zig 0.16, and Io.sleep requires an Io handle we don't
-            // own here (the sweeper is a plain std.Thread).
+            // Sleep the interval, in slices, so that a stop is noticed within
+            // `sleep_slice_ns` of being requested: `Server.run` joins this
+            // thread before it returns, and a whole-interval sleep would hold
+            // the server up for the rest of that interval.
+            //
+            // posix nanosleep is used directly — std.Thread.sleep was removed
+            // in Zig 0.16, and Io.sleep requires an Io handle we don't own
+            // here (the sweeper is a plain std.Thread).
             const total_ns: u64 = @as(u64, self.interval_ms) * std.time.ns_per_ms;
-            var req = std.posix.timespec{
-                .sec = @intCast(total_ns / std.time.ns_per_s),
-                .nsec = @intCast(total_ns % std.time.ns_per_s),
-            };
-            while (std.posix.errno(std.posix.system.nanosleep(&req, &req)) == .INTR) {}
+            var slept_ns: u64 = 0;
+            while (slept_ns < total_ns and !self.stop.load(.acquire)) {
+                const slice_ns: u64 = @min(total_ns - slept_ns, sweeper_max_sleep_ns);
+                var req = std.posix.timespec{
+                    .sec = @intCast(slice_ns / std.time.ns_per_s),
+                    .nsec = @intCast(slice_ns % std.time.ns_per_s),
+                };
+                while (std.posix.errno(std.posix.system.nanosleep(&req, &req)) == .INTR) {}
+                slept_ns += slice_ns;
+            }
 
             self.lockMutex();
             pollfds.clearRetainingCapacity();
@@ -192,6 +211,13 @@ config: Config,
 handler: Connection.Handler,
 active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 sweeper: ?*ConnSweeper = null,
+/// Port the listener is bound to while `run` is serving, 0 when it is not.
+/// A config port of 0 asks the OS for an ephemeral port, so this is how a
+/// caller learns which one it was given.
+port: std.atomic.Value(u16) = .init(0),
+/// Set by `stop` and read by the accept loop, so the server can be brought
+/// down from another thread.
+stopping: std.atomic.Value(bool) = .init(false),
 
 pub fn init(config: Config, handler: Connection.Handler) Server {
     return .{
@@ -200,11 +226,48 @@ pub fn init(config: Config, handler: Connection.Handler) Server {
     };
 }
 
+/// The port the listener is bound to while `run` is serving, 0 before `run`
+/// has bound it and after `run` returns. Read this instead of `config.port`
+/// when the config asked for an ephemeral port (`port = 0`).
+pub fn boundPort(self: *const Server) u16 {
+    return self.port.load(.acquire);
+}
+
+/// Asks `run` to come back, so a server can be taken down from another thread
+/// — a signal-handling task, or a test that wants its resources freed.
+///
+/// The accept loop notices between turns: it waits at most
+/// `accept_poll_interval_ms` for a connection, so `run` returns within about
+/// that long, plus however long the connections it is serving take to finish
+/// being cancelled. This is a stop, not a graceful shutdown: a request in
+/// flight is cut off where it stands, its connection is closed without a
+/// response, and a keep-alive connection waiting for its next request gets
+/// closed instead. Nothing tries to drain or to tell the peer why.
+pub fn stop(self: *Server) void {
+    self.stopping.store(true, .release);
+}
+
+/// Releases what the server holds. Everything the server owns — the listening
+/// socket, the accepted connections, the CLOSE-WAIT sweeper — belongs to `run`
+/// and is gone by the time `run` returns, so after a stopped server this only
+/// checks that nothing was left behind. It exists so that a caller that has
+/// initialised a `Server` has the closing half of `init` to call.
+pub fn deinit(self: *Server) void {
+    std.debug.assert(self.sweeper == null);
+    std.debug.assert(self.active_connections.load(.monotonic) == 0);
+    std.debug.assert(self.port.load(.acquire) == 0);
+}
+
 /// Start the server. This is the main entry point for running the HTTP server
 /// with the Zig 0.16 std.Io networking API.
 ///
 /// Uses Io.net.IpAddress.listen() to create a listening socket and
 /// Server.accept() to handle incoming connections.
+///
+/// Returns once `stop` has been called (see there for what stopping does and
+/// does not promise), after closing the listener, cancelling the connections it
+/// was serving and joining the sweeper. `boundPort` reports which port it bound
+/// while it runs.
 pub const RunError = error{AddressInUse};
 
 pub fn run(self: *Server, io: Io) RunError!void {
@@ -219,9 +282,11 @@ pub fn run(self: *Server, io: Io) RunError!void {
     } else |_| {}
 
     var server = Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true }) catch return error.AddressInUse;
-    defer server.deinit(io);
-    var connection_group: Io.Group = .init;
-    defer connection_group.cancel(io);
+    self.port.store(server.socket.address.getPort(), .release);
+    defer {
+        self.port.store(0, .release);
+        server.deinit(io);
+    }
 
     // Spawn the CLOSE-WAIT sweeper. Best-effort: if anything fails (allocator
     // out of memory, thread spawn fails), we proceed without it — connections
@@ -239,6 +304,9 @@ pub fn run(self: *Server, io: Io) RunError!void {
             sweeper_started = true;
         } else |_| {}
     }
+    // Declared before the connection group so that it runs after it: connection
+    // tasks unregister from the sweeper on their way out, so the sweeper — and
+    // the `sweeper` field they read to find it — has to outlive them.
     defer if (sweeper_started) {
         sweeper.stop.store(true, .release);
         if (sweeper.thread) |t| t.join();
@@ -246,8 +314,19 @@ pub fn run(self: *Server, io: Io) RunError!void {
         self.sweeper = null;
     };
 
-    while (true) {
+    var connection_group: Io.Group = .init;
+    defer connection_group.cancel(io);
+
+    while (!self.stopping.load(.acquire)) {
+        // `accept` blocks with no timeout and a listening socket cannot be
+        // woken from another thread, so wait for a pending connection rather
+        // than blocking in accept: the loop then reads the stop flag at least
+        // once per `accept_poll_interval_ms`. The socket is still blocking and
+        // is handed to `accept` unchanged.
+        if (!pollReadable(server.socket.handle, self.config.accept_poll_interval_ms)) continue;
+
         const stream = server.accept(io) catch |err| {
+            if (self.stopping.load(.acquire)) break;
             std.debug.print("Accept error: {}\n", .{err});
             continue;
         };
@@ -274,6 +353,19 @@ pub fn run(self: *Server, io: Io) RunError!void {
             continue;
         };
     }
+}
+
+/// Waits up to `timeout_ms` for a connection to be pending on the listening
+/// socket and reports whether one is. `accept` on this socket blocks with no
+/// timeout, so the accept loop asks first instead of finding out the hard way.
+fn pollReadable(fd: Io.net.Socket.Handle, timeout_ms: u32) bool {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = std.posix.poll(&fds, @intCast(timeout_ms)) catch return false;
+    return ready > 0 and (fds[0].revents & std.posix.POLL.IN) != 0;
 }
 
 /// Handle a single TCP connection, potentially with multiple requests
