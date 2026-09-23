@@ -84,6 +84,9 @@ pub const Server = struct {
     allocator: std.mem.Allocator,
     handler: Handler,
     options: Options,
+    /// Set by `stop` and read by the run loop, so the server can be taken down
+    /// from another thread.
+    stopping: std.atomic.Value(bool) = .init(false),
 
     const reap_interval_ns = 1 * std.time.ns_per_s;
 
@@ -101,12 +104,22 @@ pub const Server = struct {
         self.listener.deinit();
     }
 
+    /// Asks `run` to come back, so a server can be taken down from another
+    /// thread. The loop notices between turns — it is waiting in `poll` for up
+    /// to a second when nothing is happening — and then closes what it was
+    /// serving. This is a stop, not a graceful shutdown: requests in flight are
+    /// cut off rather than drained, and the peers get a CONNECTION_CLOSE rather
+    /// than a GOAWAY.
+    pub fn stop(self: *Server) void {
+        self.stopping.store(true, .release);
+    }
+
     pub fn run(self: *Server) !void {
         var buf: [65536]u8 = undefined;
         std.debug.print("H3 server listening on UDP\n", .{});
 
         var last_reap = nowNanos();
-        while (true) {
+        while (!self.stopping.load(.acquire)) {
             // Wait for a datagram, for the nearest QUIC timer, or for the reap
             // interval — whichever comes first. Sleeping a fixed amount here is
             // what held the whole server to one datagram per turn; a connection
@@ -124,6 +137,10 @@ pub const Server = struct {
                 last_reap = nowNanos();
             }
         }
+
+        // Nothing that arrived after the loop may be answered from state the
+        // caller is about to free: this returns with the connections gone.
+        self.closeAllConnections();
     }
 
     /// Nanoseconds until the event loop has to run again: the nearest of the

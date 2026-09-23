@@ -188,6 +188,39 @@ test "h3: a handler's own response headers reach the client" {
     try std.testing.expectEqualStrings("moved", answer.body);
 }
 
+test "h3: a stopped server gives everything back" {
+    try quic.setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
+
+    // A leak-checking allocator over a whole exchange: the server and the
+    // client both take their per-request state — the request arena, the header
+    // arrays, the response body — from it, so anything that never comes back
+    // fails the test instead of running until the process exits.
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    const allocator = gpa.allocator();
+
+    var server = try allocator.create(Server);
+    server.* = try Server.init(allocator, 0, echoHandler, .{});
+    const port = std.mem.bigToNative(u16, server.listener.local_addr.port);
+    const thread = try std.Thread.spawn(.{}, serve, .{server});
+
+    var client = try Client.init(allocator, "127.0.0.1", port, .{ .insecure_skip_verify = true });
+    const answer = try client.send("POST", "/echo", &.{
+        .{ .name = "x-test", .value = "seen-value" },
+    }, "payload");
+    allocator.free(answer.header_text);
+    allocator.free(answer.body);
+    try std.testing.expectEqual(@as(u16, 201), answer.status);
+    client.deinit();
+
+    // The server notices `stop` between turns and closes what it was serving.
+    server.stop();
+    thread.join();
+    server.deinit();
+    allocator.destroy(server);
+
+    try std.testing.expectEqual(std.heap.Check.ok, gpa.deinit());
+}
+
 test "h3: serves a second client while the first is still connected" {
     try quic.setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
 
@@ -217,24 +250,32 @@ test "h3: serves a second client while the first is still connected" {
     try std.testing.expectEqualStrings("OK", first_again);
 }
 
+// The idle-timeout path: the server starts closing a quiet connection, answers
+// what the peer still sends with the same CONNECTION_CLOSE, and reaps the
+// connection when the period is over. It runs on a leak-checking allocator
+// because that path frees a connection, its H3 state and its routing entries,
+// which is the bookkeeping most likely to go wrong.
 test "h3: a closing connection answers the peer with CONNECTION_CLOSE" {
     try quic.setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
 
-    const allocator = std.heap.page_allocator;
-    const server = try allocator.create(Server);
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    const allocator = gpa.allocator();
+
+    var server = try allocator.create(Server);
     // A short idle timeout so the server starts closing while the test watches.
     server.* = try Server.init(allocator, 0, handler, .{
         .idle_timeout_ns = 200 * std.time.ns_per_ms,
         .closing_period_ns = 2 * std.time.ns_per_s,
     });
     const port = std.mem.bigToNative(u16, server.listener.local_addr.port);
-    _ = try std.Thread.spawn(.{}, serve, .{server});
+    const thread = try std.Thread.spawn(.{}, serve, .{server});
 
     var client = try Client.init(allocator, "127.0.0.1", port, .{ .insecure_skip_verify = true });
-    defer client.deinit();
     const body = try client.get("/");
-    defer allocator.free(body);
     try std.testing.expectEqualStrings("OK", body);
+    // Freed here rather than by a `defer`: the leak check at the end of the
+    // test runs before the function's defers do.
+    allocator.free(body);
 
     // Let the connection go idle, so the server enters its closing period.
     sleepMs(1500);
@@ -243,6 +284,17 @@ test "h3: a closing connection answers the peer with CONNECTION_CLOSE" {
     // CONNECTION_CLOSE, and the client notices the connection is gone instead
     // of waiting out its own timeout.
     try std.testing.expectError(error.ConnectionClosed, client.get("/"));
+    client.deinit();
+
+    // Long enough for the closing period to be over and the connection to be
+    // reaped before the server is taken down.
+    sleepMs(1500);
+    server.stop();
+    thread.join();
+    server.deinit();
+    allocator.destroy(server);
+
+    try std.testing.expectEqual(std.heap.Check.ok, gpa.deinit());
 }
 
 test "h3: server drops a connection as soon as the client closes it" {
