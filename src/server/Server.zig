@@ -111,7 +111,7 @@ const POLLRDHUP: i16 = 0x2000;
 /// otherwise never re-enter the read loop to observe the peer's FIN.
 const ConnSweeper = struct {
     mutex: std.atomic.Mutex = .unlocked,
-    fds: std.ArrayListUnmanaged(Io.net.Socket.Handle) = .empty,
+    fds: std.ArrayList(Io.net.Socket.Handle) = .empty,
     stop: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
     allocator: std.mem.Allocator,
@@ -139,7 +139,7 @@ const ConnSweeper = struct {
     }
 
     fn run(self: *ConnSweeper) void {
-        var pollfds: std.ArrayListUnmanaged(std.posix.pollfd) = .empty;
+        var pollfds: std.ArrayList(std.posix.pollfd) = .empty;
         defer pollfds.deinit(self.allocator);
 
         while (!self.stop.load(.acquire)) {
