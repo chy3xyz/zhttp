@@ -67,15 +67,14 @@ pub const Server = struct {
 
         var last_reap = nowNanos();
         while (true) {
-            // One datagram per turn, read without blocking: an idle server sleeps
-            // instead of waiting on the socket.
-            var peer_addr: posix.sockaddr.in = undefined;
-            var peer_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-            const n = std.c.recvfrom(self.listener.socket, &buf, buf.len, std.c.MSG.DONTWAIT, @ptrCast(&peer_addr), &peer_addr_len);
-            if (n > 0) {
-                self.handleDatagram(&buf, @intCast(n), &peer_addr);
-            } else {
-                sleepMs(1);
+            // Wait for a datagram, for the nearest QUIC timer, or for the reap
+            // interval — whichever comes first. Sleeping a fixed amount here is
+            // what held the whole server to one datagram per turn; a connection
+            // knows when it next has something to do (`ngtcp2_conn_get_expiry`),
+            // and until then only the socket can change anything.
+            if (quic.pollReadable(self.listener.socket, self.waitNs())) {
+                // Take everything that is already queued, not one datagram.
+                self.drainSocket(&buf);
             }
 
             self.serviceConnections();
@@ -84,6 +83,32 @@ pub const Server = struct {
                 self.reapConnections();
                 last_reap = nowNanos();
             }
+        }
+    }
+
+    /// Nanoseconds until the event loop has to run again: the nearest of the
+    /// connections' QUIC timers, and never longer than the reap interval, so an
+    /// idle server still runs its idle-connection bookkeeping.
+    fn waitNs(self: *Server) u64 {
+        var wait: u64 = reap_interval_ns;
+        const now = nowNanos();
+        var it = self.listener.connections.iterator();
+        while (it.next()) |entry| {
+            const expiry = quic.getExpiry(entry.value_ptr.*) orelse continue;
+            wait = @min(wait, expiry -| now);
+        }
+        return wait;
+    }
+
+    /// Feeds every datagram already waiting on the listener socket to the
+    /// connection that owns it.
+    fn drainSocket(self: *Server, buf: []u8) void {
+        for (0..quic.max_datagrams_per_drain) |_| {
+            var peer_addr: posix.sockaddr.in = undefined;
+            var peer_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+            const n = std.c.recvfrom(self.listener.socket, buf.ptr, buf.len, std.c.MSG.DONTWAIT, @ptrCast(&peer_addr), &peer_addr_len);
+            if (n <= 0) return;
+            self.handleDatagram(buf, @intCast(n), &peer_addr);
         }
     }
 
@@ -163,7 +188,7 @@ pub const Server = struct {
 
         var server_scid: ngtcp2.ngtcp2_cid = undefined;
         server_scid.datalen = quic.cid_length;
-        std.c.arc4random_buf(&server_scid.data, quic.cid_length);
+        quic.fillRandom(server_scid.data[0..quic.cid_length]);
 
         // The server sends to the client's source connection ID: for the server
         // `dcid` is "the Connection ID that appears in client Initial packet as
@@ -320,7 +345,14 @@ pub const Server = struct {
                 setupH3Streams(h3, conn) catch {};
             }
             serveRequests(self, h3.session);
-            pumpServerWrites(h3.session, conn);
+            // A failure here means nghttp3 or ngtcp2 has had it with this
+            // connection (nghttp3.h: after a connection error nothing but
+            // deleting the HTTP/3 connection may touch it), so it is closed
+            // instead of being offered to either of them again.
+            pumpServerWrites(h3.session, conn) catch {
+                self.startClosing(conn, h3);
+                continue;
+            };
             _ = quic.flushPackets(conn) catch {};
             quic.handleExpiryIfDue(conn);
         }
@@ -476,7 +508,7 @@ fn serveRequests(self: *Server, session: *http3.Session) void {
 /// on the connection but `nghttp3_conn_del` is undefined behaviour. It is
 /// reported as such, with the QUIC error code the connection is closed with.
 pub fn onQuicServerStreamData(h3_conn: *anyopaque, stream_id: i64, data: []const u8, fin: bool, ts: u64) quic.StreamRead {
-    const conn: *nghttp3.nghttp3_conn = @alignCast(@ptrCast(h3_conn));
+    const conn: *nghttp3.nghttp3_conn = @ptrCast(@alignCast(h3_conn));
     const consumed = nghttp3.nghttp3_conn_read_stream2(conn, stream_id, data.ptr, data.len, @intFromBool(fin), ts);
     if (consumed < 0) {
         return .{ .connection_error = nghttp3.nghttp3_err_infer_quic_app_error_code(@intCast(consumed)) };
@@ -484,54 +516,23 @@ pub fn onQuicServerStreamData(h3_conn: *anyopaque, stream_id: i64, data: []const
     return .{ .consumed = data.len };
 }
 
-/// Pump pending HTTP/3 write data (headers, body, FIN) into the QUIC connection.
-/// One round ends as soon as it stops making progress; whatever is left is
-/// offered again on the next event-loop turn.
-fn pumpServerWrites(session: *http3.Session, quic_conn: *quic.Connection) void {
+/// Pump pending HTTP/3 write data (headers, body, FIN) into QUIC packets.
+/// Each call packs one datagram with as much of what nghttp3 has queued as fits,
+/// and the round ends when ngtcp2 has nothing it can send — congestion limited,
+/// or nothing left to write.
+fn pumpServerWrites(session: *http3.Session, quic_conn: *quic.Connection) quic.Error!void {
+    // One timestamp for the whole round: every call that adds to the same
+    // packet has to pass the timestamp the packet was started with.
+    const ts = nowNanos();
+    var wrote = false;
     while (true) {
-        var write_stream_id: i64 = -1;
-        var write_fin: c_int = 0;
-        var vec: nghttp3.nghttp3_vec = undefined;
-        const nvec = nghttp3.nghttp3_conn_writev_stream(session.conn, &write_stream_id, &write_fin, &vec, 1);
-        if (nvec < 0 or write_stream_id == -1) break;
-
-        const data: []const u8 = if (nvec > 0) vec.base[0..vec.len] else &.{};
-        const result = quic.writeStreamPacket(quic_conn, write_stream_id, write_fin != 0, data) catch |err| switch (err) {
-            // nghttp3 would otherwise offer the same stream forever, so it has
-            // to be told why ngtcp2 did not take its data.
-            error.StreamDataBlocked => {
-                nghttp3.nghttp3_conn_block_stream(session.conn, write_stream_id);
-                continue;
-            },
-            error.StreamShutWrite => {
-                nghttp3.nghttp3_conn_shutdown_stream_write(session.conn, write_stream_id);
-                continue;
-            },
-            else => break,
-        };
-
-        switch (result) {
-            .blocked, .no_stream_frame => break,
-            .wrote => |written| {
-                if (nvec > 0) {
-                    _ = nghttp3.nghttp3_conn_add_write_offset(session.conn, write_stream_id, written);
-                    if (written == 0) break;
-                } else if (write_fin != 0) {
-                    // A packet carrying the zero length FIN went out, so the
-                    // stream's write side is done.
-                    _ = nghttp3.nghttp3_conn_add_write_offset(session.conn, write_stream_id, 0);
-                }
-            },
-        }
+        const sent = try quic.writePackedPacket(quic_conn, session.conn, ts);
+        if (sent == 0) break;
+        wrote = true;
     }
-}
-
-fn sleepMs(ms: u64) void {
-    var req = posix.timespec{
-        .sec = @intCast(ms / 1000),
-        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
-    };
-    while (posix.errno(posix.system.nanosleep(&req, &req)) == .INTR) {}
+    // ngtcp2.h: the application must tell ngtcp2 when packets carrying stream
+    // data went out, which is what its send pacing is measured from.
+    if (wrote) ngtcp2.ngtcp2_conn_update_pkt_tx_time(quic_conn.conn, ts);
 }
 
 fn nowNanos() u64 {

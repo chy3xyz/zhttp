@@ -25,6 +25,46 @@ fn sleepNs(ns: u64) void {
     while (posix.errno(posix.system.nanosleep(&req, &req)) == .INTR) {}
 }
 
+/// Fill `buf` with bytes from the system's cryptographically secure random
+/// source. Every connection ID and the stateless reset secret this layer
+/// chooses come from here.
+///
+/// `std.c.arc4random_buf` is not usable on its own: it is a `switch (native_os)`
+/// in std/c.zig that resolves to an empty tuple — a call that does nothing —
+/// on Linux unless the ABI is Android or glibc >= 2.36, and on any other
+/// platform whose libc has no such function. A connection ID or a reset secret
+/// filled that way is whatever the memory happened to hold, which is both a
+/// protocol and a security failure. This is what `std.Io.Threaded` does for
+/// `Io.randomSecure`, without needing the `Io`: the libc primitive where the
+/// ABI has one, the `getrandom` syscall otherwise, and a compile error where
+/// neither exists — never a silent no-op.
+pub fn fillRandom(buf: []u8) void {
+    if (buf.len == 0) return;
+    if (comptime builtin.link_libc and @TypeOf(c.arc4random_buf) != void) {
+        c.arc4random_buf(buf.ptr, buf.len);
+    } else if (comptime builtin.os.tag == .linux) {
+        // The syscall, not `std.c.getrandom`: this std leaves that one
+        // unimplemented for glibc < 2.25 and every musl, and the syscall is
+        // what it falls back to itself. `getrandom` hands back at most 256
+        // bytes per call, so a longer buffer takes several.
+        var filled: usize = 0;
+        while (filled < buf.len) {
+            const rc = std.os.linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
+            switch (posix.errno(rc)) {
+                .SUCCESS => filled += @intCast(rc),
+                .INTR => continue,
+                // EFAULT and EINVAL are the only other ways this call fails and
+                // neither can happen here: the buffer is a live Zig slice and
+                // the flags word is 0. Stopping loudly beats handing out bytes
+                // that were never written.
+                else => @panic("h3: getrandom failed"),
+            }
+        }
+    } else {
+        @compileError("h3: no source of cryptographically secure random bytes for this target");
+    }
+}
+
 /// Server SSL_CTX for QUIC TLS handshake (set by setServerCert).
 var server_ssl_ctx: ?*anyopaque = null;
 
@@ -38,7 +78,10 @@ pub fn setServerCert(cert_pem: []const u8, key_pem: []const u8) !void {
     const cert_bio = ossl.BIO_new_mem_buf(cert_pem.ptr, @intCast(cert_pem.len)) orelse return error.TlsError;
     defer _ = ossl.BIO_free(cert_bio);
     const x509 = ossl.PEM_read_bio_X509(cert_bio, null, null, null) orelse return error.TlsError;
-    if (ossl.SSL_CTX_use_certificate(ctx, x509) != 1) { ossl.X509_free(x509); return error.TlsError; }
+    if (ossl.SSL_CTX_use_certificate(ctx, x509) != 1) {
+        ossl.X509_free(x509);
+        return error.TlsError;
+    }
     ossl.X509_free(x509);
 
     // Load private key
@@ -65,7 +108,7 @@ fn alpnSelectH3Cb(
     _: ?*anyopaque,
 ) callconv(.c) c_int {
     const h3 = "\x02h3";
-    const ret = ossl.SSL_select_next_proto(@constCast(@ptrCast(out)), outlen, h3, h3.len, in, inlen);
+    const ret = ossl.SSL_select_next_proto(@ptrCast(@constCast(out)), outlen, h3, h3.len, in, inlen);
     if (ret == ossl.OPENSSL_NPN_NEGOTIATED) return ossl.SSL_TLSEXT_ERR_OK;
     return ossl.SSL_TLSEXT_ERR_ALERT_FATAL;
 }
@@ -392,7 +435,7 @@ pub fn recvStreamDataCb(
 ) callconv(.c) c_int {
     _ = offset;
     _ = stream_user_data;
-    const ctx: *StreamDataCtx = @alignCast(@ptrCast(user_data));
+    const ctx: *StreamDataCtx = @ptrCast(@alignCast(user_data));
     const fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0;
     // The timestamp ngtcp2 is working off is the one this packet was read with,
     // so nghttp3 sees the same clock ngtcp2 does and never sees it go backwards.
@@ -429,7 +472,7 @@ pub fn ackedStreamDataOffsetCb(
     // A connection without an HTTP/3 layer (or one that is not attached to an
     // H3 session yet) has nothing to hand the acknowledgement to.
     const ctx: *StreamDataCtx = @ptrCast(@alignCast(user_data orelse return 0));
-    const h3_conn: *nghttp3.nghttp3_conn = @alignCast(@ptrCast(ctx.h3_conn));
+    const h3_conn: *nghttp3.nghttp3_conn = @ptrCast(@alignCast(ctx.h3_conn));
     if (nghttp3.nghttp3_conn_add_ack_offset(h3_conn, stream_id, @intCast(datalen)) != 0) {
         return ngtcp2.NGTCP2_ERR_CALLBACK_FAILURE;
     }
@@ -456,7 +499,7 @@ pub fn extendMaxStreamDataCb(
     _: ?*anyopaque,
 ) callconv(.c) c_int {
     const ctx: *StreamDataCtx = @ptrCast(@alignCast(user_data orelse return 0));
-    _ = nghttp3.nghttp3_conn_unblock_stream(@alignCast(@ptrCast(ctx.h3_conn)), stream_id);
+    _ = nghttp3.nghttp3_conn_unblock_stream(@ptrCast(@alignCast(ctx.h3_conn)), stream_id);
     return 0;
 }
 
@@ -493,7 +536,7 @@ pub fn extendMaxRemoteStreamsBidiCb(
     user_data: ?*anyopaque,
 ) callconv(.c) c_int {
     const ctx: *StreamDataCtx = @ptrCast(@alignCast(user_data orelse return 0));
-    nghttp3.nghttp3_conn_set_max_client_streams_bidi(@alignCast(@ptrCast(ctx.h3_conn)), max_streams);
+    nghttp3.nghttp3_conn_set_max_client_streams_bidi(@ptrCast(@alignCast(ctx.h3_conn)), max_streams);
     return 0;
 }
 
@@ -509,62 +552,111 @@ fn sendPacket(conn: *Connection, path: *const ngtcp2.ngtcp2_path, len: usize) Er
     return sendBytes(conn, path, conn.buf[0..len]);
 }
 
-/// What one `writeStreamPacket` call did with the stream data it was given.
-pub const StreamWrite = union(enum) {
-    /// ngtcp2 wrote nothing: the connection is congestion limited, or the
-    /// stream's flow control window is exhausted. None of the data was taken.
-    blocked,
-    /// A packet went out, but it carried no STREAM frame for this stream, so
-    /// none of the data was taken.
-    no_stream_frame,
-    /// A packet carrying `wrote` bytes of the data went out. Zero means only
-    /// the stream's FIN was serialized.
-    wrote: usize,
-};
+/// How many vectors nghttp3 may hand over for one stream in one call. A
+/// response is a header block followed by its body, queued as several
+/// contiguous runs, and ngtcp2 can only fill a packet with as much of them as
+/// it is given in one go.
+const max_stream_vecs = 16;
 
-/// What `writeStreamPacket` can fail with: the two conditions ngtcp2 reports
-/// for one stream alone, plus everything the socket path can report.
-pub const WriteError = Error || error{ StreamDataBlocked, StreamShutWrite };
-
-/// Packs one HTTP/3 stream chunk into a QUIC packet and sends it. `data` may be
-/// empty when only the stream's FIN needs to go out. Returns how many bytes of
-/// `data` ngtcp2 took, which is what nghttp3 has to be told about.
-pub fn writeStreamPacket(conn: *Connection, stream_id: i64, fin: bool, data: []const u8) WriteError!StreamWrite {
-    var pi: ngtcp2.ngtcp2_pkt_info = undefined;
-    // ngtcp2 writes the destination path here and needs storage for the
-    // addresses (ngtcp2.h, `ngtcp2_conn_writev_stream`).
+/// Packs one QUIC datagram with everything pending in the HTTP/3 session and
+/// sends it, coalescing frames from several streams into the packet the way
+/// ngtcp2 structures it (`NGTCP2_WRITE_STREAM_FLAG_MORE`). Returns the number of
+/// bytes sent, or 0 when ngtcp2 had nothing it could put on the wire.
+///
+/// Without MORE each call to `ngtcp2_conn_writev_stream` finalizes its own
+/// packet, so a response always leaves as at least two datagrams — one for the
+/// HEADERS and one for the DATA and FIN — and a header block that would have fit
+/// alongside its body costs a whole extra packet. ngtcp2.h spells out the shape
+/// this has to take: the packet stays open while the calls keep returning
+/// `NGTCP2_ERR_WRITE_MORE`, every call has to pass the same path, packet info,
+/// buffer, and timestamp, and the way to end the packet is one more call with
+/// `stream_id` = -1 and nothing to offer.
+///
+/// A stream ngtcp2 refuses (flow control, or the write side already shut) is
+/// blocked or shut down in nghttp3 before the loop goes on, so it cannot be
+/// offered again forever; the packet being built is kept, because it still
+/// holds whatever was written before.
+pub fn writePackedPacket(conn: *Connection, h3_conn: *nghttp3.nghttp3_conn, ts: u64) Error!usize {
+    // The packet's destination path and metadata live for the whole packet:
+    // ngtcp2 requires the same path, packet info, buffer, and timestamp on
+    // every call that adds to it, and it writes the packed addresses into this
+    // storage (ngtcp2.h, `ngtcp2_conn_writev_stream`).
     var dest: ngtcp2.ngtcp2_path_storage = undefined;
     ngtcp2.ngtcp2_path_storage_zero(&dest);
-    var pdatalen: ngtcp2.ngtcp2_ssize = 0;
-    const flags: u32 = if (fin) ngtcp2.NGTCP2_WRITE_STREAM_FLAG_FIN else ngtcp2.NGTCP2_WRITE_STREAM_FLAG_NONE;
+    var pi: ngtcp2.ngtcp2_pkt_info = undefined;
+    var vec: [max_stream_vecs]nghttp3.nghttp3_vec = undefined;
 
-    const n = ngtcp2.ngtcp2_conn_write_stream_versioned(
-        conn.conn,
-        &dest.path,
-        ngtcp2.NGTCP2_PKT_INFO_VERSION,
-        &pi,
-        &conn.buf,
-        conn.buf.len,
-        &pdatalen,
-        flags,
-        stream_id,
-        data.ptr,
-        data.len,
-        nowNanos(),
-    );
-    // These two stop this stream alone; nghttp3 has to be told about them
-    // instead of being offered the same data again. Everything else is a
-    // connection error.
-    if (n == ngtcp2.NGTCP2_ERR_STREAM_DATA_BLOCKED) return error.StreamDataBlocked;
-    if (n == ngtcp2.NGTCP2_ERR_STREAM_SHUT_WR) return error.StreamShutWrite;
-    // ngtcp2.h: any other negative return is a connection error, and a TLS
-    // failure reaches the application this way too.
-    if (n < 0) return classify(conn.conn, @intCast(n));
-    if (n == 0) return .blocked;
-    try sendPacket(conn, &dest.path, @intCast(n));
-    // -1 means the packet was full of other frames.
-    if (pdatalen < 0) return .no_stream_frame;
-    return .{ .wrote = @intCast(pdatalen) };
+    while (true) {
+        var stream_id: i64 = -1;
+        var fin: c_int = 0;
+        var nvec: nghttp3.nghttp3_ssize = 0;
+
+        // There is no point offering nghttp3's data while the connection's own
+        // flow control window is empty: ngtcp2 would refuse every stream and
+        // each one would have to be blocked in nghttp3 until the peer extends
+        // the window (ngtcp2.h, `ngtcp2_conn_get_max_data_left2`).
+        if (ngtcp2.ngtcp2_conn_get_max_data_left2(conn.conn) != 0) {
+            nvec = nghttp3.nghttp3_conn_writev_stream(h3_conn, &stream_id, &fin, &vec, vec.len);
+            if (nvec < 0) {
+                // nghttp3.h: a negative return is a connection error and the
+                // connection may only be deleted from here on. There is no
+                // packet to finish for it, so it is reported to the caller the
+                // same way a broken QUIC connection is.
+                return error.Http3Error;
+            }
+        }
+
+        var pdatalen: ngtcp2.ngtcp2_ssize = 0;
+        var flags: u32 = ngtcp2.NGTCP2_WRITE_STREAM_FLAG_MORE;
+        if (fin != 0) flags |= ngtcp2.NGTCP2_WRITE_STREAM_FLAG_FIN;
+
+        const n = ngtcp2.ngtcp2_conn_writev_stream_versioned(
+            conn.conn,
+            &dest.path,
+            ngtcp2.NGTCP2_PKT_INFO_VERSION,
+            &pi,
+            &conn.buf,
+            conn.buf.len,
+            &pdatalen,
+            flags,
+            stream_id,
+            @ptrCast(&vec),
+            @intCast(nvec),
+            ts,
+        );
+
+        // The packet is not finished yet: ngtcp2 took `pdatalen` bytes of this
+        // stream into it and is waiting for more, so nghttp3 has to be told how
+        // much of the stream went out before the next chunk is taken.
+        if (n == ngtcp2.NGTCP2_ERR_WRITE_MORE) {
+            _ = nghttp3.nghttp3_conn_add_write_offset(h3_conn, stream_id, @intCast(pdatalen));
+            continue;
+        }
+        // These two stop this stream alone; the packet survives them and is
+        // finished below, so nghttp3 is told why ngtcp2 did not take its data
+        // instead of being offered the same stream again.
+        if (n == ngtcp2.NGTCP2_ERR_STREAM_DATA_BLOCKED) {
+            nghttp3.nghttp3_conn_block_stream(h3_conn, stream_id);
+            continue;
+        }
+        if (n == ngtcp2.NGTCP2_ERR_STREAM_SHUT_WR) {
+            _ = nghttp3.nghttp3_conn_shutdown_stream_write(h3_conn, stream_id);
+            continue;
+        }
+        // ngtcp2.h: any other negative return is a connection error, and a TLS
+        // failure reaches the application this way too.
+        if (n < 0) return classify(conn.conn, @intCast(n));
+        // Nothing could be sent at all: congestion limited, or nothing to say.
+        if (n == 0) return 0;
+
+        // A packet went out. -1 means it carried no STREAM frame for this
+        // stream, i.e. none of the data was taken.
+        if (pdatalen >= 0) {
+            _ = nghttp3.nghttp3_conn_add_write_offset(h3_conn, stream_id, @intCast(pdatalen));
+        }
+        try sendPacket(conn, &dest.path, @intCast(n));
+        return @intCast(n);
+    }
 }
 
 /// Handles the QUIC timer when it is due, e.g. for retransmissions.
@@ -652,7 +744,40 @@ fn nowNanos() u64 {
 pub fn readPacket(conn: *Connection) Error!void {
     const n = posix.system.recvfrom(conn.socket, &conn.buf, conn.buf.len, 0, null, null);
     if (n < 0) return;
-    const data = conn.buf[0..@intCast(n)];
+    return handlePacket(conn, conn.buf[0..@intCast(n)]);
+}
+
+/// How many datagrams one turn of an event loop takes off the socket before it
+/// goes back to whatever else it has to do. Reading one per turn would make the
+/// loop — and with it the connection — move at one datagram per wakeup; reading
+/// without a bound would let a peer that sends faster than this endpoint
+/// processes keep it from ever pumping its own writes. The reference server
+/// drains in the same bounded way (64 datagrams per readable event).
+pub const max_datagrams_per_drain = 64;
+
+/// Feeds one datagram that is already waiting to the QUIC connection without
+/// waiting for one to arrive, and reports whether there was one.
+pub fn readPacketIfAvailable(conn: *Connection) Error!bool {
+    const n = posix.system.recvfrom(conn.socket, &conn.buf, conn.buf.len, std.c.MSG.DONTWAIT, null, null);
+    if (n < 0) return false;
+    try handlePacket(conn, conn.buf[0..@intCast(n)]);
+    return true;
+}
+
+/// Takes up to `max_datagrams_per_drain` datagrams off the socket and feeds
+/// them to the QUIC connection. An event loop calls this when `pollReadable`
+/// reported the socket is readable.
+pub fn readAvailablePackets(conn: *Connection) Error!usize {
+    var read_count: usize = 0;
+    while (read_count < max_datagrams_per_drain) {
+        if (!try readPacketIfAvailable(conn)) break;
+        read_count += 1;
+    }
+    return read_count;
+}
+
+/// Handles one datagram's worth of bytes that came off the socket.
+fn handlePacket(conn: *Connection, data: []const u8) Error!void {
     const pkt = ngtcp2.ngtcp2_pkt_info{};
     // ngtcp2 wants the network path the packet arrived on; the connection's own
     // addresses are the only ones that fit for a connected UDP socket.
@@ -676,6 +801,38 @@ pub fn readPacket(conn: *Connection) Error!void {
         sendConnectionClose(conn, .{ .tls_alert = last_tls_failure.alert }, "tls error");
     }
     return err;
+}
+
+/// The longest `pollReadable` is allowed to wait. A connection with no timer
+/// pending and a silent peer reports no deadline at all, and waiting for one
+/// forever would leave whatever else the loop has to do undone.
+const max_poll_wait_ns = 5 * std.time.ns_per_s;
+
+/// Waits until the socket has a datagram to read or `timeout_ns` has passed,
+/// and reports whether one is waiting.
+///
+/// This is what an event loop waits on instead of sleeping a fixed amount: a
+/// connection knows exactly when it next has to do something (the QUIC timers
+/// `getExpiry` reports), and until then the only thing that can change its
+/// state is a datagram.
+pub fn pollReadable(fd: posix.fd_t, timeout_ns: u64) bool {
+    // poll() counts in whole milliseconds and rounds the wait up, which is also
+    // what is wanted for a deadline that has already passed: asking for 0 there
+    // would spin the loop.
+    const wait = @min(timeout_ns, max_poll_wait_ns);
+    const timeout_ms: i32 = @intCast((wait + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
+    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    const ready = posix.poll(&fds, timeout_ms) catch return false;
+    return ready > 0 and (fds[0].revents & posix.POLL.IN) != 0;
+}
+
+/// Nanoseconds until this connection's next QUIC timer is due, or null when it
+/// has none pending. A timer that is already due is 0, so a loop that waits for
+/// this long and then handles the timer does not wait at all in that case.
+pub fn expiryDelayNs(conn: *Connection) ?u64 {
+    const expiry = getExpiry(conn) orelse return null;
+    const now = nowNanos();
+    return if (expiry <= now) 0 else expiry - now;
 }
 
 /// Write any pending QUIC packets to the UDP socket.
@@ -717,7 +874,7 @@ fn resolveHostIp(host: []const u8, port: u16) !u32 {
 
     var res: ?*std.c.addrinfo = null;
     const rc = std.c.getaddrinfo(@as(?[*:0]const u8, @ptrCast(host_z)), port_z_null, &hints, &res);
-    if (@intFromEnum(rc) != 0) return error.QuicError;
+    if (@backingInt(rc) != 0) return error.QuicError;
     defer std.c.freeaddrinfo(res.?);
 
     const addr = res.?.addr orelse return error.QuicError;
@@ -763,13 +920,13 @@ pub fn connect(host: []const u8, port: u16, stream_ctx: ?StreamDataCtx, _: ?[]co
     const tls_session = try clientTlsSession(tls);
     errdefer tls_session.deinit();
 
-    // Generate random connection IDs (use getrandom syscall)
+    // Generate random connection IDs
     var dcid: ngtcp2.ngtcp2_cid = undefined;
     var scid: ngtcp2.ngtcp2_cid = undefined;
     dcid.datalen = 18;
     scid.datalen = 18;
-    std.c.arc4random_buf(&dcid.data, 18);
-    std.c.arc4random_buf(&scid.data, 18);
+    fillRandom(dcid.data[0..dcid.datalen]);
+    fillRandom(scid.data[0..scid.datalen]);
 
     var callbacks = clientCallbacks();
 
@@ -942,7 +1099,7 @@ fn statelessResetSecret() []const u8 {
     while (!stateless_reset_secret_lock.tryLock()) std.atomic.spinLoopHint();
     defer stateless_reset_secret_lock.unlock();
     if (!stateless_reset_secret_ready) {
-        std.c.arc4random_buf(&stateless_reset_secret, stateless_reset_secret.len);
+        fillRandom(&stateless_reset_secret);
         stateless_reset_secret_ready = true;
     }
     return &stateless_reset_secret;
@@ -964,7 +1121,7 @@ pub fn getNewConnIdCb(
     // exactly this length (ngtcp2_conn.c, conn_enqueue_new_connection_id).
     if (cidlen > out.data.len) return ngtcp2.NGTCP2_ERR_CALLBACK_FAILURE;
     out.datalen = cidlen;
-    std.c.arc4random_buf(@ptrCast(&out.data), cidlen);
+    fillRandom(out.data[0..cidlen]);
 
     // RFC 9000: the peer can only end this connection with a stateless reset
     // whose token is derived from the connection ID it is using, so one has to
@@ -1039,7 +1196,7 @@ pub fn pathValidationCb(
 /// ngtcp2 rand callback — mandatory for every connection. ngtcp2 calls it for
 /// unpredictable bytes it derives itself (stateless reset tokens, CIDs).
 pub fn randCb(dest: [*c]u8, destlen: usize, _: [*c]const ngtcp2.ngtcp2_rand_ctx) callconv(.c) void {
-    std.c.arc4random_buf(dest, destlen);
+    fillRandom(dest[0..destlen]);
 }
 
 /// Callbacks for a client connection. ngtcp2 marks several of these as
@@ -1091,6 +1248,25 @@ test "clientCallbacks: sets every callback ngtcp2 requires" {
     // stream data was acknowledged, and so cannot reclaim it.
     try std.testing.expect(callbacks.acked_stream_data_offset != null);
     try std.testing.expect(callbacks.rand != null);
+}
+
+test "fillRandom: fills the whole buffer with bytes that change" {
+    // A source that silently does nothing (which is what `std.c.arc4random_buf`
+    // is on Linux for musl and glibc < 2.36) leaves the buffer as it was, and a
+    // stuck source repeats itself: neither can pass this.
+    var a: [64]u8 = @splat(0);
+    var b: [64]u8 = @splat(0);
+    fillRandom(&a);
+    fillRandom(&b);
+
+    try std.testing.expect(!std.mem.allEqual(u8, &a, 0));
+    try std.testing.expect(!std.mem.allEqual(u8, &b, 0));
+    try std.testing.expect(!std.mem.eql(u8, &a, &b));
+    // Every byte, not just the first: a partial fill leaves the tail untouched.
+    try std.testing.expect(!std.mem.allEqual(u8, a[a.len / 2 ..], 0));
+
+    var empty: [0]u8 = .{};
+    fillRandom(&empty);
 }
 
 test "getNewConnIdCb: fills the requested CID length and its reset token" {
