@@ -44,6 +44,23 @@ pub const HeaderField = struct {
     value: []const u8,
 };
 
+/// Pulls the next chunk of a streamed response body: fill `buf` and return how
+/// many bytes were written, 0 at the end of the body.
+pub const BodyReader = *const fn (context: ?*anyopaque, buf: []u8) anyerror!usize;
+
+/// A chunk of a streamed response body. ngtcp2 keeps the bytes it is given so
+/// it can retransmit a lost packet ("The caller must keep the portion of data
+/// covered by |*pdatalen| bytes intact until
+/// :member:`ngtcp2_callbacks.acked_stream_data_offset` indicates that they are
+/// acknowledged" — ngtcp2.h), so a chunk stays where it is until the peer
+/// acknowledges it.
+const BodyChunk = struct {
+    buf: []u8,
+    /// Offset in the body just past this chunk. The buffer holds nothing the
+    /// peer may need once the acknowledgement has reached it.
+    end: usize,
+};
+
 /// A request the server received, plus the response being sent for it. Answers
 /// `nghttp3_conn_submit_response`'s need for a body that stays alive until the
 /// stream closes.
@@ -74,9 +91,28 @@ pub const ServerRequest = struct {
     complete: bool = false,
     /// Set once a response has been submitted for it.
     responded: bool = false,
-    /// Response body, owned here until the stream closes.
+    /// Response body, owned here until the stream closes. Empty for a response
+    /// whose body is streamed (see `body_reader`).
     response_body: []const u8 = &.{},
     response_sent: usize = 0,
+    /// Streamed response: where the next chunk of the body comes from, and what
+    /// it is passed. Set by `submitStreamingResponse`.
+    body_reader: ?BodyReader = null,
+    body_context: ?*anyopaque = null,
+    /// The buffer the reader fills. Every chunk is read out of it and copied
+    /// into a buffer of its own, so the same buffer serves the whole response;
+    /// it is taken from the arena with the first chunk, so a response that does
+    /// not stream never allocates it.
+    read_buf: []u8 = &.{},
+    /// Chunks handed to nghttp3 and not acknowledged yet. Bounded by the peer's
+    /// flow control window: its bytes are what may still need resending.
+    chunks: std.ArrayList(BodyChunk) = .empty,
+    /// Body bytes handed to nghttp3, and how many of them the peer has
+    /// acknowledged (see `ackedStreamDataCb`).
+    body_sent: usize = 0,
+    body_acked: usize = 0,
+    /// Set once the reader has reported the end of the body.
+    body_eof: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, stream_id: i64, max_body_bytes: usize) !*ServerRequest {
         const req = try allocator.create(ServerRequest);
@@ -139,6 +175,9 @@ pub const Session = struct {
         session.callbacks.end_stream = endStreamCb;
         session.callbacks.begin_headers = beginHeadersCb;
         session.callbacks.stream_close = streamCloseCb;
+        // A streamed response needs to know when the peer has taken what it
+        // sent, since that is what frees a chunk (see `BodyChunk`).
+        session.callbacks.acked_stream_data = ackedStreamDataCb;
 
         var settings: nghttp3.nghttp3_settings = undefined;
         nghttp3.nghttp3_settings_default(&settings);
@@ -241,17 +280,7 @@ pub const Session = struct {
 
         const nva = try self.allocator.alloc(nghttp3.nghttp3_nv, 3 + headers.len);
         defer self.allocator.free(nva);
-
-        nva[0] = makeNv(":status", status_str);
-        nva[1] = makeNv("content-type", content_type);
-        nva[2] = makeNv("content-length", len_str);
-
-        var nvlen: usize = 3;
-        for (headers) |header| {
-            if (std.mem.eql(u8, header.name, "content-length")) continue;
-            nva[nvlen] = makeNv(header.name, header.value);
-            nvlen += 1;
-        }
+        const nvlen = fillResponseFields(nva, status_str, content_type, headers, len_str);
 
         const reader = nghttp3.nghttp3_data_reader{ .read_data = readDataCb };
 
@@ -262,7 +291,70 @@ pub const Session = struct {
         req.response_sent = 0;
         req.responded = true;
     }
+
+    /// Submit a response for |req| whose body is pulled from |body_reader| while
+    /// it is sent, for a body too large — or too long-lived — to hand over in
+    /// one piece.
+    ///
+    /// No `content-length` goes out: RFC 9114 Section 4.1 lets an HTTP/3
+    /// response leave it out, and the length is not known before the body has
+    /// been produced. `status`, `content_type` and `headers` are what
+    /// `submitResponse` makes of them.
+    pub fn submitStreamingResponse(
+        self: *Session,
+        req: *ServerRequest,
+        status: u16,
+        content_type: []const u8,
+        headers: []const HeaderField,
+        body_reader: BodyReader,
+        body_context: ?*anyopaque,
+    ) !void {
+        var status_buf: [16]u8 = undefined;
+        const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch return error.H3Error;
+
+        const nva = try self.allocator.alloc(nghttp3.nghttp3_nv, 3 + headers.len);
+        defer self.allocator.free(nva);
+        const nvlen = fillResponseFields(nva, status_str, content_type, headers, null);
+
+        var reader = nghttp3.nghttp3_data_reader{ .read_data = readStreamedDataCb };
+
+        const ret = nghttp3.nghttp3_conn_submit_response(self.conn, req.stream_id, nva.ptr, nvlen, &reader);
+        if (ret != 0) return error.H3Error;
+
+        req.body_reader = body_reader;
+        req.body_context = body_context;
+        req.responded = true;
+    }
 };
+
+/// Fills |nva| with the fields of a response — `:status`, `content-type`, the
+/// length when it is known, then the caller's own — and returns how many of
+/// them were written. A `content-length` among the caller's fields is dropped:
+/// RFC 9114 Section 4.1 allows only one, and the server's is the one that
+/// matches the body.
+fn fillResponseFields(
+    nva: []nghttp3.nghttp3_nv,
+    status: []const u8,
+    content_type: []const u8,
+    headers: []const HeaderField,
+    content_length: ?[]const u8,
+) usize {
+    var n: usize = 0;
+    nva[n] = makeNv(":status", status);
+    n += 1;
+    nva[n] = makeNv("content-type", content_type);
+    n += 1;
+    if (content_length) |len| {
+        nva[n] = makeNv("content-length", len);
+        n += 1;
+    }
+    for (headers) |header| {
+        if (std.mem.eql(u8, header.name, "content-length")) continue;
+        nva[n] = makeNv(header.name, header.value);
+        n += 1;
+    }
+    return n;
+}
 
 // ---- nghttp3 callback implementations ----
 
@@ -388,6 +480,25 @@ fn endStreamCb(
     return 0;
 }
 
+/// The peer acknowledged stream data. For a streamed response this is what
+/// frees the chunk that data came from: ngtcp2 may read the bytes it was given
+/// again for a retransmission until the acknowledgement reaches them.
+fn ackedStreamDataCb(
+    _: ?*nghttp3.nghttp3_conn,
+    _: i64,
+    datalen: u64,
+    conn_user_data: ?*anyopaque,
+    stream_user_data: ?*anyopaque,
+) callconv(.c) c_int {
+    const session: *Session = @ptrCast(@alignCast(conn_user_data orelse return 0));
+    if (!session.server) return 0;
+    // Streams that are not a request (the endpoint's own control and QPACK
+    // streams) are not the application's to account for.
+    const req: *ServerRequest = @ptrCast(@alignCast(stream_user_data orelse return 0));
+    req.body_acked += @intCast(datalen);
+    return 0;
+}
+
 /// Frees the state a server request hung off its stream.
 fn streamCloseCb(
     _: ?*nghttp3.nghttp3_conn,
@@ -432,6 +543,91 @@ fn readDataCb(
     req.response_sent = req.response_body.len;
     pflags.* = nghttp3.NGHTTP3_DATA_FLAG_EOF;
     return 1;
+}
+
+/// Hands nghttp3 one chunk of a streamed body per call, taken from the
+/// request's reader. A chunk is copied onto a buffer of its own before it goes
+/// out, because nghttp3 is free to hand the same bytes to ngtcp2 again for a
+/// retransmission (see `BodyChunk`); the read buffer that chunk was read into
+/// is only reused once its content has been copied.
+///
+/// A reader that returns an error fails the stream: nghttp3.h makes
+/// `NGHTTP3_ERR_CALLBACK_FAILURE` the way to report that the application could
+/// not produce the data, and the failure surfaces as a write error the server
+/// acts on. A short chunk is not the end of the body — only the reader
+/// returning 0 is.
+fn readStreamedDataCb(
+    _: ?*nghttp3.nghttp3_conn,
+    _: i64,
+    vec: [*c]nghttp3.nghttp3_vec,
+    veccnt: usize,
+    pflags: [*c]u32,
+    _: ?*anyopaque,
+    stream_user_data: ?*anyopaque,
+) callconv(.c) nghttp3.nghttp3_ssize {
+    if (veccnt == 0) return 0;
+    const req: *ServerRequest = @ptrCast(@alignCast(stream_user_data orelse return nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE));
+
+    const chunk = readStreamedChunk(req) catch return nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE;
+    if (chunk.len == 0) {
+        // The reader reported the end of the body: with nothing left to hand
+        // over, the response ends here.
+        pflags.* = nghttp3.NGHTTP3_DATA_FLAG_EOF;
+        return 0;
+    }
+
+    vec[0] = .{ .base = @constCast(chunk.ptr), .len = chunk.len };
+    return 1;
+}
+
+/// What the size of the buffer a streamed body's reader is offered, i.e. the
+/// largest chunk one call can produce.
+pub const stream_chunk_bytes = 64 * 1024;
+
+const StreamedReadError = error{ OutOfMemory, ReaderFailed };
+
+/// Reads the next chunk of a streamed body, and returns an empty slice at the
+/// end of it.
+fn readStreamedChunk(req: *ServerRequest) StreamedReadError![]u8 {
+    const reader = req.body_reader orelse return &.{};
+    if (req.body_eof) return &.{};
+
+    const a = req.arena.allocator();
+    if (req.read_buf.len == 0) {
+        req.read_buf = try a.alloc(u8, stream_chunk_bytes);
+    }
+
+    const n = reader(req.body_context, req.read_buf) catch return error.ReaderFailed;
+    if (n == 0) {
+        req.body_eof = true;
+        return &.{};
+    }
+    // The contract is "fill `buf` and return how many bytes were written", so a
+    // reader that reports more than it was given has broken it.
+    if (n > req.read_buf.len) return error.ReaderFailed;
+
+    const chunk = try takeChunk(req, a, n);
+    @memcpy(chunk, req.read_buf[0..n]);
+    req.body_sent += n;
+    return chunk;
+}
+
+/// A buffer for the next chunk of a streamed body: one an acknowledged chunk
+/// has given back, or a new one. Everything a response holds comes from its
+/// arena, so what it holds is the chunks the peer has not acknowledged yet,
+/// which its flow control window bounds.
+fn takeChunk(req: *ServerRequest, a: std.mem.Allocator, len: usize) StreamedReadError![]u8 {
+    const end = req.body_sent + len;
+    for (req.chunks.items) |*chunk| {
+        if (chunk.end > req.body_acked) continue;
+        if (chunk.buf.len < len) continue;
+        chunk.end = end;
+        return chunk.buf[0..len];
+    }
+
+    const buf = try a.alloc(u8, len);
+    try req.chunks.append(a, .{ .buf = buf, .end = end });
+    return buf;
 }
 
 /// Hands the request body to nghttp3 in one piece — the client side of

@@ -614,6 +614,47 @@ The handler answers with `h3.Response` — `status`, `content_type` and `body`, 
 the body is copied, so a literal is fine. `h3.Request.method` and
 `h3.Response.status` are the same enums the HTTP/1.1 and HTTP/2 sides use.
 
+A response whose body would not fit in memory is streamed instead, by setting
+`body_reader`:
+
+```zig
+const body_len = 8 * 1024 * 1024;
+/// Where the reader has got to in the body it produces.
+var progress: usize = 0;
+
+/// Fill `buf` and return how many bytes were written; 0 means the end of the
+/// body. A short chunk is not the end, so a reader may produce a body in as many
+/// pieces as it likes.
+fn bodyReader(context: ?*anyopaque, buf: []u8) anyerror!usize {
+    const at: *usize = @ptrCast(@alignCast(context.?));
+    if (at.* == body_len) return 0;
+    const n = @min(body_len - at.*, buf.len);
+    for (buf[0..n], 0..) |*b, i| b.* = @truncate(at.* + i);
+    at.* += n;
+    return n;
+}
+
+fn streamingHandler(_: std.mem.Allocator, request: *const h3.Request) h3.Response {
+    if (!std.mem.eql(u8, request.path, "/stream")) return .{ .body = "hello\n" };
+    // Whatever the reader walks belongs to the handler, and one reader is only
+    // ever serving one request.
+    progress = 0;
+    return .{
+        .content_type = "application/octet-stream",
+        .body_reader = bodyReader,
+        .body_context = &progress,
+    };
+}
+```
+
+The reader is called from the server's event loop whenever the stream has room
+for more, and what it returns is sent as it goes, so `body` is ignored and the
+handler keeps ownership of whatever it built the reader on. No `content-length`
+goes out — RFC 9114 Section 4.1 lets an HTTP/3 response leave it out, and the
+length is not known in advance. A reader that returns an error fails that
+request's stream, which takes its connection down; the server keeps serving the
+rest.
+
 ### Client
 
 ```zig

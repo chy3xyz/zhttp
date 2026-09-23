@@ -27,15 +27,34 @@ pub const Request = struct {
 };
 
 /// What a handler answers with. `body` is copied by the server before it is
-/// sent, so it may be a literal or a buffer the handler owns.
+/// sent, so it may be a literal or a buffer the handler owns. A handler that
+/// would rather produce the body as it goes streams it instead, with
+/// `body_reader`.
 pub const Response = struct {
     status: StatusCode = .ok,
     content_type: []const u8 = "text/plain",
     body: []const u8 = "",
+    /// Streams the body instead of handing it over: the server calls this when
+    /// the stream has room for more, and it fills `buf` and returns how many
+    /// bytes were written — 0 for the end of the body. Together with
+    /// `body_context` this replaces `body`, which is then ignored, and no
+    /// `content-length` goes out: RFC 9114 Section 4.1 lets an HTTP/3 response
+    /// leave it out, and the length is not known before the body has been
+    /// produced. `status`, `content_type` and `headers` are unaffected.
+    ///
+    /// Called from the server's event loop, so it holds up every connection
+    /// that loop is serving while it runs: a reader that has to wait for the
+    /// next piece of a long-lived stream has to return from one call with the
+    /// bytes it has and produce the rest on the next. Returning an error fails
+    /// the request's stream, which closes its connection.
+    body_reader: ?*const fn (context: ?*anyopaque, buf: []u8) anyerror!usize = null,
+    /// Passed to `body_reader`.
+    body_context: ?*anyopaque = null,
     /// Header fields to send after Content-Type, e.g. `Set-Cookie` or
     /// `Location`. Names have to be lowercase (RFC 9114 Section 4.2).
     /// `content-length` is set from the body, and a field that repeats it is
-    /// dropped rather than sent twice.
+    /// dropped rather than sent twice; a streamed body has no length to set,
+    /// so a field that would carry one is dropped.
     headers: []const Header = &.{},
 };
 
@@ -43,7 +62,8 @@ pub const Response = struct {
 pub const Header = http3.HeaderField;
 
 /// Handler called for each completed HTTP/3 request. The returned body is
-/// copied, so the handler keeps ownership of everything it hands over.
+/// copied, so the handler keeps ownership of everything it hands over; a
+/// `body_reader` is called later and belongs to the handler the same way.
 pub const Handler = *const fn (allocator: std.mem.Allocator, request: *const Request) Response;
 
 /// Server state for one accepted connection: the HTTP/3 session on top of it,
@@ -551,6 +571,17 @@ fn serveRequests(self: *Server, session: *http3.Session) void {
             }
         else
             callHandler(self, req);
+
+        // A streamed body is pulled from the handler's reader while it is sent,
+        // one chunk at a time, so there is nothing to copy and nothing to keep
+        // alive here.
+        if (answer.body_reader) |reader| {
+            session.submitStreamingResponse(req, @backingInt(answer.status), answer.content_type, answer.headers, reader, answer.body_context) catch {
+                req.responded = true;
+                continue;
+            };
+            continue;
+        }
 
         // The handler keeps what it handed over, and the body has to outlive the
         // response, so this is the one copy made on the response path.

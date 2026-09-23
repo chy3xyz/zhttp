@@ -383,6 +383,165 @@ fn bulkOrOkHandler(_: std.mem.Allocator, request: *const server_mod.Request) ser
     return .{ .body = bulkBody() };
 }
 
+/// Where a streaming reader has got to in the body it produces. The handler
+/// resets it for each request, and the reader runs on the server's thread.
+const StreamSource = struct {
+    offset: usize = 0,
+};
+
+var stream_source: StreamSource = .{};
+
+/// Streams the bulk body a chunk at a time, each call writing the bytes of
+/// `responseByte` at the offset it has reached.
+fn streamBulkReader(context: ?*anyopaque, buf: []u8) anyerror!usize {
+    const src: *StreamSource = @ptrCast(@alignCast(context.?));
+    if (src.offset >= bulk_len) return 0;
+    const n = @min(bulk_len - src.offset, buf.len);
+    for (buf[0..n], 0..) |*b, i| b.* = responseByte(src.offset + i);
+    src.offset += n;
+    return n;
+}
+
+fn streamBulkHandler(_: std.mem.Allocator, _: *const server_mod.Request) server_mod.Response {
+    stream_source = .{};
+    return .{
+        .content_type = "application/octet-stream",
+        .body_reader = streamBulkReader,
+        .body_context = &stream_source,
+    };
+}
+
+test "h3: a streamed response larger than the flow control window arrives complete" {
+    try quic.setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
+
+    const allocator = std.heap.page_allocator;
+    const server = try allocator.create(Server);
+    server.* = try Server.init(allocator, 0, streamBulkHandler, .{});
+    const port = std.mem.bigToNative(u16, server.listener.local_addr.port);
+    _ = try std.Thread.spawn(.{}, serve, .{server});
+
+    var client = try Client.init(allocator, "127.0.0.1", port, .{ .insecure_skip_verify = true });
+    defer client.deinit();
+
+    const answer = try client.request("/bulk");
+    defer allocator.free(answer.header_text);
+    defer allocator.free(answer.body);
+
+    try std.testing.expectEqual(@as(u16, 200), answer.status);
+    // The body is produced as it is sent, so its length is not known when the
+    // header block goes out and none is claimed.
+    try std.testing.expect(std.mem.indexOf(u8, answer.header_text, "content-length") == null);
+    try std.testing.expectEqual(@as(usize, bulk_len), answer.body.len);
+    for (answer.body, 0..) |b, i| {
+        if (b != responseByte(i)) return error.BodyCorrupted;
+    }
+}
+
+/// A body that turns out to be empty: the reader says so on its first call.
+fn emptyStreamReader(_: ?*anyopaque, _: []u8) anyerror!usize {
+    return 0;
+}
+
+fn emptyStreamHandler(_: std.mem.Allocator, _: *const server_mod.Request) server_mod.Response {
+    return .{
+        .status = .no_content,
+        .content_type = "text/x-empty",
+        .headers = &.{.{ .name = "set-cookie", .value = "a=b" }},
+        .body_reader = emptyStreamReader,
+    };
+}
+
+test "h3: a streamed response with an empty body is still a response" {
+    try quic.setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
+
+    // A leak-checking allocator over the shortest path through the streaming
+    // reader: one call, no chunk, EOF.
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    const allocator = gpa.allocator();
+
+    var server = try allocator.create(Server);
+    server.* = try Server.init(allocator, 0, emptyStreamHandler, .{});
+    const port = std.mem.bigToNative(u16, server.listener.local_addr.port);
+    const thread = try std.Thread.spawn(.{}, serve, .{server});
+
+    var client = try Client.init(allocator, "127.0.0.1", port, .{ .insecure_skip_verify = true });
+
+    const answer = try client.request("/");
+    try std.testing.expectEqual(@as(u16, 204), answer.status);
+    try std.testing.expect(std.mem.indexOf(u8, answer.header_text, "content-type: text/x-empty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answer.header_text, "set-cookie: a=b") != null);
+    try std.testing.expectEqual(@as(usize, 0), answer.body.len);
+    allocator.free(answer.header_text);
+    allocator.free(answer.body);
+
+    // The stream ended rather than being left open: the connection serves
+    // another request.
+    const again = try client.request("/");
+    try std.testing.expectEqual(@as(u16, 204), again.status);
+    allocator.free(again.header_text);
+    allocator.free(again.body);
+    client.deinit();
+
+    server.stop();
+    thread.join();
+    server.deinit();
+    allocator.destroy(server);
+
+    try std.testing.expectEqual(std.heap.Check.ok, gpa.deinit());
+}
+
+/// Streams one chunk and then fails, the way an application error inside the
+/// reader reaches the server.
+fn failingStreamReader(context: ?*anyopaque, buf: []u8) anyerror!usize {
+    const src: *StreamSource = @ptrCast(@alignCast(context.?));
+    if (src.offset != 0) return error.SourceFailed;
+    const n = @min(@as(usize, 1024), buf.len);
+    for (buf[0..n], 0..) |*b, i| b.* = responseByte(i);
+    src.offset = n;
+    return n;
+}
+
+fn failingOrOkHandler(_: std.mem.Allocator, request: *const server_mod.Request) server_mod.Response {
+    if (!std.mem.eql(u8, request.path, "/broken")) return .{ .body = "OK" };
+    stream_source = .{};
+    return .{ .body_reader = failingStreamReader, .body_context = &stream_source };
+}
+
+test "h3: a reader that fails breaks its stream, not the server" {
+    try quic.setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
+
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    const allocator = gpa.allocator();
+
+    var server = try allocator.create(Server);
+    server.* = try Server.init(allocator, 0, failingOrOkHandler, .{});
+    const port = std.mem.bigToNative(u16, server.listener.local_addr.port);
+    const thread = try std.Thread.spawn(.{}, serve, .{server});
+
+    var client = try Client.init(allocator, "127.0.0.1", port, .{ .insecure_skip_verify = true });
+    // The reader fails the stream, which the server answers by closing the
+    // connection: the client is told, rather than waiting out its own timeout.
+    if (client.get("/broken")) |body| {
+        allocator.free(body);
+        return error.ExpectedStreamFailure;
+    } else |_| {}
+    client.deinit();
+
+    // A connection that never touched the broken response is unaffected.
+    var other = try Client.init(allocator, "127.0.0.1", port, .{ .insecure_skip_verify = true });
+    const body = try other.get("/");
+    try std.testing.expectEqualStrings("OK", body);
+    allocator.free(body);
+    other.deinit();
+
+    server.stop();
+    thread.join();
+    server.deinit();
+    allocator.destroy(server);
+
+    try std.testing.expectEqual(std.heap.Check.ok, gpa.deinit());
+}
+
 /// One client's whole request run on its own thread, so the test can watch how
 /// long it takes instead of sitting in the client's own 30 s timeout. It is
 /// heap-allocated: a run that is still going when the test gives up must not
