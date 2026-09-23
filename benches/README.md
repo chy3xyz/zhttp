@@ -10,6 +10,11 @@ To run the built-in Zig micro-benchmarks:
 zig build bench
 ```
 
+The benchmarks build the library the way a release build would
+(`ReleaseFast`), because that is what they are meant to report on — a Debug
+library pays several times more per request for the same code. Pass
+`-Doptimize=...` to measure another mode, e.g. `zig build bench -Doptimize=Debug`.
+
 ### Sample Micro-benchmark Output
 
 ```text
@@ -17,15 +22,15 @@ zig build bench
 
 1. HTTP Request Parser:
    Iterations: 1,000,000
-   Total Time: 526.42 ms
-   Latency:    526.42 ns/op
-   Throughput: 1,899,635 ops/sec
+   Total Time: 444.22 ms
+   Latency:    444.22 ns/op
+   Throughput: 2,251,142 ops/sec
 
 2. Router Match & Dispatch:
    Iterations: 1,000,000
-   Total Time: 210.00 ms
-   Latency:    210.00 ns/op
-   Throughput: 4,761,905 ops/sec
+   Total Time: 136.24 ms
+   Latency:    136.24 ns/op
+   Throughput: 7,340,258 ops/sec
 ```
 
 ---
@@ -53,18 +58,23 @@ H3 server listening on UDP
    Requested:   500
    Completed:   500
    Connections: 1
-   Total Time:  1850.20 ms
-   Latency:     3.70 ms/req (min 2.68 ms, max 7.53 ms)
-   Throughput:  270 req/sec
+   Total Time:  56.94 ms
+   Latency:     0.11 ms/req (min 0.04 ms, max 3.20 ms)
+   Throughput:  8782 req/sec
 
 2. Large response body (2 MiB):
    Requested:   3
    Completed:   3
    Connections: 1
-   Total Time:  2410.00 ms
-   Latency:     803.33 ms/req (min 780.10 ms, max 840.00 ms)
-   Throughput:  2.61 MB/s
+   Total Time:  74.48 ms
+   Latency:     24.83 ms/req (min 15.10 ms, max 40.02 ms)
+   Throughput:  84.46 MB/s
 ```
+
+The event loop is what the two numbers are most sensitive to: reading one
+datagram per turn and sleeping in between caps a connection at roughly 250
+requests/s and 1 MB/s, which is what these ran at before the loop waited in
+`poll` and drained the socket instead.
 
 The benchmark exits non-zero when a request does not come back, so it can be
 used as a regression check. It reads its TLS certificate at run time:

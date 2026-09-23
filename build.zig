@@ -8,8 +8,7 @@ pub fn build(b: *std.Build) void {
 
     // Include paths — configurable via -D flags for cross-platform support.
     // Defaults work for macOS Homebrew. Override for Linux/pkg-config paths.
-    const openssl_include = b.option([]const u8, "openssl-include",
-        "Path to OpenSSL include directory") orelse "/opt/homebrew/opt/openssl@3/include";
+    const openssl_include = b.option([]const u8, "openssl-include", "Path to OpenSSL include directory") orelse "/opt/homebrew/opt/openssl@3/include";
 
     // Hand-written OpenSSL bindings (see src/openssl_c.zig) — no C translation,
     // so no OpenSSL headers are needed to build.
@@ -29,10 +28,8 @@ pub fn build(b: *std.Build) void {
 
     // Translate C headers for HTTP/3 (ngtcp2 + nghttp3)
     if (h3) {
-        const ngtcp2_include = b.option([]const u8, "ngtcp2-include",
-            "Path to ngtcp2 include directory") orelse "/opt/homebrew/opt/libngtcp2/include";
-        const nghttp3_include = b.option([]const u8, "nghttp3-include",
-            "Path to nghttp3 include directory") orelse "/opt/homebrew/opt/libnghttp3/include";
+        const ngtcp2_include = b.option([]const u8, "ngtcp2-include", "Path to ngtcp2 include directory") orelse "/opt/homebrew/opt/libngtcp2/include";
+        const nghttp3_include = b.option([]const u8, "nghttp3-include", "Path to nghttp3 include directory") orelse "/opt/homebrew/opt/libnghttp3/include";
 
         const ngtcp2_h = b.addTranslateC(.{
             .root_source_file = b.path("src/h3/ngtcp2.h"),
@@ -56,20 +53,14 @@ pub fn build(b: *std.Build) void {
     }
 
     // Library module
+    const zhttp_imports = imports.toOwnedSlice(b.allocator) catch @panic("OOM");
     const zhttp_mod = b.addModule("zhttp", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = imports.toOwnedSlice(b.allocator) catch @panic("OOM"),
+        .imports = zhttp_imports,
     });
-    zhttp_mod.linkSystemLibrary("ssl", .{});
-    zhttp_mod.linkSystemLibrary("crypto", .{});
-    if (h3) {
-        zhttp_mod.linkSystemLibrary("ngtcp2", .{});
-        zhttp_mod.linkSystemLibrary("ngtcp2_crypto_ossl", .{});
-        zhttp_mod.linkSystemLibrary("nghttp3", .{});
-    }
-    zhttp_mod.link_libc = true;
+    linkSystemLibraries(zhttp_mod, h3);
 
     // Example executables
     const examples = [_][]const u8{
@@ -128,12 +119,27 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_integration_tests.step);
 
     // Benchmark step
+    //
+    // The micro-benchmarks measure the library, so the library is built the way
+    // a release build would: `zig build bench` against a default (Debug) library
+    // reports numbers nobody ships with — three times the per-request cost of
+    // the same code in ReleaseFast. An explicit `-Doptimize` still wins.
+    const bench_optimize: std.builtin.OptimizeMode =
+        if (b.user_input_options.contains("optimize")) optimize else .ReleaseFast;
+    const bench_zhttp_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+        .imports = zhttp_imports,
+    });
+    linkSystemLibraries(bench_zhttp_mod, h3);
+
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("benches/bench_http.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = bench_optimize,
         .imports = &.{
-            .{ .name = "zhttp", .module = zhttp_mod },
+            .{ .name = "zhttp", .module = bench_zhttp_mod },
         },
     });
     const bench_exe = b.addExecutable(.{
@@ -149,9 +155,9 @@ pub fn build(b: *std.Build) void {
         const bench_h3_mod = b.createModule(.{
             .root_source_file = b.path("benches/bench_h3.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = bench_optimize,
             .imports = &.{
-                .{ .name = "zhttp", .module = zhttp_mod },
+                .{ .name = "zhttp", .module = bench_zhttp_mod },
             },
         });
         const bench_h3_exe = b.addExecutable(.{
@@ -179,6 +185,19 @@ pub fn build(b: *std.Build) void {
     kcov_mod.addArg("kcov-output");
     kcov_mod.addArtifactArg(cov_mod_test);
     coverage_step.dependOn(&kcov_mod.step);
+}
+
+/// Everything the library needs from the system: OpenSSL always, and the QUIC
+/// and HTTP/3 libraries when the h3 layer is built in.
+fn linkSystemLibraries(mod: *std.Build.Module, h3: bool) void {
+    mod.linkSystemLibrary("ssl", .{});
+    mod.linkSystemLibrary("crypto", .{});
+    if (h3) {
+        mod.linkSystemLibrary("ngtcp2", .{});
+        mod.linkSystemLibrary("ngtcp2_crypto_ossl", .{});
+        mod.linkSystemLibrary("nghttp3", .{});
+    }
+    mod.link_libc = true;
 }
 
 fn addExample(
