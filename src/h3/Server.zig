@@ -107,6 +107,13 @@ pub const Server = struct {
     /// Set by `stop` and read by the run loop, so the server can be taken down
     /// from another thread.
     stopping: std.atomic.Value(bool) = .init(false),
+    /// How many connections are in their closing period: told the connection is
+    /// over, still answering every packet the peer sends with the same
+    /// CONNECTION_CLOSE, and kept until the period is out. Derived from the
+    /// routing table, but counted separately because that table is only safe to
+    /// read from the server's own thread — this says the same thing from any
+    /// thread, so a test can wait for the state rather than for the clock.
+    closing_connections: std.atomic.Value(usize) = .init(0),
 
     const reap_interval_ns = 1 * std.time.ns_per_s;
 
@@ -475,12 +482,17 @@ pub const Server = struct {
     }
 
     /// Enters the closing period: tell the peer, then keep answering its packets
-    /// with the same CONNECTION_CLOSE until the period is over.
+    /// with the same CONNECTION_CLOSE until the period is over. A second call
+    /// leaves both the close that already went out and the deadline it set where
+    /// they are, which is what keeps `closing_connections` counting once per
+    /// connection.
     fn startClosing(self: *Server, conn: *quic.Connection, h3: *H3Conn) void {
+        if (h3.closing_until_ns != null) return;
         quic.sendConnectionClose(conn, .{ .application = http3.H3_NO_ERROR }, "server closing connection");
         // ngtcp2 arms a 3xPTO timer for the closing period; fall back to a fixed
         // period if it has none.
         h3.closing_until_ns = quic.getExpiry(conn) orelse (nowNanos() + self.options.closing_period_ns);
+        _ = self.closing_connections.fetchAdd(1, .monotonic);
     }
 
     /// Frees a connection and drops every connection ID that routed to it.
@@ -496,7 +508,13 @@ pub const Server = struct {
         }
         for (keys.items) |key| _ = self.listener.connections.remove(key);
 
-        if (h3Conn(conn)) |h3| h3.deinit();
+        if (h3Conn(conn)) |h3| {
+            // Every connection leaves through here — reaped, dropped by an
+            // error, or taken down by `deinit`/`stop` — so this is where a
+            // closing connection stops being one.
+            if (h3.closing_until_ns != null) _ = self.closing_connections.fetchSub(1, .monotonic);
+            h3.deinit();
+        }
         conn.deinit();
         self.allocator.destroy(conn);
     }

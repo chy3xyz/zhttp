@@ -34,6 +34,20 @@ fn sleepMs(ms: u64) void {
     while (std.posix.errno(std.posix.system.nanosleep(&req, &req)) == .INTR) {}
 }
 
+/// Waits, for up to |ms|, for the server to have a connection in its closing
+/// period (`want_closing`) or for every closing connection to have been
+/// reaped. `Server.closing_connections` is the observable kept for this: the
+/// routing table it is derived from is mutated by the server's thread and may
+/// only be read from it.
+fn waitForClosing(server: *const Server, want_closing: bool, ms: u64) !void {
+    var waited: u64 = 0;
+    while (waited < ms) : (waited += 10) {
+        if ((server.closing_connections.load(.acquire) > 0) == want_closing) return;
+        sleepMs(10);
+    }
+    return error.ClosingStateTimeout;
+}
+
 test "quic: handshake completes against the h3 server" {
     try quic.setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
 
@@ -277,8 +291,11 @@ test "h3: a closing connection answers the peer with CONNECTION_CLOSE" {
     // test runs before the function's defers do.
     allocator.free(body);
 
-    // Let the connection go idle, so the server enters its closing period.
-    sleepMs(1500);
+    // Let the connection go idle, so the server enters its closing period. The
+    // wait is for that state rather than for a fixed time: how long the server
+    // thread takes to notice the idle connection is the machine's business, and
+    // guessing at it is what made this test fail on a loaded one.
+    try waitForClosing(server, true, 10 * std.time.ms_per_s);
 
     // Whatever the client sends now is answered by the buffered
     // CONNECTION_CLOSE, and the client notices the connection is gone instead
@@ -286,9 +303,9 @@ test "h3: a closing connection answers the peer with CONNECTION_CLOSE" {
     try std.testing.expectError(error.ConnectionClosed, client.get("/"));
     client.deinit();
 
-    // Long enough for the closing period to be over and the connection to be
-    // reaped before the server is taken down.
-    sleepMs(1500);
+    // The connection is taken out of the routing table once its period is over,
+    // so the count falling back to zero is that reaping having happened.
+    try waitForClosing(server, false, 10 * std.time.ms_per_s);
     server.stop();
     thread.join();
     server.deinit();
