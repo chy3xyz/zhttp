@@ -668,6 +668,77 @@ fn makeNv(name: []const u8, value: []const u8) nghttp3.nghttp3_nv {
     };
 }
 
+/// A streaming reader that hands over a fixed small piece per call, however
+/// much room it is offered: what a source with one byte — or two hundred —
+/// ready produces.
+const SmallChunkSource = struct {
+    offset: usize = 0,
+    body_len: usize,
+    chunk_bytes: usize,
+};
+
+fn chunkByte(i: usize) u8 {
+    return @intCast('a' + (i % 26));
+}
+
+fn smallChunkReader(context: ?*anyopaque, buf: []u8) anyerror!usize {
+    const src: *SmallChunkSource = @ptrCast(@alignCast(context.?));
+    if (src.offset >= src.body_len) return 0;
+    const n = @min(@min(src.body_len - src.offset, src.chunk_bytes), buf.len);
+    for (buf[0..n], 0..) |*b, i| b.* = chunkByte(src.offset + i);
+    src.offset += n;
+    return n;
+}
+
+/// Reads a streamed body the way the server does, from a reader that produces
+/// `chunk_bytes` per call, and checks the two things the chunk handling has to
+/// get right: the pieces arrive in the body's order, and what the response
+/// holds at any point is bounded by what the peer has not acknowledged —
+/// `window` stands in for its flow control window, which is what bounds the
+/// chunks a retransmission could still need (see `BodyChunk`).
+fn expectSmallChunkStream(chunk_bytes: usize, body_len: usize, window: usize) !void {
+    var src: SmallChunkSource = .{ .body_len = body_len, .chunk_bytes = chunk_bytes };
+    const req = try ServerRequest.init(std.testing.allocator, 0, 1024);
+    defer req.deinit();
+    req.body_reader = smallChunkReader;
+    req.body_context = &src;
+
+    var read: usize = 0;
+    while (true) {
+        const chunk = try readStreamedChunk(req);
+        if (chunk.len == 0) break;
+
+        // A chunk handed out twice, or overwritten while it was still needed
+        // for a retransmission, is a mismatch here.
+        for (chunk, 0..) |b, i| try std.testing.expectEqual(chunkByte(read + i), b);
+        read += chunk.len;
+        try std.testing.expect(read <= body_len);
+
+        // A peer that keeps up: everything but the last window's worth is
+        // acknowledged, so the buffers behind it are free to be reused.
+        req.body_acked = req.body_sent -| window;
+
+        var held: usize = 0;
+        for (req.chunks.items) |c| held += c.buf.len;
+        try std.testing.expect(held <= window + 2 * chunk_bytes);
+    }
+
+    try std.testing.expectEqual(body_len, read);
+    // Buffers are reused, so the response holds one per unacknowledged chunk
+    // rather than one per chunk the body is made of — and it stops holding them
+    // altogether when it is released, which is what the arena's own leak check
+    // says on the `defer` above.
+    try std.testing.expect(req.chunks.items.len <= window / chunk_bytes + 2);
+}
+
+test "H3: a body streamed in one-byte chunks arrives in order and holds one window's worth" {
+    try expectSmallChunkStream(1, 64 * 1024, 512);
+}
+
+test "H3: a body streamed in two-hundred-byte chunks arrives in order and holds one window's worth" {
+    try expectSmallChunkStream(200, 256 * 1024, 16 * 1024);
+}
+
 test {
     _ = Session;
     _ = ResponseContext;
