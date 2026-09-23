@@ -5,7 +5,6 @@ const std = @import("std");
 /// Static Huffman table for HTTP/2 header compression.
 /// Each symbol (0-255) maps to a fixed bit code. Symbol 256 is EOS.
 /// Adapted from the bit-level I/O patterns in github.com/Maartz/huffman_encoding.
-
 /// A Huffman code entry: the bit pattern and its length.
 const Code = struct {
     bits: u32,
@@ -138,7 +137,7 @@ const huffman_table = [257]Code{
     .{ .bits = 0x79, .len = 7 }, // 120 'x'
     .{ .bits = 0x7a, .len = 7 }, // 121 'y'
     .{ .bits = 0x7b, .len = 7 }, // 122 'z'
-    .{ .bits = 0x7fffe, .len = 19 }, // 123 '{'
+    .{ .bits = 0x7ffe, .len = 15 }, // 123 '{'
     .{ .bits = 0x7fc, .len = 11 }, // 124 '|'
     .{ .bits = 0x3ffd, .len = 14 }, // 125 '}'
     .{ .bits = 0x1ffd, .len = 13 }, // 126 '~'
@@ -264,7 +263,7 @@ const huffman_table = [257]Code{
     .{ .bits = 0x7ffffe9, .len = 27 }, // 246
     .{ .bits = 0x7ffffea, .len = 27 }, // 247
     .{ .bits = 0x7ffffeb, .len = 27 }, // 248
-    .{ .bits = 0xfffffffe, .len = 30 }, // 249
+    .{ .bits = 0xffffffe, .len = 28 }, // 249
     .{ .bits = 0x7ffffec, .len = 27 }, // 250
     .{ .bits = 0x7ffffed, .len = 27 }, // 251
     .{ .bits = 0x7ffffee, .len = 27 }, // 252
@@ -322,59 +321,158 @@ pub fn encodedLength(src: []const u8) usize {
     return total;
 }
 
-/// Decode a Huffman-encoded byte sequence.
-/// `src` is the encoded data, `dst` receives the decoded bytes.
-/// Returns the number of bytes decoded.
-///
-/// Uses a bit-by-bit accumulator approach similar to the BitReader
-/// pattern from Maartz/huffman_encoding, but against the fixed
-/// HPACK Huffman table. Matches are found by trying code lengths
-/// from shortest (5) to longest (30), ensuring the correct
-/// prefix-free match.
-pub fn decode(dst: []u8, src: []const u8) !usize {
-    var dst_pos: usize = 0;
-    var accumulator: u64 = 0;
-    var bits_left: u7 = 0;
+// --- Decoding tables ---
+//
+// Decoding walks a table four bits at a time, the layout nghttp2 uses
+// (nghttp2_hd_huffman.c). A state is the internal node of the Huffman tree
+// reached by the bits consumed since the last complete code, so the tree's
+// 256 internal nodes are the states, and state 256 is a terminal failure
+// state entered when the EOS code appears in the input.
+//
+// A step consumes exactly one nibble and completes at most one symbol: the
+// shortest code is five bits, so at most three bits of the nibble can follow
+// a symbol, too few to complete another. Every decoded byte therefore costs
+// two table indexes instead of a scan of the whole code table.
 
-    for (src) |byte| {
-        // `accumulator` is a u64: at most 64 bits of pending input are
-        // representable. If more than 56 bits are still unmatched, shifting
-        // in another byte would discard the high bits and later make `shift`
-        // exceed the 6-bit shift operand range. Treat it as invalid data.
-        if (bits_left > 56) return error.HpackDecodingError;
-        accumulator = (accumulator << 8) | byte;
-        bits_left += 8;
+/// Internal nodes of the tree spanned by the 257 codes; state 256 is failure.
+const state_count = 256;
+const fail_state = state_count;
 
-        while (bits_left >= 5) {
-            // Try matching from shortest to longest code length.
-            // Huffman codes are prefix-free, so the first match by
-            // length is the correct one.
-            var found = false;
-            for (huffman_table[0..256], 0..) |code, sym| {
-                if (code.len <= bits_left) {
-                    const shift: u7 = bits_left - code.len;
-                    const candidate: u32 = @intCast((accumulator >> @intCast(shift)) & ((@as(u64, 1) << @intCast(code.len)) - 1));
-                    if (candidate == code.bits) {
-                        if (dst_pos >= dst.len) return error.HpackDecodingError;
-                        dst[dst_pos] = @intCast(sym);
-                        dst_pos += 1;
-                        bits_left -= code.len;
-                        accumulator &= (@as(u64, 1) << @intCast(bits_left)) - 1;
-                        found = true;
-                        break;
-                    }
-                }
+const Entry = struct {
+    /// State after consuming the nibble.
+    next: u16,
+    /// Byte emitted by this transition when `emit` is set.
+    sym: u8,
+    emit: bool,
+};
+
+const tables = buildTables();
+
+/// Table of state transitions, one row per state plus the failure row.
+const decode_table = tables.decode;
+/// Whether a state can end a string: the bits pending at that point are
+/// padding, so there are at most 7 of them and they are the leading bits of
+/// the EOS code, i.e. all ones (RFC 7541 §5.2).
+const end_state = tables.end_state;
+
+fn buildTables() struct { decode: [state_count + 1][16]Entry, end_state: [state_count + 1]bool } {
+    @setEvalBranchQuota(4_000_000);
+
+    // Child references: 0-256 are leaf symbols, 257+id are internal nodes.
+    const none = std.math.maxInt(u16);
+    const internal = 257;
+    var children: [state_count][2]u16 = @splat(.{ none, none });
+    var parent: [state_count]u16 = @splat(0);
+    var parent_bit: [state_count]u1 = @splat(0);
+    var next_node: u16 = 1;
+
+    // Lay the codes out as a tree. Order does not matter: the codes are
+    // prefix-free, so each ends in a slot of its own.
+    for (huffman_table, 0..) |code, sym| {
+        var node: u16 = 0;
+        var bit_index: u6 = code.len;
+        while (bit_index > 0) {
+            bit_index -= 1;
+            const bit: u1 = @intCast((code.bits >> @intCast(bit_index)) & 1);
+            const child = children[node][bit];
+            if (bit_index == 0) {
+                if (child != none) @compileError("Huffman codes are not prefix-free");
+                children[node][bit] = @intCast(sym);
+            } else if (child == none) {
+                const new_node = next_node;
+                next_node += 1;
+                children[node][bit] = internal + new_node;
+                parent[new_node] = node;
+                parent_bit[new_node] = bit;
+                node = new_node;
+            } else {
+                if (child < internal) @compileError("Huffman codes are not prefix-free");
+                node = child - internal;
             }
-            if (!found) break;
         }
     }
+    if (next_node != state_count) @compileError("Huffman tree does not have 256 internal nodes");
 
-    // Remaining bits should be padding (all 1s) of at most 7 bits
-    if (bits_left > 7) return error.HpackDecodingError;
-    if (bits_left > 0) {
-        const mask = (@as(u64, 1) << @intCast(bits_left)) - 1;
-        if (accumulator & mask != mask) return error.HpackDecodingError;
+    // Parents are allocated before their children, so one ascending pass is
+    // enough to give every state its depth and padding validity.
+    var valid_end: [state_count + 1]bool = @splat(false);
+    valid_end[0] = true; // nothing pending: a valid end of string
+    var depth: [state_count]u16 = @splat(0);
+    var node: u16 = 1;
+    while (node < state_count) : (node += 1) {
+        depth[node] = depth[parent[node]] + 1;
+        valid_end[node] = valid_end[parent[node]] and parent_bit[node] == 1 and depth[node] <= 7;
     }
+
+    var table: [state_count + 1][16]Entry = undefined;
+    for (0..state_count) |state| {
+        for (0..16) |nibble| {
+            var at: u16 = @intCast(state);
+            var sym: u8 = 0;
+            var emit = false;
+            var failed = false;
+
+            var left: u3 = 4;
+            while (left > 0) {
+                left -= 1;
+                const bit: u1 = @intCast((nibble >> left) & 1);
+                const child = children[at][bit];
+                if (child >= internal) {
+                    at = child - internal;
+                } else if (child == 256) {
+                    failed = true; // EOS in the input is a decoding error
+                    break;
+                } else {
+                    sym = @intCast(child);
+                    emit = true;
+                    at = 0; // a code resets the walk to the root
+                }
+            }
+
+            table[state][nibble] = .{
+                .next = if (failed) fail_state else at,
+                .sym = sym,
+                .emit = emit,
+            };
+        }
+    }
+    // The failure state consumes input without emitting anything, and can
+    // never end a string, so a failed decode is only reported at the end.
+    for (0..16) |nibble| {
+        table[fail_state][nibble] = .{ .next = fail_state, .sym = 0, .emit = false };
+    }
+
+    return .{ .decode = table, .end_state = valid_end };
+}
+
+/// Decode a Huffman-encoded byte sequence.
+/// `src` is the encoded data, `dst` receives the decoded bytes.
+/// Returns the number of bytes decoded. Input whose trailing bits are not
+/// padding — at most 7 bits, all ones (RFC 7541 §5.2) — is rejected.
+pub fn decode(dst: []u8, src: []const u8) !usize {
+    var state: u16 = 0;
+    var dst_pos: usize = 0;
+
+    for (src) |byte| {
+        const high = decode_table[state][byte >> 4];
+        if (high.emit) {
+            if (dst_pos >= dst.len) return error.HpackDecodingError;
+            dst[dst_pos] = high.sym;
+            dst_pos += 1;
+        }
+        state = high.next;
+
+        const low = decode_table[state][byte & 0x0F];
+        if (low.emit) {
+            if (dst_pos >= dst.len) return error.HpackDecodingError;
+            dst[dst_pos] = low.sym;
+            dst_pos += 1;
+        }
+        state = low.next;
+    }
+
+    // What is left pending must be valid padding: at most 7 bits, all ones.
+    if (!end_state[state]) return error.HpackDecodingError;
 
     return dst_pos;
 }
@@ -437,4 +535,88 @@ test "padding is all 1-bits" {
     try testing.expectEqual(@as(usize, 1), enc_len);
     // 'a' = 00011, padded = 00011|111 = 0x1f
     try testing.expectEqual(@as(u8, 0b00011_111), encoded[0]);
+}
+
+test "code table is a complete prefix code (RFC 7541 Appendix B)" {
+    // Every code of length L occupies 2^(30-L) of the 30-bit code space, and
+    // a complete code fills it exactly. A table with a mistyped entry would
+    // not add up, and its codes would overlap.
+    var space: u64 = 0;
+    for (huffman_table[0..257]) |code| {
+        space += @as(u64, 1) << @intCast(30 - code.len);
+    }
+    try testing.expectEqual(@as(u64, 1) << 30, space);
+
+    for (huffman_table[0..257], 0..) |outer, i| {
+        for (huffman_table[0..257], 0..) |inner, j| {
+            if (i == j or inner.len <= outer.len) continue;
+            try testing.expect((inner.bits >> @intCast(inner.len - outer.len)) != outer.bits);
+        }
+    }
+}
+
+test "Appendix B: 15-bit and 28-bit codes '{' and 0xF9" {
+    // '{' is 11111111|1111110 (15 bits), not a 19-bit code that would
+    // overlap with 0xF9's neighbours.
+    var encoded: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 15), encodedLength("{"));
+    const len = try encode(&encoded, "{");
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xff, 0xfd }, encoded[0..len]);
+
+    var decoded: [8]u8 = undefined;
+    try testing.expectEqualStrings("{", decoded[0..try decode(&decoded, encoded[0..len])]);
+
+    // 0xF9 is 28 bits, 11111111|11111111|11111111|1110.
+    try testing.expectEqual(@as(usize, 28), encodedLength(&[_]u8{0xf9}));
+    const len2 = try encode(&encoded, &[_]u8{0xf9});
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xff, 0xff, 0xff, 0xef }, encoded[0..len2]);
+    const dec2 = try decode(&decoded, encoded[0..len2]);
+    try testing.expectEqualSlices(u8, &[_]u8{0xf9}, decoded[0..dec2]);
+}
+
+test "encode and decode round-trip: every byte value" {
+    var input: [256]u8 = undefined;
+    for (&input, 0..) |*byte, i| byte.* = @intCast(i);
+
+    var encoded: [1024]u8 = undefined;
+    const enc_len = try encode(&encoded, &input);
+
+    var decoded: [256]u8 = undefined;
+    const dec_len = try decode(&decoded, encoded[0..enc_len]);
+    try testing.expectEqualSlices(u8, &input, decoded[0..dec_len]);
+
+    // Each byte on its own, so mis-decodes cannot cancel out.
+    for (input) |byte| {
+        const n = try encode(&encoded, &[_]u8{byte});
+        const d = try decode(&decoded, encoded[0..n]);
+        try testing.expectEqualSlices(u8, &[_]u8{byte}, decoded[0..d]);
+    }
+}
+
+test "decode rejects the EOS symbol" {
+    // 30 one-bits is the EOS code, which must never appear in a string.
+    var decoded: [16]u8 = undefined;
+    try testing.expectError(error.HpackDecodingError, decode(&decoded, &[_]u8{ 0xff, 0xff, 0xff, 0xfc }));
+    // Same, followed by more data.
+    try testing.expectError(error.HpackDecodingError, decode(&decoded, &[_]u8{ 0xff, 0xff, 0xff, 0xfc, 0xff }));
+}
+
+test "decode rejects invalid padding" {
+    var decoded: [16]u8 = undefined;
+    // 'a' = 00011, then padding 110 rather than 111.
+    try testing.expectError(error.HpackDecodingError, decode(&decoded, &[_]u8{0b00011_110}));
+    // 8 bits of padding, more than the 7 the RFC allows.
+    try testing.expectError(error.HpackDecodingError, decode(&decoded, &[_]u8{ 0x1f, 0xf0 }));
+    // A trailing zero bit.
+    try testing.expectError(error.HpackDecodingError, decode(&decoded, &[_]u8{0x1e}));
+
+    // Three padding bits are fine.
+    try testing.expectEqual(@as(usize, 1), try decode(&decoded, &[_]u8{0x1f}));
+}
+
+test "decode reports an output buffer that is too small" {
+    var encoded: [64]u8 = undefined;
+    const len = try encode(&encoded, "www.example.com");
+    var decoded: [4]u8 = undefined;
+    try testing.expectError(error.HpackDecodingError, decode(&decoded, encoded[0..len]));
 }

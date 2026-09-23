@@ -322,6 +322,69 @@ test "Huffman: encode custom-value matches RFC" {
     try testing.expectEqualSlices(u8, &expected, encoded[0..len]);
 }
 
+// --- Decoder isolation: one decoder per HTTP/2 connection ---
+
+// RFC 7541 C.4.1: :authority: www.example.com (Huffman-encoded value)
+const authority_block = hexToBytes("418c" ++ "f1e3c2e5f23a6ba0ab90f4ff");
+// RFC 7541 C.4.2: cache-control: no-cache (Huffman-encoded value)
+const no_cache_block = hexToBytes("5886" ++ "a8eb10649cbf");
+
+test "decoders on separate connections do not share decoded strings" {
+    var buf_a: [4096]u8 = undefined;
+    var entries_a: [64]hpack.DynamicTable.Entry = undefined;
+    var dec_a = hpack.Decoder.init(&buf_a, &entries_a);
+
+    var buf_b: [4096]u8 = undefined;
+    var entries_b: [64]hpack.DynamicTable.Entry = undefined;
+    var dec_b = hpack.Decoder.init(&buf_b, &entries_b);
+
+    var headers_a: [16]hpack.HeaderField = undefined;
+    var headers_b: [16]hpack.HeaderField = undefined;
+
+    const count_a = try dec_a.decode(&authority_block, &headers_a);
+    try testing.expectEqual(@as(usize, 1), count_a);
+    const value_a = headers_a[0].value;
+
+    const count_b = try dec_b.decode(&no_cache_block, &headers_b);
+    try testing.expectEqual(@as(usize, 1), count_b);
+    try testing.expectEqualStrings("no-cache", headers_b[0].value);
+
+    // Decoding on connection B must not disturb connection A's decoded
+    // header list, which stays valid until A decodes its next block.
+    try testing.expectEqualStrings(":authority", headers_a[0].name);
+    try testing.expectEqualStrings("www.example.com", value_a);
+}
+
+test "decoders on separate threads do not corrupt each other" {
+    const Worker = struct {
+        fn run(block: []const u8, expected: []const u8, corrupt: *std.atomic.Value(u32)) void {
+            var buf: [4096]u8 = undefined;
+            var entries: [64]hpack.DynamicTable.Entry = undefined;
+            var decoder = hpack.Decoder.init(&buf, &entries);
+            var headers: [16]hpack.HeaderField = undefined;
+
+            for (0..500) |_| {
+                const count = decoder.decode(block, &headers) catch {
+                    _ = corrupt.fetchAdd(1, .monotonic);
+                    return;
+                };
+                if (count != 1 or !mem.eql(u8, headers[0].value, expected)) {
+                    _ = corrupt.fetchAdd(1, .monotonic);
+                    return;
+                }
+            }
+        }
+    };
+
+    var corrupt = std.atomic.Value(u32).init(0);
+    const thread_a = try std.Thread.spawn(.{}, Worker.run, .{ &authority_block, "www.example.com", &corrupt });
+    const thread_b = try std.Thread.spawn(.{}, Worker.run, .{ &no_cache_block, "no-cache", &corrupt });
+    thread_a.join();
+    thread_b.join();
+
+    try testing.expectEqual(@as(u32, 0), corrupt.load(.monotonic));
+}
+
 // --- Helper: compile-time hex string to bytes ---
 
 fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {

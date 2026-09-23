@@ -6,9 +6,12 @@ const huffman = @import("huffman.zig");
 ///
 /// Provides encoding and decoding of HTTP/2 header fields using
 /// the static table, dynamic table, and Huffman coding.
-
 /// Maximum number of headers we support per field block.
 pub const max_decoded_headers = 128;
+
+/// Room for the Huffman-decoded strings of one header block. Every decoder
+/// owns its own scratch, so decoded strings never cross between connections.
+pub const huffman_scratch_size = 16384;
 
 /// A decoded header field name-value pair.
 pub const HeaderField = struct {
@@ -276,6 +279,13 @@ pub const DynamicTable = struct {
 pub const Decoder = struct {
     dynamic_table: DynamicTable,
 
+    /// Decoded strings for the header block currently being decoded. The
+    /// `HeaderField` slices handed back by `decode` point in here and stay
+    /// valid until the next block is decoded.
+    huffman_scratch: [huffman_scratch_size]u8 = undefined,
+    /// How much of `huffman_scratch` is already handed out.
+    huffman_scratch_offset: usize = 0,
+
     pub fn init(buffer: []u8, entries: []DynamicTable.Entry) Decoder {
         return .{
             .dynamic_table = DynamicTable.init(buffer, entries),
@@ -296,8 +306,8 @@ pub const Decoder = struct {
     /// Decode a complete header block fragment into header fields.
     /// Returns the number of headers decoded.
     pub fn decode(self: *Decoder, data: []const u8, headers: []HeaderField) !usize {
-        // Reset Huffman scratch buffer for this header block
-        huffman_scratch_offset = 0;
+        // Reset this decoder's Huffman scratch for the new header block
+        self.huffman_scratch_offset = 0;
 
         var pos: usize = 0;
         var count: usize = 0;
@@ -322,12 +332,12 @@ pub const Decoder = struct {
                 if (result.value != 0) {
                     name = (try self.lookup(result.value)).name;
                 } else {
-                    const str = try decodeString(data[pos..]);
+                    const str = try decodeString(self, data[pos..]);
                     name = str.value;
                     pos += str.consumed;
                 }
 
-                const value_str = try decodeString(data[pos..]);
+                const value_str = try decodeString(self, data[pos..]);
                 pos += value_str.consumed;
 
                 self.dynamic_table.add(name, value_str.value);
@@ -347,12 +357,12 @@ pub const Decoder = struct {
                 if (result.value != 0) {
                     name = (try self.lookup(result.value)).name;
                 } else {
-                    const str = try decodeString(data[pos..]);
+                    const str = try decodeString(self, data[pos..]);
                     name = str.value;
                     pos += str.consumed;
                 }
 
-                const value_str = try decodeString(data[pos..]);
+                const value_str = try decodeString(self, data[pos..]);
                 pos += value_str.consumed;
 
                 // Don't add to dynamic table
@@ -371,9 +381,9 @@ pub const Decoder = struct {
 
 /// Decode an HPACK string (RFC 7541 §5.2).
 /// Huffman encoding is indicated by the high bit of the first byte.
-/// When Huffman-encoded, decodes into the scratch buffer at the current
-/// offset so multiple decoded strings don't overwrite each other.
-fn decodeString(data: []const u8) !struct { value: []const u8, consumed: usize } {
+/// When Huffman-encoded, decodes into this decoder's scratch buffer at the
+/// current offset so multiple decoded strings don't overwrite each other.
+fn decodeString(self: *Decoder, data: []const u8) !struct { value: []const u8, consumed: usize } {
     if (data.len == 0) return error.HpackDecodingError;
 
     const is_huffman = data[0] & 0x80 != 0;
@@ -386,13 +396,13 @@ fn decodeString(data: []const u8) !struct { value: []const u8, consumed: usize }
     const encoded = data[str_start..][0..str_len];
 
     if (is_huffman) {
-        if (huffman_scratch_offset >= huffman_decode_scratch.len)
+        if (self.huffman_scratch_offset >= self.huffman_scratch.len)
             return error.HpackDecodingError;
-        const remaining = huffman_decode_scratch[huffman_scratch_offset..];
+        const remaining = self.huffman_scratch[self.huffman_scratch_offset..];
         const dec_len = huffman.decode(remaining, encoded) catch
             return error.HpackDecodingError;
         const value = remaining[0..dec_len];
-        huffman_scratch_offset += dec_len;
+        self.huffman_scratch_offset += dec_len;
         return .{
             .value = value,
             .consumed = str_start + str_len,
@@ -404,11 +414,6 @@ fn decodeString(data: []const u8) !struct { value: []const u8, consumed: usize }
         .consumed = str_start + str_len,
     };
 }
-
-/// Scratch buffer for Huffman decoding. Each decoded string occupies
-/// a separate region so slices remain valid for the header block.
-var huffman_decode_scratch: [16384]u8 = undefined;
-var huffman_scratch_offset: usize = 0;
 
 // --- Encoder ---
 
