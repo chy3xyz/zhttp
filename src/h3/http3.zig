@@ -221,21 +221,41 @@ pub const Session = struct {
 
     /// Submit a response for |req|, with |body| as its content. Ownership of
     /// |body| moves to the request and it is freed when the stream closes.
-    pub fn submitResponse(self: *Session, req: *ServerRequest, status: u16, content_type: []const u8, body: []const u8) !void {
+    ///
+    /// |headers| are additional fields to send after Content-Type. A
+    /// `content-length` among them is dropped: the length of |body| is what
+    /// goes out, and RFC 9114 Section 4.1 allows only one.
+    pub fn submitResponse(
+        self: *Session,
+        req: *ServerRequest,
+        status: u16,
+        content_type: []const u8,
+        headers: []const HeaderField,
+        body: []const u8,
+    ) !void {
         // nghttp3 copies the header values, so stack buffers are fine here.
         var status_buf: [16]u8 = undefined;
         const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch return error.H3Error;
         var len_buf: [20]u8 = undefined;
         const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{body.len}) catch return error.H3Error;
 
-        const nva = [3]nghttp3.nghttp3_nv{
-            makeNv(":status", status_str),
-            makeNv("content-type", content_type),
-            makeNv("content-length", len_str),
-        };
+        const nva = try self.allocator.alloc(nghttp3.nghttp3_nv, 3 + headers.len);
+        defer self.allocator.free(nva);
+
+        nva[0] = makeNv(":status", status_str);
+        nva[1] = makeNv("content-type", content_type);
+        nva[2] = makeNv("content-length", len_str);
+
+        var nvlen: usize = 3;
+        for (headers) |header| {
+            if (std.mem.eql(u8, header.name, "content-length")) continue;
+            nva[nvlen] = makeNv(header.name, header.value);
+            nvlen += 1;
+        }
+
         const reader = nghttp3.nghttp3_data_reader{ .read_data = readDataCb };
 
-        const ret = nghttp3.nghttp3_conn_submit_response(self.conn, req.stream_id, &nva, nva.len, &reader);
+        const ret = nghttp3.nghttp3_conn_submit_response(self.conn, req.stream_id, nva.ptr, nvlen, &reader);
         if (ret != 0) return error.H3Error;
 
         req.response_body = body;

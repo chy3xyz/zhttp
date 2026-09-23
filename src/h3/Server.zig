@@ -32,7 +32,15 @@ pub const Response = struct {
     status: StatusCode = .ok,
     content_type: []const u8 = "text/plain",
     body: []const u8 = "",
+    /// Header fields to send after Content-Type, e.g. `Set-Cookie` or
+    /// `Location`. Names have to be lowercase (RFC 9114 Section 4.2).
+    /// `content-length` is set from the body, and a field that repeats it is
+    /// dropped rather than sent twice.
+    headers: []const Header = &.{},
 };
+
+/// One header field of a response. The name has to be lowercase.
+pub const Header = http3.HeaderField;
 
 /// Handler called for each completed HTTP/3 request. The returned body is
 /// copied, so the handler keeps ownership of everything it hands over.
@@ -533,7 +541,7 @@ fn serveRequests(self: *Server, session: *http3.Session) void {
             req.responded = true; // nothing to send; don't retry it forever
             continue;
         };
-        session.submitResponse(req, @backingInt(answer.status), answer.content_type, body) catch {
+        session.submitResponse(req, @backingInt(answer.status), answer.content_type, answer.headers, body) catch {
             self.allocator.free(body);
             req.responded = true;
             continue;

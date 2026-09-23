@@ -147,6 +147,47 @@ test "h3: a body over the limit is answered with 413" {
     try std.testing.expectEqualStrings("OK", ok.body);
 }
 
+/// Answers with two header fields of its own, and tries to send one that
+/// repeats Content-Length.
+fn headersHandler(_: std.mem.Allocator, request: *const server_mod.Request) server_mod.Response {
+    _ = request;
+    return .{
+        .status = .found,
+        .body = "moved",
+        .headers = &.{
+            .{ .name = "location", .value = "/elsewhere" },
+            .{ .name = "set-cookie", .value = "a=b; HttpOnly" },
+            .{ .name = "content-length", .value = "999" },
+        },
+    };
+}
+
+test "h3: a handler's own response headers reach the client" {
+    try quic.setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
+
+    const allocator = std.heap.page_allocator;
+    const server = try allocator.create(Server);
+    server.* = try Server.init(allocator, 0, headersHandler, .{});
+    const port = std.mem.bigToNative(u16, server.listener.local_addr.port);
+    _ = try std.Thread.spawn(.{}, serve, .{server});
+
+    var client = try Client.init(allocator, "127.0.0.1", port, .{ .insecure_skip_verify = true });
+    defer client.deinit();
+
+    const answer = try client.request("/");
+    defer allocator.free(answer.header_text);
+    defer allocator.free(answer.body);
+
+    try std.testing.expectEqual(@as(u16, 302), answer.status);
+    try std.testing.expect(std.mem.indexOf(u8, answer.header_text, "location: /elsewhere") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answer.header_text, "set-cookie: a=b; HttpOnly") != null);
+    // The handler's own content-length is dropped, not sent beside the real one:
+    // the body is five bytes long, and a second field would be malformed.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, answer.header_text, "content-length:"));
+    try std.testing.expect(std.mem.indexOf(u8, answer.header_text, "content-length: 5") != null);
+    try std.testing.expectEqualStrings("moved", answer.body);
+}
+
 test "h3: serves a second client while the first is still connected" {
     try quic.setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
 
