@@ -128,7 +128,7 @@ test "compression middleware: wraps route handler and compresses" {
     try testing.expect(resp.body.len < 256);
 }
 
-test "compression middleware: skips when not accepted" {
+test "compression middleware: skips an encoding the client did not ask for" {
     const inner = struct {
         fn h(_: std.mem.Allocator, _: std.Io, _: *const Request) Response {
             return Response.init(
@@ -144,6 +144,7 @@ test "compression middleware: skips when not accepted" {
     const req = try Request.parseConst(
         "GET / HTTP/1.1\r\n" ++
             "Host: localhost\r\n" ++
+            "Accept-Encoding: identity\r\n" ++
             "\r\n",
     );
     const test_io: std.Io = .{ .userdata = null, .vtable = undefined };

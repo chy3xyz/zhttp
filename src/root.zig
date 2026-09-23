@@ -32,9 +32,48 @@ const std = @import("std");
 
 test {
     std.testing.refAllDecls(@This());
-    // middleware/rate_limit.zig is only reachable through the `middleware`
-    // struct's field types, which refAllDecls does not analyse — import it
-    // explicitly so its tests are collected.
-    _ = @import("middleware/rate_limit.zig");
-    if (httpz_options.h3) _ = @import("h3/root.zig");
+    // Every file of the library is walked here, so each one is compiled even
+    // when nothing else reaches it: a function that only a caller's code would
+    // analyse is a function whose breakage ships as a build failure for that
+    // caller. `refAllDecls` on a namespace does not descend into the files it
+    // holds, which is how a `RateLimiter` still using a removed
+    // `std.Thread.Mutex` stayed green in here.
+    std.testing.refAllDecls(@import("Request.zig"));
+    std.testing.refAllDecls(@import("Response.zig"));
+    std.testing.refAllDecls(@import("Headers.zig"));
+    std.testing.refAllDecls(@import("Router.zig"));
+    std.testing.refAllDecls(@import("Cookie.zig"));
+    std.testing.refAllDecls(@import("openssl.zig"));
+    // openssl_c.zig is its own module, so it is compiled on its own; importing
+    // it again by path would put the same file in two modules.
+    std.testing.refAllDecls(@import("client/Client.zig"));
+    std.testing.refAllDecls(@import("client/H2Client.zig"));
+    std.testing.refAllDecls(@import("h2/frame.zig"));
+    std.testing.refAllDecls(@import("h2/hpack.zig"));
+    std.testing.refAllDecls(@import("h2/huffman.zig"));
+    std.testing.refAllDecls(@import("h2/Settings.zig"));
+    std.testing.refAllDecls(@import("h2/Stream.zig"));
+    std.testing.refAllDecls(@import("h2/StreamRegistry.zig"));
+    std.testing.refAllDecls(@import("h2/ConnectionIO.zig"));
+    std.testing.refAllDecls(@import("h2/FlowControl.zig"));
+    std.testing.refAllDecls(@import("h2/errors.zig"));
+    std.testing.refAllDecls(@import("middleware/compression.zig"));
+    std.testing.refAllDecls(@import("middleware/cors.zig"));
+    std.testing.refAllDecls(@import("middleware/rate_limit.zig"));
+    std.testing.refAllDecls(@import("middleware/security_headers.zig"));
+    std.testing.refAllDecls(@import("server/ChunkedWriter.zig"));
+    std.testing.refAllDecls(@import("server/Compression.zig"));
+    std.testing.refAllDecls(@import("server/Connection.zig"));
+    std.testing.refAllDecls(@import("server/Date.zig"));
+    std.testing.refAllDecls(@import("server/H2Connection.zig"));
+    std.testing.refAllDecls(@import("server/Proxy.zig"));
+    std.testing.refAllDecls(@import("server/Server.zig"));
+    std.testing.refAllDecls(@import("server/WebSocket.zig"));
+
+    if (httpz_options.h3) {
+        std.testing.refAllDecls(@import("h3/quic.zig"));
+        std.testing.refAllDecls(@import("h3/http3.zig"));
+        std.testing.refAllDecls(@import("h3/Client.zig"));
+        std.testing.refAllDecls(@import("h3/Server.zig"));
+    }
 }

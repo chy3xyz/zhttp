@@ -35,10 +35,7 @@ pub fn apply(response: *Response, options: Options) void {
 }
 
 test "security_headers middleware" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var resp = Response.init(arena.allocator());
+    var resp = Response.init(.ok, "text/plain", "");
     apply(&resp, .{
         .content_security_policy = "default-src 'self'",
     });
