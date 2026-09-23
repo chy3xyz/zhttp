@@ -32,5 +32,9 @@ const std = @import("std");
 
 test {
     std.testing.refAllDecls(@This());
+    // middleware/rate_limit.zig is only reachable through the `middleware`
+    // struct's field types, which refAllDecls does not analyse — import it
+    // explicitly so its tests are collected.
+    _ = @import("middleware/rate_limit.zig");
     if (httpz_options.h3) _ = @import("h3/root.zig");
 }

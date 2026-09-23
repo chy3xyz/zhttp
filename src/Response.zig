@@ -51,6 +51,7 @@ pub const StatusCode = enum(u16) {
     unsupported_media_type = 415,
     requested_range_not_satisfiable = 416,
     expectation_failed = 417,
+    too_many_requests = 429,
 
     // 5xx Server Error (RFC 2616 Section 10.5)
     internal_server_error = 500,
@@ -96,6 +97,7 @@ pub const StatusCode = enum(u16) {
             .unsupported_media_type => "Unsupported Media Type",
             .requested_range_not_satisfiable => "Requested Range Not Satisfiable",
             .expectation_failed => "Expectation Failed",
+            .too_many_requests => "Too Many Requests",
             .internal_server_error => "Internal Server Error",
             .not_implemented => "Not Implemented",
             .bad_gateway => "Bad Gateway",
@@ -106,7 +108,7 @@ pub const StatusCode = enum(u16) {
     }
 
     pub fn toInt(self: StatusCode) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -362,7 +364,7 @@ pub fn init(status: StatusCode, content_type: []const u8, body: []const u8) Resp
 
 /// Serialize a Zig value into JSON and create a Response with Content-Type application/json.
 pub fn json(allocator: std.mem.Allocator, value: anytype, status: StatusCode) !Response {
-    const stringified = try std.json.stringifyAlloc(allocator, value, .{});
+    const stringified = try std.json.Stringify.valueAlloc(allocator, value, .{});
     var resp = Response.init(status, "application/json", stringified);
     resp._body_allocated = stringified;
     return resp;
@@ -383,48 +385,58 @@ pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
 
 /// Context for the sendFile stream function.
 const SendFileContext = struct {
-    file: std.fs.File,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: std.Io.File,
+    reader: std.Io.File.Reader,
+    read_buf: [read_buf_len]u8 = undefined,
+
+    const read_buf_len = 16 * 1024;
 
     fn streamFn(ctx_ptr: ?*anyopaque, writer: *std.Io.Writer) void {
         const self: *SendFileContext = @ptrCast(@alignCast(ctx_ptr));
         defer {
-            self.file.close();
-            std.heap.page_allocator.destroy(self);
+            self.file.close(self.io);
+            self.allocator.destroy(self);
         }
-        const file_reader = self.file.reader();
-        writer.sendFileAll(&file_reader, .unlimited) catch return;
+        _ = writer.sendFileAll(&self.reader, .unlimited) catch return;
     }
 };
 
 /// Create a streaming response that serves a file from disk.
 /// Uses the writer's native sendFile support (may use zero-copy on Linux).
 /// The file is opened at call time, streamed when the server calls stream_fn.
+/// The stream context is allocated with `allocator` and released when the file
+/// has been streamed (or closed early by the server).
 ///
 /// WARNING: This follows symlinks. Callers must validate that the path
 /// is within an expected directory to prevent path traversal attacks.
 ///
 /// `max_file_size`: maximum allowed file size in bytes. Pass 0 for unlimited.
 /// Returns 413 Request Entity Too Large if the file exceeds the limit.
-pub fn sendFile(path: []const u8, content_type: []const u8, max_file_size: usize) Response {
-    const file = std.fs.openFileAbsolute(path, .{}) catch {
+pub fn sendFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, content_type: []const u8, max_file_size: usize) Response {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch {
         return Response.init(.not_found, "text/plain", "Not Found");
     };
 
-    const stat = file.stat() catch {
-        file.close();
+    const stat = file.stat(io) catch {
+        file.close(io);
         return Response.init(.internal_server_error, "text/plain", "Internal Server Error");
     };
 
     if (max_file_size > 0 and stat.size > max_file_size) {
-        file.close();
+        file.close(io);
         return Response.init(.request_entity_too_large, "text/plain", "Request Entity Too Large");
     }
 
-    const ctx = std.heap.page_allocator.create(SendFileContext) catch {
-        file.close();
+    const ctx = allocator.create(SendFileContext) catch {
+        file.close(io);
         return Response.init(.internal_server_error, "text/plain", "Internal Server Error");
     };
-    ctx.* = .{ .file = file };
+    ctx.io = io;
+    ctx.allocator = allocator;
+    ctx.file = file;
+    ctx.reader = file.reader(io, &ctx.read_buf);
 
     var resp: Response = .{ .status = .ok };
     resp.headers.append("Content-Type", content_type) catch {};
@@ -933,4 +945,57 @@ test "Response: serializeHeaders with chunked" {
     try testing.expect(std.mem.indexOf(u8, result, "Transfer-Encoding: chunked\r\n") != null);
     // Should end with \r\n (no body/chunk data)
     try testing.expect(std.mem.endsWith(u8, result, "\r\n\r\n"));
+}
+
+// The JSON body is allocated with the caller's allocator and released by deinit
+test "Response: json helper" {
+    var resp = try Response.json(testing.allocator, .{ .ok = true, .count = 3 }, .created);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(StatusCode.created, resp.status);
+    try testing.expectEqualStrings("application/json", resp.headers.get("Content-Type").?);
+    try testing.expectEqualStrings("{\"ok\":true,\"count\":3}", resp.body);
+
+    var buf: [256]u8 = undefined;
+    const wire = try resp.serialize(&buf);
+    try testing.expect(std.mem.startsWith(u8, wire, "HTTP/1.1 201 Created\r\n"));
+    try testing.expect(std.mem.endsWith(u8, wire, "{\"ok\":true,\"count\":3}"));
+}
+
+// sendFile opens the file, reports its size, and streams it through stream_fn
+test "Response: sendFile streams file contents" {
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const contents = "hello from sendFile";
+    try tmp.dir.writeFile(io, .{ .sub_path = "index.html", .data = contents });
+
+    const abs_path = try tmp.dir.realPathFileAlloc(io, "index.html", testing.allocator);
+    defer testing.allocator.free(abs_path);
+
+    var resp = Response.sendFile(testing.allocator, io, abs_path, "text/html", 0);
+    try testing.expectEqual(StatusCode.ok, resp.status);
+    try testing.expectEqualStrings("text/html", resp.headers.get("Content-Type").?);
+    try testing.expectEqualStrings("19", resp.headers.get("Content-Length").?);
+    try testing.expect(!resp.auto_content_length);
+    const stream_fn = resp.stream_fn orelse return error.MissingStreamFn;
+
+    // Drive the streaming path the server uses. It also releases the context.
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.ensureUnusedCapacity(1);
+    stream_fn(resp.stream_context, &out.writer);
+    try testing.expectEqualStrings(contents, out.writer.buffered());
+
+    // Missing file
+    const missing = Response.sendFile(testing.allocator, io, "/zhttp-no-such-file", "text/plain", 0);
+    try testing.expectEqual(StatusCode.not_found, missing.status);
+    try testing.expectEqualStrings("Not Found", missing.body);
+
+    // File larger than the limit
+    const too_big = Response.sendFile(testing.allocator, io, abs_path, "text/plain", contents.len - 1);
+    try testing.expectEqual(StatusCode.request_entity_too_large, too_big.status);
+    try testing.expectEqualStrings("Request Entity Too Large", too_big.body);
 }

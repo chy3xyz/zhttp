@@ -246,7 +246,7 @@ sec.apply(&response, .{
 Token-bucket rate limiter per IP or custom key:
 
 ```zig
-var limiter = httpz.middleware.rate_limit.RateLimiter.init(allocator, 100, 10); // max 100 tokens, 10 tokens/sec refill
+var limiter = httpz.middleware.rate_limit.RateLimiter.init(allocator, io, 100, 10); // max 100 tokens, 10 tokens/sec refill
 defer limiter.deinit();
 
 // Returns false and sets 429 status when limit exceeded:
@@ -467,12 +467,12 @@ The `Conn` API: `recv() !?Message`, `send([]const u8) !void`, `sendBinary([]cons
 `Response.sendFile` streams a file from disk using zero-copy I/O when available:
 
 ```zig
-fn handleFile(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request) httpz.Response {
-    return httpz.Response.sendFile("/var/www/index.html", "text/html", 10 * 1024 * 1024);
+fn handleFile(allocator: std.mem.Allocator, io: std.Io, _: *const httpz.Request) httpz.Response {
+    return httpz.Response.sendFile(allocator, io, "/var/www/index.html", "text/html", 10 * 1024 * 1024);
 }
 ```
 
-The third argument is the maximum allowed file size in bytes (0 for unlimited). Returns 404 if the file doesn't exist, 413 if it exceeds the limit.
+The last argument is the maximum allowed file size in bytes (0 for unlimited). Returns 404 if the file doesn't exist, 413 if it exceeds the limit. The file is streamed with the allocator and `Io` it is given, and released once it has been sent.
 
 ## HTTPS / TLS
 

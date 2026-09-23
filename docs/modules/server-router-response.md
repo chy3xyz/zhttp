@@ -300,7 +300,9 @@ pub fn deinit(self: *Response, allocator: std.mem.Allocator) void
 /// Create a streaming response that serves a file from disk.
 /// Uses zero-copy sendFile when available. Returns 404 / 413 on error.
 /// WARNING: follows symlinks — caller must validate path.
-pub fn sendFile(path: []const u8, content_type: []const u8, max_file_size: usize) Response
+/// The stream context is allocated with `allocator` and released once the
+/// file has been streamed.
+pub fn sendFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, content_type: []const u8, max_file_size: usize) Response
 ```
 
 ```zig
@@ -373,8 +375,8 @@ fn streamFn(_: ?*anyopaque, writer: *std.Io.Writer) void {
 File serving:
 
 ```zig
-fn handleFile(_: std.mem.Allocator, _: std.Io, _: *const httpz.Request) httpz.Response {
-    return httpz.Response.sendFile("/var/www/index.html", "text/html", 10 * 1024 * 1024);
+fn handleFile(allocator: std.mem.Allocator, io: std.Io, _: *const httpz.Request) httpz.Response {
+    return httpz.Response.sendFile(allocator, io, "/var/www/index.html", "text/html", 10 * 1024 * 1024);
 }
 ```
 
