@@ -386,13 +386,14 @@ pub const TlsSession = struct {
 fn clientTlsSession(tls: ClientTls) !*TlsSession {
     const ssl_ctx = ossl.SSL_CTX_new(ossl.TLS_client_method()) orelse return error.TlsError;
     errdefer ossl.SSL_CTX_free(ssl_ctx);
-    if (tls.insecure_skip_verify) {
+    // `.empty` means what it says: no store to verify against, so the peer is
+    // trusted on the strength of the handshake. This is what the HTTP/1.1
+    // client does with the same setting.
+    if (tls.insecure_skip_verify or tls.root_ca == .empty) {
         ossl.SSL_CTX_set_verify(ssl_ctx, ossl.SSL_VERIFY_NONE, null);
     } else {
         ossl.SSL_CTX_set_verify(ssl_ctx, ossl.SSL_VERIFY_PEER, null);
-        if (tls.root_ca == .system and ossl.SSL_CTX_set_default_verify_paths(ssl_ctx) != 1) {
-            return error.TlsError;
-        }
+        if (ossl.SSL_CTX_set_default_verify_paths(ssl_ctx) != 1) return error.TlsError;
     }
 
     if (tls.auth) |auth| try loadCertInto(ssl_ctx, auth.cert_pem, auth.key_pem);
@@ -1481,4 +1482,26 @@ test "connect: a client certificate that does not load is a TLS error" {
         .insecure_skip_verify = true,
         .auth = .{ .cert_pem = @embedFile("test_cert.pem"), .key_pem = "not a key" },
     }));
+}
+
+// `root_ca = .empty` says the peer is trusted without a store to check it
+// against, which is what the HTTP/1.1 client does with the same setting. The
+// test certificate is self-signed, so a client that verified it against the
+// system store would fail this handshake.
+test "quic: a client with an empty root_ca store trusts the peer" {
+    defer resetServerTls();
+    try setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
+
+    const allocator = std.heap.page_allocator;
+    const server = try RunningServer.start(allocator, okHandler);
+    defer server.stop();
+
+    var client = try client_mod.Client.init(allocator, "127.0.0.1", server.port(), .{
+        .root_ca = .empty,
+    });
+    defer client.deinit();
+
+    const body = try client.get("/");
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("OK", body);
 }
