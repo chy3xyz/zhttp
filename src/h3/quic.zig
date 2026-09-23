@@ -131,7 +131,69 @@ pub fn disableQLog() void {
     }
 }
 
-pub const Error = error{ QuicError, OutOfMemory, NoSpaceLeft, TlsError };
+pub const Error = error{
+    QuicError,
+    OutOfMemory,
+    NoSpaceLeft,
+    /// The TLS handshake failed. ngtcp2 reports the alert and the TLS library's
+    /// own error code; `lastTlsFailure` has them.
+    TlsError,
+    /// The QUIC handshake did not finish within the time a connection attempt
+    /// allowed, so there is no connection to hand back.
+    HandshakeTimeout,
+    /// The HTTP/3 layer reported a connection error. nghttp3.h: the connection
+    /// must be closed, and calling anything but `nghttp3_conn_del` on it
+    /// afterwards is undefined behaviour.
+    Http3Error,
+    /// The connection is closing or draining — the peer ended it, or an endpoint
+    /// already sent a CONNECTION_CLOSE.
+    ConnectionClosed,
+    /// ngtcp2.h, `ngtcp2_conn_read_pkt`: the endpoint must drop the connection
+    /// silently, without a CONNECTION_CLOSE, and discard its state.
+    ConnectionDropped,
+    /// ngtcp2.h, `ngtcp2_conn_read_pkt`: the server must validate the peer's
+    /// address by sending a Retry packet and discard the connection state.
+    RetryRequired,
+};
+
+/// What ngtcp2 knows about a TLS failure: the alert that ended the handshake and
+/// the error code the TLS library reported. Both are 0 when ngtcp2 has neither.
+pub const TlsFailure = struct {
+    alert: u8 = 0,
+    error_code: c_int = 0,
+};
+
+/// The TLS failure the last read or write on this thread ran into. ngtcp2 keeps
+/// the details only until the next one, so they are lifted out of the connection
+/// when it reports the error (`ngtcp2_conn_get_tls_alert2`,
+/// `ngtcp2_conn_get_tls_error2`), where a caller that no longer has a connection
+/// can still see them.
+pub threadlocal var last_tls_failure: TlsFailure = .{};
+
+/// The error an ngtcp2 return value means. TLS is the one failure ngtcp2 keeps
+/// detail for, so it is read out here; everything else is the code itself.
+fn classify(conn: *ngtcp2.ngtcp2_conn, ret: c_int) Error {
+    switch (ret) {
+        ngtcp2.NGTCP2_ERR_CRYPTO => {
+            last_tls_failure = .{
+                .alert = ngtcp2.ngtcp2_conn_get_tls_alert2(conn),
+                .error_code = ngtcp2.ngtcp2_conn_get_tls_error2(conn),
+            };
+            return error.TlsError;
+        },
+        ngtcp2.NGTCP2_ERR_DRAINING, ngtcp2.NGTCP2_ERR_CLOSING => return error.ConnectionClosed,
+        ngtcp2.NGTCP2_ERR_DROP_CONN => return error.ConnectionDropped,
+        ngtcp2.NGTCP2_ERR_RETRY => return error.RetryRequired,
+        else => return error.QuicError,
+    }
+}
+
+/// The error `ngtcp2_conn_read_pkt`'s return value means, as ngtcp2.h documents
+/// it. Public because a caller that drives ngtcp2 itself (the H3 server does)
+/// has to act on the same codes.
+pub fn classifyReadError(conn: *ngtcp2.ngtcp2_conn, ret: c_int) Error {
+    return classify(conn, ret);
+}
 
 /// TLS settings for a QUIC client connection, mirroring `httpz.tls.config.Client`.
 pub const ClientTls = struct {
@@ -144,13 +206,31 @@ pub const ClientTls = struct {
 
 pub const RootCa = enum { empty, system };
 
+/// What the HTTP/3 layer did with one chunk of stream data.
+pub const StreamRead = union(enum) {
+    /// The bytes nghttp3 consumed. This much flow control credit goes back to
+    /// the peer.
+    consumed: usize,
+    /// nghttp3 hit a connection error, which nghttp3.h defines as: the
+    /// connection must be closed, and calling anything but `nghttp3_conn_del`
+    /// on it is undefined behaviour. The payload is the QUIC application error
+    /// code to close it with (`nghttp3_err_infer_quic_app_error_code`).
+    connection_error: u64,
+};
+
 /// Callback type for receiving stream data. Called from ngtcp2 recv_stream_data.
-/// `h3_conn` is the nghttp3 connection pointer to feed data into. Returns how
-/// many bytes of the received datagram the HTTP/3 layer took, which is the flow
-/// control credit the QUIC connection gets back.
+/// `h3_conn` is the nghttp3 connection pointer to feed data into. `ts` is the
+/// timestamp ngtcp2 was given for the packet that carried the data: nghttp3
+/// requires the timestamp of every read to be non-decreasing and to come from a
+/// steadily increasing clock, and feeding it a constant disables its rate
+/// limiter (nghttp3.h, `nghttp3_conn_read_stream2`).
 pub const StreamDataCtx = struct {
     h3_conn: *anyopaque, // *nghttp3.nghttp3_conn — opaque to avoid circular dep
-    recv_stream_data: *const fn (h3_conn: *anyopaque, stream_id: i64, data: []const u8, fin: bool) usize,
+    recv_stream_data: *const fn (h3_conn: *anyopaque, stream_id: i64, data: []const u8, fin: bool, ts: u64) StreamRead,
+    /// Set once `recv_stream_data` reported `connection_error`: the HTTP/3
+    /// connection is dead, and this is the application error code the QUIC
+    /// connection is closed with. Nothing calls into nghttp3 again after that.
+    h3_error_code: ?u64 = null,
     /// The connection this context belongs to, once it exists. ngtcp2 hands this
     /// context to the callbacks, which is how they reach it.
     connection: ?*Connection = null,
@@ -314,8 +394,45 @@ pub fn recvStreamDataCb(
     _ = stream_user_data;
     const ctx: *StreamDataCtx = @alignCast(@ptrCast(user_data));
     const fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0;
-    const consumed = ctx.recv_stream_data(ctx.h3_conn, stream_id, data[0..datalen], fin);
-    if (conn) |quic_conn| extendFlowControl(quic_conn, stream_id, consumed);
+    // The timestamp ngtcp2 is working off is the one this packet was read with,
+    // so nghttp3 sees the same clock ngtcp2 does and never sees it go backwards.
+    const ts = if (conn) |quic_conn| ngtcp2.ngtcp2_conn_get_timestamp(quic_conn) else nowNanos();
+    switch (ctx.recv_stream_data(ctx.h3_conn, stream_id, data[0..datalen], fin, ts)) {
+        .consumed => |consumed| {
+            if (conn) |quic_conn| extendFlowControl(quic_conn, stream_id, consumed);
+            return 0;
+        },
+        // nghttp3 documents the connection as unwritable from here on: report
+        // the failure to ngtcp2 rather than pretend the bytes were taken, and
+        // remember why so the read that is running can close the connection.
+        .connection_error => |code| {
+            ctx.h3_error_code = code;
+            return ngtcp2.NGTCP2_ERR_CALLBACK_FAILURE;
+        },
+    }
+}
+
+/// ngtcp2 acked_stream_data_offset callback — stream data this endpoint sent has
+/// been acknowledged by the peer, which is the only thing that lets nghttp3
+/// reclaim it: an entry of a stream's outgoing queue is popped only from
+/// `nghttp3_stream_update_ack_offset` (nghttp3_stream.c), which
+/// `nghttp3_conn_add_ack_offset` feeds. Without this the queue of a long-lived
+/// stream holds every byte the stream ever sent.
+pub fn ackedStreamDataOffsetCb(
+    _: ?*ngtcp2.ngtcp2_conn,
+    stream_id: i64,
+    _: u64,
+    datalen: u64,
+    user_data: ?*anyopaque,
+    _: ?*anyopaque,
+) callconv(.c) c_int {
+    // A connection without an HTTP/3 layer (or one that is not attached to an
+    // H3 session yet) has nothing to hand the acknowledgement to.
+    const ctx: *StreamDataCtx = @ptrCast(@alignCast(user_data orelse return 0));
+    const h3_conn: *nghttp3.nghttp3_conn = @alignCast(@ptrCast(ctx.h3_conn));
+    if (nghttp3.nghttp3_conn_add_ack_offset(h3_conn, stream_id, @intCast(datalen)) != 0) {
+        return ngtcp2.NGTCP2_ERR_CALLBACK_FAILURE;
+    }
     return 0;
 }
 
@@ -440,7 +557,9 @@ pub fn writeStreamPacket(conn: *Connection, stream_id: i64, fin: bool, data: []c
     // connection error.
     if (n == ngtcp2.NGTCP2_ERR_STREAM_DATA_BLOCKED) return error.StreamDataBlocked;
     if (n == ngtcp2.NGTCP2_ERR_STREAM_SHUT_WR) return error.StreamShutWrite;
-    if (n < 0) return error.QuicError;
+    // ngtcp2.h: any other negative return is a connection error, and a TLS
+    // failure reaches the application this way too.
+    if (n < 0) return classify(conn.conn, @intCast(n));
     if (n == 0) return .blocked;
     try sendPacket(conn, &dest.path, @intCast(n));
     // -1 means the packet was full of other frames.
@@ -454,13 +573,29 @@ pub fn handleExpiryIfDue(conn: *Connection) void {
     if (nowNanos() >= expiry) handleExpiry(conn) catch {};
 }
 
+/// Why a connection is ending, as the CONNECTION_CLOSE frame states it.
+pub const CloseReason = union(enum) {
+    /// An HTTP/3 or application error code.
+    application: u64,
+    /// A TLS alert number; ngtcp2 turns it into the QUIC CRYPTO_ERROR code that
+    /// carries it (ngtcp2.h, `ngtcp2_ccerr_set_tls_alert`).
+    tls_alert: u8,
+    /// One of ngtcp2's own error codes, from which ngtcp2 infers the QUIC
+    /// transport error code (ngtcp2.h, `ngtcp2_ccerr_set_liberr`).
+    ngtcp2_error: c_int,
+};
+
 /// Tells the peer the connection is going away, so it can drop its state
 /// instead of waiting out its idle timeout. Best effort: the packet is written
 /// and sent once, and nothing waits for the closing period to pass.
-pub fn sendConnectionClose(conn: *Connection, error_code: u64, reason: []const u8) void {
+pub fn sendConnectionClose(conn: *Connection, reason: CloseReason, text: []const u8) void {
     var ccerr: ngtcp2.ngtcp2_ccerr = std.mem.zeroes(ngtcp2.ngtcp2_ccerr);
     ngtcp2.ngtcp2_ccerr_default(&ccerr);
-    ngtcp2.ngtcp2_ccerr_set_application_error(&ccerr, error_code, reason.ptr, reason.len);
+    switch (reason) {
+        .application => |code| ngtcp2.ngtcp2_ccerr_set_application_error(&ccerr, code, text.ptr, text.len),
+        .tls_alert => |alert| ngtcp2.ngtcp2_ccerr_set_tls_alert(&ccerr, alert, text.ptr, text.len),
+        .ngtcp2_error => |liberr| ngtcp2.ngtcp2_ccerr_set_liberr(&ccerr, liberr, text.ptr, text.len),
+    }
 
     var pi: ngtcp2.ngtcp2_pkt_info = undefined;
     var dest: ngtcp2.ngtcp2_path_storage = undefined;
@@ -509,6 +644,11 @@ fn nowNanos() u64 {
 }
 
 /// Read a UDP packet and feed it to the QUIC connection.
+///
+/// A failure ends the connection, and the peer is told why before this returns:
+/// ngtcp2.h documents that a CONNECTION_CLOSE is the terminal packet for every
+/// error `ngtcp2_conn_read_pkt` reports except the two that mean the state is
+/// dropped, and an HTTP/3 error carries the code nghttp3 named.
 pub fn readPacket(conn: *Connection) Error!void {
     const n = posix.system.recvfrom(conn.socket, &conn.buf, conn.buf.len, 0, null, null);
     if (n < 0) return;
@@ -518,7 +658,24 @@ pub fn readPacket(conn: *Connection) Error!void {
     // addresses are the only ones that fit for a connected UDP socket.
     const path: [*c]ngtcp2.ngtcp2_path = if (conn.path_alloc) |ps| &ps.path else null;
     const ret = ngtcp2.ngtcp2_conn_read_pkt(conn.conn, path, &pkt, data.ptr, data.len, nowNanos());
-    if (ret != 0) return error.QuicError;
+    if (ret == 0) return;
+
+    // The HTTP/3 layer found the error first: ngtcp2 only saw the callback
+    // failing, and knows nothing of the HTTP/3 code that ended the connection.
+    if (conn.stream_ctx_alloc) |ctx| {
+        if (ctx.h3_error_code) |code| {
+            sendConnectionClose(conn, .{ .application = code }, "http/3 connection error");
+            return error.Http3Error;
+        }
+    }
+
+    const err = classify(conn.conn, ret);
+    if (err == error.TlsError) {
+        // ngtcp2 keeps the alert for exactly this: RFC 9000 sends a TLS failure
+        // to the peer as CRYPTO_ERROR carrying the alert.
+        sendConnectionClose(conn, .{ .tls_alert = last_tls_failure.alert }, "tls error");
+    }
+    return err;
 }
 
 /// Write any pending QUIC packets to the UDP socket.
@@ -532,7 +689,11 @@ pub fn flushPackets(conn: *Connection) Error!void {
     while (true) {
         var pi: ngtcp2.ngtcp2_pkt_info = undefined;
         const n = ngtcp2.ngtcp2_conn_write_pkt(conn.conn, &path_storage.path, &pi, conn.buf[0..].ptr, conn.buf.len, nowNanos());
-        if (n <= 0) return;
+        // A TLS failure can surface on the write side too (the handshake runs
+        // from both), and ngtcp2.h makes every other negative return a
+        // connection error just like on the read side.
+        if (n < 0) return classify(conn.conn, @intCast(n));
+        if (n == 0) return;
         const sent = posix.system.sendto(conn.socket, conn.buf[0..@intCast(n)].ptr, @intCast(n), 0, @ptrCast(path_storage.path.remote.addr), path_storage.path.remote.addrlen);
         if (sent < 0) return error.QuicError;
     }
@@ -564,7 +725,17 @@ fn resolveHostIp(host: []const u8, port: u16) !u32 {
     return in_addr.addr;
 }
 
-/// Create a QUIC client connection and perform handshake over UDP.
+/// How long `connect` drives the handshake before giving up: loopback needs a
+/// couple of round trips, and a peer that has not answered within this many
+/// poll rounds (each of which waits up to the socket's 100 ms read timeout) is
+/// reported as `error.HandshakeTimeout` instead of being handed back as a
+/// connection.
+const handshake_attempts = 10;
+
+/// Create a QUIC client connection and perform handshake over UDP. Returns only
+/// once the handshake has completed; the failure modes are `error.TlsError` for
+/// a TLS alert, whatever ngtcp2 reported for a broken connection, and
+/// `error.HandshakeTimeout` for a handshake that never happened.
 pub fn connect(host: []const u8, port: u16, stream_ctx: ?StreamDataCtx, _: ?[]const u8, tls: ClientTls) Error!Connection {
     // Literal addresses ("127.0.0.1") and names ("localhost") both work here;
     // a name that does not resolve is reported the same way as any other
@@ -666,15 +837,22 @@ pub fn connect(host: []const u8, port: u16, stream_ctx: ?StreamDataCtx, _: ?[]co
         .path_alloc = path_storage,
     };
 
-    // Drive handshake
-    _ = try flushPackets(&self);
-    for (0..10) |_| {
-        readPacket(&self) catch {};
-        _ = flushPackets(&self) catch {};
+    // Drive the handshake to completion. Every other outcome is a failed
+    // connection attempt, not a connection: a TLS failure surfaces as
+    // `error.TlsError` on the first read that hits it, a peer that closes or
+    // breaks the connection reports what ngtcp2 saw, and a peer that never
+    // answers leaves the handshake unfinished.
+    try flushPackets(&self);
+    for (0..handshake_attempts) |_| {
+        // A read or write error is not transient: none of them can be retried
+        // into a handshake (ngtcp2.h lists exactly what each one means).
+        try readPacket(&self);
+        try flushPackets(&self);
+        if (ngtcp2.ngtcp2_conn_get_handshake_completed(self.conn) != 0) return self;
         sleepNs(10 * std.time.ns_per_ms);
     }
 
-    return self;
+    return error.HandshakeTimeout;
 }
 
 /// Get encoded transport params for 0-RTT resumption.
@@ -884,6 +1062,7 @@ fn clientCallbacks() ngtcp2.ngtcp2_callbacks {
     callbacks.remove_connection_id = removeConnIdCb;
     callbacks.path_validation = pathValidationCb;
     callbacks.extend_max_stream_data = extendMaxStreamDataCb;
+    callbacks.acked_stream_data_offset = ackedStreamDataOffsetCb;
     callbacks.rand = randCb;
     return callbacks;
 }
@@ -908,6 +1087,9 @@ test "clientCallbacks: sets every callback ngtcp2 requires" {
     try std.testing.expect(callbacks.get_new_connection_id != null);
     try std.testing.expect(callbacks.remove_connection_id != null);
     try std.testing.expect(callbacks.path_validation != null);
+    // Not one ngtcp2 demands, but without it nghttp3 never learns that sent
+    // stream data was acknowledged, and so cannot reclaim it.
+    try std.testing.expect(callbacks.acked_stream_data_offset != null);
     try std.testing.expect(callbacks.rand != null);
 }
 
@@ -929,9 +1111,11 @@ test "getNewConnIdCb: fills the requested CID length and its reset token" {
     try std.testing.expectEqualSlices(u8, &expected, &token);
 }
 
-// Flipping this on also makes `connect` reach ngtcp2_crypto_client_initial_cb,
-// which needs the connection's TLS native handle.
-test "connect: creates a client connection" {
-    var conn = try connect("127.0.0.1", 45454, null, null, .{ .insecure_skip_verify = true });
-    defer conn.deinit();
+// Nothing is listening on this port, so the handshake never completes. That is
+// a failed connection attempt, not a connection to hand back — and it is
+// reported as exactly that instead of as an unreachable or broken peer. Sending
+// the Initial reaches ngtcp2_crypto_client_initial_cb, which needs the
+// connection's TLS native handle, before the attempt gives up.
+test "connect: reports a handshake that never happened" {
+    try std.testing.expectError(error.HandshakeTimeout, connect("127.0.0.1", 45454, null, null, .{ .insecure_skip_verify = true }));
 }

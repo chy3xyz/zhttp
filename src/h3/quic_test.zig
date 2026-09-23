@@ -4,9 +4,19 @@
 //! keep the testing allocator's leak detection out of it.
 const std = @import("std");
 const quic = @import("quic.zig");
+const http3 = @import("http3.zig");
+const client_mod = @import("Client.zig");
+const server_mod = @import("Server.zig");
 const Client = @import("Client.zig").Client;
 const Server = @import("Server.zig").Server;
 const ngtcp2 = @import("ngtcp2_c");
+const nghttp3 = @import("nghttp3_c");
+
+fn nowNanos() u64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
 
 fn handler(allocator: std.mem.Allocator, _: []const u8) []const u8 {
     return allocator.dupe(u8, "OK") catch "OK";
@@ -314,6 +324,35 @@ test "h3: one connection serves well over a hundred requests" {
         defer allocator.free(body);
         try std.testing.expectEqualStrings("OK", body);
     }
+}
+
+test "h3: a client that verifies certificates rejects the self-signed server" {
+    try quic.setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
+
+    const allocator = std.heap.page_allocator;
+    const server = try allocator.create(Server);
+    server.* = try Server.init(allocator, 0, handler, .{});
+    const port = std.mem.bigToNative(u16, server.listener.local_addr.port);
+    _ = try std.Thread.spawn(.{}, serve, .{server});
+
+    // `.{}` keeps verification on, and the test certificate is self-signed, so
+    // the handshake has to fail with a TLS error rather than a generic failure
+    // or a wait for some timeout.
+    const start = nowNanos();
+    try std.testing.expectError(error.TlsError, Client.init(allocator, "127.0.0.1", port, .{}));
+    const elapsed_ms = (nowNanos() - start) / std.time.ns_per_ms;
+    try std.testing.expect(elapsed_ms < 5000);
+}
+
+test "quic: a stream read that fails is reported as a connection error" {
+    const session = try http3.Session.init(std.testing.allocator);
+    defer session.deinit();
+
+    // Stream 4 was never opened by either endpoint: nghttp3 must reject data
+    // arriving on it, and the bridge must report that as the connection error
+    // nghttp3's header says it is, rather than as "nothing was consumed".
+    const result = client_mod.onQuicStreamData(@ptrCast(session.conn), 4, "GET", true, nowNanos());
+    try std.testing.expect(result == .connection_error);
 }
 
 test "h3: resolves the host name it is given" {

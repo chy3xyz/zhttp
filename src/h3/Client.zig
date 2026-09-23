@@ -49,7 +49,7 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         // Tell the server to drop this connection instead of leaving it to its
         // idle timeout.
-        quic.sendConnectionClose(&self.quic_conn, http3.H3_NO_ERROR, "client done");
+        quic.sendConnectionClose(&self.quic_conn, .{ .application = http3.H3_NO_ERROR }, "client done");
         self.h3_session.deinit();
         self.quic_conn.deinit();
     }
@@ -92,8 +92,11 @@ pub const Client = struct {
             quic.flushPackets(&self.quic_conn) catch {};
 
             // Read incoming UDP packets — feeds QUIC engine which triggers
-            // recv_stream_data → nghttp3 readStream → ctx populated
-            quic.readPacket(&self.quic_conn) catch {};
+            // recv_stream_data → nghttp3 conn_read_stream2 → ctx populated.
+            // A read error ends the connection (a TLS failure, a connection
+            // the peer closed, an HTTP/3 connection error): the caller hears
+            // why instead of waiting out the timeout below.
+            quic.readPacket(&self.quic_conn) catch |err| return err;
             quic.handleExpiryIfDue(&self.quic_conn);
 
             // Timeout after 30 seconds
@@ -115,13 +118,18 @@ pub const Client = struct {
 /// leaves the payload of a DATA frame out of that count — those bytes reach the
 /// application through `recv_data` — so the whole datagram is credited here: the
 /// application consumed all of it.
-fn onQuicStreamData(h3_conn: *anyopaque, stream_id: i64, data: []const u8, fin: bool) usize {
+///
+/// A negative return from nghttp3 is a connection error, not a short read:
+/// nghttp3.h says the connection must then be closed, and that calling anything
+/// on the connection but `nghttp3_conn_del` is undefined behaviour. It is
+/// reported as such, with the QUIC error code the connection is closed with.
+pub fn onQuicStreamData(h3_conn: *anyopaque, stream_id: i64, data: []const u8, fin: bool, ts: u64) quic.StreamRead {
     const conn: *nghttp3.nghttp3_conn = @alignCast(@ptrCast(h3_conn));
-    const consumed = nghttp3.nghttp3_conn_read_stream2(conn, stream_id, data.ptr, data.len, @intFromBool(fin), 0);
-    // A negative return means nghttp3 hit a connection error and will not be
-    // handed anything else.
-    if (consumed < 0) return 0;
-    return data.len;
+    const consumed = nghttp3.nghttp3_conn_read_stream2(conn, stream_id, data.ptr, data.len, @intFromBool(fin), ts);
+    if (consumed < 0) {
+        return .{ .connection_error = nghttp3.nghttp3_err_infer_quic_app_error_code(@intCast(consumed)) };
+    }
+    return .{ .consumed = data.len };
 }
 
 /// Pump pending HTTP/3 write data (headers, body, FIN) into the QUIC connection.
@@ -183,7 +191,10 @@ fn openUniStream(client: *Client) !i64 {
         var stream_id: i64 = -1;
         if (ngtcp2.ngtcp2_conn_open_uni_stream(client.quic_conn.conn, &stream_id, null) == 0) return stream_id;
         quic.flushPackets(&client.quic_conn) catch {};
-        quic.readPacket(&client.quic_conn) catch {};
+        // The handshake is done before the connection is handed out, so the
+        // limit this needs is already known; an error here means the connection
+        // is gone, and retrying it would only hide that.
+        quic.readPacket(&client.quic_conn) catch |err| return err;
         sleepNs(10 * std.time.ns_per_ms);
     }
     return error.QuicError;

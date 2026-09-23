@@ -110,8 +110,38 @@ pub const Server = struct {
         var path_storage: ngtcp2.ngtcp2_path_storage = undefined;
         quic.initPath(&path_storage, &self.listener.local_addr, peer_addr);
         const pkt = ngtcp2.ngtcp2_pkt_info{};
-        _ = ngtcp2.ngtcp2_conn_read_pkt(conn.conn, &path_storage.path, &pkt, data.ptr, data.len, nowNanos());
+        const ret = ngtcp2.ngtcp2_conn_read_pkt(conn.conn, &path_storage.path, &pkt, data.ptr, data.len, nowNanos());
+        if (ret != 0) {
+            // May free `conn`, so nothing touches it afterwards.
+            self.handleReadError(conn, ret);
+            return;
+        }
         if (h3Conn(conn)) |h3| h3.last_activity_ns = nowNanos();
+    }
+
+    /// Acts on what `ngtcp2_conn_read_pkt` reported, as ngtcp2.h defines each
+    /// code. Two of them mean the connection state has to go; the rest mean the
+    /// peer is told why the connection ends.
+    fn handleReadError(self: *Server, conn: *quic.Connection, ret: c_int) void {
+        switch (quic.classifyReadError(conn.conn, ret)) {
+            // ngtcp2.h: "Server application must drop the connection silently
+            // (without sending any CONNECTION_CLOSE frame), and discard
+            // connection state." Retry means the same here: ngtcp2 asks for
+            // address validation, which this endpoint does not do, so there is
+            // no state worth keeping while a client would wait for a Retry.
+            error.ConnectionDropped, error.RetryRequired => self.dropConnection(conn),
+            // The peer closed, or this endpoint already sent its close: the
+            // connection leaves once the closing period is over.
+            error.ConnectionClosed => {},
+            error.TlsError => {
+                quic.sendConnectionClose(conn, .{ .tls_alert = quic.last_tls_failure.alert }, "tls error");
+                self.dropConnection(conn);
+            },
+            else => {
+                quic.sendConnectionClose(conn, .{ .ngtcp2_error = ret }, "quic connection error");
+                self.dropConnection(conn);
+            },
+        }
     }
 
     fn h3Conn(conn: *quic.Connection) ?*H3Conn {
@@ -163,6 +193,9 @@ pub const Server = struct {
         callbacks.remove_connection_id = quic.removeConnIdCb;
         callbacks.path_validation = quic.pathValidationCb;
         callbacks.extend_max_stream_data = quic.extendMaxStreamDataCb;
+        // Without this nghttp3 never learns that a response it sent was
+        // acknowledged, and so never reclaims it.
+        callbacks.acked_stream_data_offset = quic.ackedStreamDataOffsetCb;
         // The stream limit in the transport parameters below is what the client
         // spends one stream per request from, and ngtcp2 never raises it on its
         // own, so a closed request stream has to hand its place back here.
@@ -226,7 +259,15 @@ pub const Server = struct {
 
         const pkt = ngtcp2.ngtcp2_pkt_info{};
         const init_data = buf[0..n];
-        _ = ngtcp2.ngtcp2_conn_read_pkt(conn_ptr.?, &path_storage.?.path, &pkt, init_data.ptr, init_data.len, nowNanos());
+        const init_ret = ngtcp2.ngtcp2_conn_read_pkt(conn_ptr.?, &path_storage.?.path, &pkt, init_data.ptr, init_data.len, nowNanos());
+        if (init_ret != 0) {
+            // The Initial that would have created this connection already
+            // failed. ngtcp2.h says what that means — most often that the state
+            // itself has to be discarded, which is what returning an error does
+            // here: the errdefers above free the connection and it is never
+            // registered, so it cannot linger in the routing table.
+            return quic.classifyReadError(conn_ptr.?, init_ret);
+        }
 
         const conn = try self.allocator.create(quic.Connection);
         conn.* = quic.Connection{
@@ -252,7 +293,7 @@ pub const Server = struct {
         ctx.connection = conn;
 
         self.listener.connections.put(quic.cidKey(server_scid), conn) catch |err| {
-            quic.sendConnectionClose(conn, http3.H3_NO_ERROR, "server out of resources");
+            quic.sendConnectionClose(conn, .{ .application = http3.H3_NO_ERROR }, "server out of resources");
             self.dropConnection(conn);
             return err;
         };
@@ -327,7 +368,7 @@ pub const Server = struct {
     /// Enters the closing period: tell the peer, then keep answering its packets
     /// with the same CONNECTION_CLOSE until the period is over.
     fn startClosing(self: *Server, conn: *quic.Connection, h3: *H3Conn) void {
-        quic.sendConnectionClose(conn, http3.H3_NO_ERROR, "server closing connection");
+        quic.sendConnectionClose(conn, .{ .application = http3.H3_NO_ERROR }, "server closing connection");
         // ngtcp2 arms a 3xPTO timer for the closing period; fall back to a fixed
         // period if it has none.
         h3.closing_until_ns = quic.getExpiry(conn) orelse (nowNanos() + self.options.closing_period_ns);
@@ -370,7 +411,7 @@ pub const Server = struct {
         }
         for (dead.items) |conn| {
             // Shutting down: tell the peers and go, without a closing period.
-            quic.sendConnectionClose(conn, http3.H3_NO_ERROR, "server shutting down");
+            quic.sendConnectionClose(conn, .{ .application = http3.H3_NO_ERROR }, "server shutting down");
             self.dropConnection(conn);
         }
     }
@@ -429,13 +470,18 @@ fn serveRequests(self: *Server, session: *http3.Session) void {
 /// leaves the payload of a DATA frame out of that count — those bytes reach the
 /// application through `recv_data` — so the whole datagram is credited here: the
 /// application consumed all of it.
-fn onQuicServerStreamData(h3_conn: *anyopaque, stream_id: i64, data: []const u8, fin: bool) usize {
+///
+/// A negative return from nghttp3 is a connection error, not a short read:
+/// nghttp3.h says the connection must then be closed, and that calling anything
+/// on the connection but `nghttp3_conn_del` is undefined behaviour. It is
+/// reported as such, with the QUIC error code the connection is closed with.
+pub fn onQuicServerStreamData(h3_conn: *anyopaque, stream_id: i64, data: []const u8, fin: bool, ts: u64) quic.StreamRead {
     const conn: *nghttp3.nghttp3_conn = @alignCast(@ptrCast(h3_conn));
-    const consumed = nghttp3.nghttp3_conn_read_stream2(conn, stream_id, data.ptr, data.len, @intFromBool(fin), 0);
-    // A negative return means nghttp3 hit a connection error and will not be
-    // handed anything else.
-    if (consumed < 0) return 0;
-    return data.len;
+    const consumed = nghttp3.nghttp3_conn_read_stream2(conn, stream_id, data.ptr, data.len, @intFromBool(fin), ts);
+    if (consumed < 0) {
+        return .{ .connection_error = nghttp3.nghttp3_err_infer_quic_app_error_code(@intCast(consumed)) };
+    }
+    return .{ .consumed = data.len };
 }
 
 /// Pump pending HTTP/3 write data (headers, body, FIN) into the QUIC connection.

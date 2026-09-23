@@ -166,14 +166,6 @@ pub const Session = struct {
         req.body_sent = 0;
         req.responded = true;
     }
-
-    /// Feed received stream data to nghttp3 for HTTP/3 processing.
-    /// Returns number of bytes consumed.
-    pub fn readStream(self: *Session, stream_id: i64, data: []const u8, fin: bool) !usize {
-        const consumed = nghttp3.nghttp3_conn_read_stream2(self.conn, stream_id, data.ptr, data.len, @intFromBool(fin));
-        if (consumed < 0) return error.H3Error;
-        return @intCast(consumed);
-    }
 };
 
 // ---- nghttp3 callback implementations ----
