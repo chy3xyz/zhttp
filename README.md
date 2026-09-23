@@ -751,6 +751,9 @@ zig build -Dh3=true
 # Run micro-benchmarks
 zig build bench
 
+# Run the HTTP/3 micro-benchmarks (needs -Dh3=true)
+zig build bench-h3 -Dh3=true
+
 # Run integration tests only
 zig build test-integration
 

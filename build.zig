@@ -144,6 +144,27 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run httpz micro-benchmarks");
     bench_step.dependOn(&run_bench.step);
 
+    // HTTP/3 benchmark — imports `httpz.h3`, which only exists with -Dh3=true.
+    if (h3) {
+        const bench_h3_mod = b.createModule(.{
+            .root_source_file = b.path("benches/bench_h3.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zhttp", .module = zhttp_mod },
+            },
+        });
+        const bench_h3_exe = b.addExecutable(.{
+            .name = "bench_h3",
+            .root_module = bench_h3_mod,
+        });
+        const run_bench_h3 = b.addRunArtifact(bench_h3_exe);
+        // The benchmark reads its TLS certificate relative to the project root.
+        run_bench_h3.setCwd(b.path("."));
+        const bench_h3_step = b.step("bench-h3", "Run httpz HTTP/3 benchmarks (requires -Dh3=true)");
+        bench_h3_step.dependOn(&run_bench_h3.step);
+    }
+
     // Coverage step using kcov
     const coverage_step = b.step("coverage", "Run tests with kcov code coverage");
 

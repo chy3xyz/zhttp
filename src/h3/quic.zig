@@ -1,5 +1,6 @@
 const std = @import("std");
 const ngtcp2 = @import("ngtcp2_c");
+const nghttp3 = @import("nghttp3_c");
 const ossl = @import("openssl_c");
 const posix = std.posix;
 const builtin = @import("builtin");
@@ -144,10 +145,12 @@ pub const ClientTls = struct {
 pub const RootCa = enum { empty, system };
 
 /// Callback type for receiving stream data. Called from ngtcp2 recv_stream_data.
-/// `h3_conn` is the nghttp3 connection pointer to feed data into.
+/// `h3_conn` is the nghttp3 connection pointer to feed data into. Returns how
+/// many bytes of the received datagram the HTTP/3 layer took, which is the flow
+/// control credit the QUIC connection gets back.
 pub const StreamDataCtx = struct {
     h3_conn: *anyopaque, // *nghttp3.nghttp3_conn — opaque to avoid circular dep
-    recv_stream_data: *const fn (h3_conn: *anyopaque, stream_id: i64, data: []const u8, fin: bool) void,
+    recv_stream_data: *const fn (h3_conn: *anyopaque, stream_id: i64, data: []const u8, fin: bool) usize,
     /// The connection this context belongs to, once it exists. ngtcp2 hands this
     /// context to the callbacks, which is how they reach it.
     connection: ?*Connection = null,
@@ -311,8 +314,69 @@ pub fn recvStreamDataCb(
     _ = stream_user_data;
     const ctx: *StreamDataCtx = @alignCast(@ptrCast(user_data));
     const fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0;
-    ctx.recv_stream_data(ctx.h3_conn, stream_id, data[0..datalen], fin);
-    _ = conn;
+    const consumed = ctx.recv_stream_data(ctx.h3_conn, stream_id, data[0..datalen], fin);
+    if (conn) |quic_conn| extendFlowControl(quic_conn, stream_id, consumed);
+    return 0;
+}
+
+/// Hands consumed data back as flow control credit, so the peer's window grows
+/// past the initial one as its data is read (ngtcp2 turns this into
+/// MAX_STREAM_DATA and MAX_DATA frames).
+fn extendFlowControl(conn: *ngtcp2.ngtcp2_conn, stream_id: i64, consumed: usize) void {
+    if (consumed == 0) return;
+    _ = ngtcp2.ngtcp2_conn_extend_max_stream_offset(conn, stream_id, consumed);
+    ngtcp2.ngtcp2_conn_extend_max_offset(conn, consumed);
+}
+
+/// ngtcp2 extend_max_stream_data callback — the peer grew an outgoing stream's
+/// flow control window, so the data nghttp3 is holding for that stream can be
+/// offered again.
+pub fn extendMaxStreamDataCb(
+    _: ?*ngtcp2.ngtcp2_conn,
+    stream_id: i64,
+    _: u64,
+    user_data: ?*anyopaque,
+    _: ?*anyopaque,
+) callconv(.c) c_int {
+    const ctx: *StreamDataCtx = @ptrCast(@alignCast(user_data orelse return 0));
+    _ = nghttp3.nghttp3_conn_unblock_stream(@alignCast(@ptrCast(ctx.h3_conn)), stream_id);
+    return 0;
+}
+
+/// ngtcp2 stream_close callback — a stream is gone, so the room it took up in
+/// the peer's stream limit can be handed back. ngtcp2 does not raise the limit
+/// on its own ("The library does not increase maximum stream limit
+/// automatically" — ngtcp2_conn_extend_max_streams_bidi), so a connection that
+/// never does it serves only as many requests as it advertised streams.
+/// The peer opens exactly the three unidirectional streams HTTP/3 requires, so
+/// only the bidirectional limit needs tracking.
+pub fn streamCloseCb(
+    conn: ?*ngtcp2.ngtcp2_conn,
+    _: u32,
+    stream_id: i64,
+    _: u64,
+    _: ?*anyopaque,
+    _: ?*anyopaque,
+) callconv(.c) c_int {
+    const quic_conn = conn orelse return 0;
+    // Only a stream the peer opened frees up room for another of the same kind.
+    if (ngtcp2.ngtcp2_conn_is_local_stream2(quic_conn, stream_id) != 0) return 0;
+    if (ngtcp2.ngtcp2_is_bidi_stream(stream_id) == 0) return 0;
+    ngtcp2.ngtcp2_conn_extend_max_streams_bidi(quic_conn, 1);
+    return 0;
+}
+
+/// ngtcp2 extend_max_remote_streams_bidi callback — the stream limit this
+/// endpoint advertises to the peer grew along with the MAX_STREAMS frame ngtcp2
+/// is about to send, and nghttp3 tracks that limit separately: without telling
+/// it, it refuses the request streams the peer is now allowed to open.
+pub fn extendMaxRemoteStreamsBidiCb(
+    _: ?*ngtcp2.ngtcp2_conn,
+    max_streams: u64,
+    user_data: ?*anyopaque,
+) callconv(.c) c_int {
+    const ctx: *StreamDataCtx = @ptrCast(@alignCast(user_data orelse return 0));
+    nghttp3.nghttp3_conn_set_max_client_streams_bidi(@alignCast(@ptrCast(ctx.h3_conn)), max_streams);
     return 0;
 }
 
@@ -328,10 +392,27 @@ fn sendPacket(conn: *Connection, path: *const ngtcp2.ngtcp2_path, len: usize) Er
     return sendBytes(conn, path, conn.buf[0..len]);
 }
 
+/// What one `writeStreamPacket` call did with the stream data it was given.
+pub const StreamWrite = union(enum) {
+    /// ngtcp2 wrote nothing: the connection is congestion limited, or the
+    /// stream's flow control window is exhausted. None of the data was taken.
+    blocked,
+    /// A packet went out, but it carried no STREAM frame for this stream, so
+    /// none of the data was taken.
+    no_stream_frame,
+    /// A packet carrying `wrote` bytes of the data went out. Zero means only
+    /// the stream's FIN was serialized.
+    wrote: usize,
+};
+
+/// What `writeStreamPacket` can fail with: the two conditions ngtcp2 reports
+/// for one stream alone, plus everything the socket path can report.
+pub const WriteError = Error || error{ StreamDataBlocked, StreamShutWrite };
+
 /// Packs one HTTP/3 stream chunk into a QUIC packet and sends it. `data` may be
 /// empty when only the stream's FIN needs to go out. Returns how many bytes of
-/// `data` made it into the packet, which is what nghttp3 has to be told about.
-pub fn writeStreamPacket(conn: *Connection, stream_id: i64, fin: bool, data: []const u8) Error!usize {
+/// `data` ngtcp2 took, which is what nghttp3 has to be told about.
+pub fn writeStreamPacket(conn: *Connection, stream_id: i64, fin: bool, data: []const u8) WriteError!StreamWrite {
     var pi: ngtcp2.ngtcp2_pkt_info = undefined;
     // ngtcp2 writes the destination path here and needs storage for the
     // addresses (ngtcp2.h, `ngtcp2_conn_writev_stream`).
@@ -354,10 +435,17 @@ pub fn writeStreamPacket(conn: *Connection, stream_id: i64, fin: bool, data: []c
         data.len,
         nowNanos(),
     );
+    // These two stop this stream alone; nghttp3 has to be told about them
+    // instead of being offered the same data again. Everything else is a
+    // connection error.
+    if (n == ngtcp2.NGTCP2_ERR_STREAM_DATA_BLOCKED) return error.StreamDataBlocked;
+    if (n == ngtcp2.NGTCP2_ERR_STREAM_SHUT_WR) return error.StreamShutWrite;
     if (n < 0) return error.QuicError;
-    if (n == 0) return 0;
+    if (n == 0) return .blocked;
     try sendPacket(conn, &dest.path, @intCast(n));
-    return if (pdatalen > 0) @intCast(pdatalen) else 0;
+    // -1 means the packet was full of other frames.
+    if (pdatalen < 0) return .no_stream_frame;
+    return .{ .wrote = @intCast(pdatalen) };
 }
 
 /// Handles the QUIC timer when it is due, e.g. for retransmissions.
@@ -478,9 +566,10 @@ fn resolveHostIp(host: []const u8, port: u16) !u32 {
 
 /// Create a QUIC client connection and perform handshake over UDP.
 pub fn connect(host: []const u8, port: u16, stream_ctx: ?StreamDataCtx, _: ?[]const u8, tls: ClientTls) Error!Connection {
-    // Resolve host to IP (simplified — loopback for local testing)
-    _ = host;
-    const server_ip: u32 = 0x0100007F; // 127.0.0.1 in network byte order
+    // Literal addresses ("127.0.0.1") and names ("localhost") both work here;
+    // a name that does not resolve is reported the same way as any other
+    // failure to reach the peer.
+    const server_ip = resolveHostIp(host, port) catch return error.QuicError;
 
     const sock: posix.fd_t = @intCast(posix.system.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP));
     if (sock < 0) return error.QuicError;
@@ -658,18 +747,53 @@ pub const Listener = struct {
 
 // ---- Connection migration callbacks ----
 
-/// ngtcp2 get_new_connection_id callback — generates a random CID and, on the
-/// server, registers it so datagrams addressed to it reach the same connection.
+/// Length of the secret stateless reset tokens are derived from. ngtcp2 only
+/// fixes the length of the token itself (NGTCP2_STATELESS_RESET_TOKENLEN); this
+/// matches the secret the reference server uses.
+const stateless_reset_secret_len = 32;
+
+/// Secret the stateless reset tokens this endpoint issues are derived from, and
+/// the lock that keeps two threads from filling it at the same time: it belongs
+/// to the endpoint rather than to one connection, and the client and the server
+/// callback below share it.
+var stateless_reset_secret: [stateless_reset_secret_len]u8 = @splat(0);
+var stateless_reset_secret_ready = false;
+var stateless_reset_secret_lock: std.atomic.Mutex = .unlocked;
+
+fn statelessResetSecret() []const u8 {
+    while (!stateless_reset_secret_lock.tryLock()) std.atomic.spinLoopHint();
+    defer stateless_reset_secret_lock.unlock();
+    if (!stateless_reset_secret_ready) {
+        std.c.arc4random_buf(&stateless_reset_secret, stateless_reset_secret.len);
+        stateless_reset_secret_ready = true;
+    }
+    return &stateless_reset_secret;
+}
+
+/// ngtcp2 get_new_connection_id callback — generates a connection ID of the
+/// length ngtcp2 asked for together with the stateless reset token that goes
+/// with it, and on the server registers the ID so datagrams addressed to it
+/// reach the same connection.
 pub fn getNewConnIdCb(
     _: ?*ngtcp2.ngtcp2_conn,
     cid: ?*ngtcp2.ngtcp2_cid,
-    _: [*c]u8,
-    _: usize,
+    token: [*c]u8,
+    cidlen: usize,
     user_data: ?*anyopaque,
 ) callconv(.c) c_int {
-    const out = cid orelse return 0;
-    out.datalen = cid_length;
-    std.c.arc4random_buf(@ptrCast(&out.data), cid_length);
+    const out = cid orelse return ngtcp2.NGTCP2_ERR_CALLBACK_FAILURE;
+    // ngtcp2 rejects the connection ID it asked for unless it comes back with
+    // exactly this length (ngtcp2_conn.c, conn_enqueue_new_connection_id).
+    if (cidlen > out.data.len) return ngtcp2.NGTCP2_ERR_CALLBACK_FAILURE;
+    out.datalen = cidlen;
+    std.c.arc4random_buf(@ptrCast(&out.data), cidlen);
+
+    // RFC 9000: the peer can only end this connection with a stateless reset
+    // whose token is derived from the connection ID it is using, so one has to
+    // be issued alongside every connection ID.
+    if (ngtcp2.ngtcp2_crypto_generate_stateless_reset_token(token, statelessResetSecret().ptr, stateless_reset_secret_len, out) != 0) {
+        return ngtcp2.NGTCP2_ERR_CALLBACK_FAILURE;
+    }
 
     const ctx: *StreamDataCtx = @ptrCast(@alignCast(user_data orelse return 0));
     const connection = ctx.connection orelse return 0; // client side: nothing to route
@@ -759,6 +883,7 @@ fn clientCallbacks() ngtcp2.ngtcp2_callbacks {
     callbacks.get_new_connection_id = getNewConnIdCb;
     callbacks.remove_connection_id = removeConnIdCb;
     callbacks.path_validation = pathValidationCb;
+    callbacks.extend_max_stream_data = extendMaxStreamDataCb;
     callbacks.rand = randCb;
     return callbacks;
 }
@@ -784,6 +909,24 @@ test "clientCallbacks: sets every callback ngtcp2 requires" {
     try std.testing.expect(callbacks.remove_connection_id != null);
     try std.testing.expect(callbacks.path_validation != null);
     try std.testing.expect(callbacks.rand != null);
+}
+
+test "getNewConnIdCb: fills the requested CID length and its reset token" {
+    // Deliberately not the length this endpoint uses for the connection IDs it
+    // chooses: ngtcp2 hands down the length it wants back.
+    const cidlen = 17;
+    var cid: ngtcp2.ngtcp2_cid = undefined;
+    var token: [ngtcp2.NGTCP2_STATELESS_RESET_TOKENLEN]u8 = @splat(0);
+    try std.testing.expectEqual(0, getNewConnIdCb(null, &cid, &token, cidlen, null));
+
+    try std.testing.expectEqual(@as(usize, cidlen), cid.datalen);
+    try std.testing.expect(!std.mem.allEqual(u8, cid.data[0..cidlen], 0));
+
+    // The token has to be the one derived from that connection ID, not whatever
+    // the buffer the callback was given happened to hold.
+    var expected: [ngtcp2.NGTCP2_STATELESS_RESET_TOKENLEN]u8 = undefined;
+    try std.testing.expectEqual(0, ngtcp2.ngtcp2_crypto_generate_stateless_reset_token(&expected, statelessResetSecret().ptr, stateless_reset_secret_len, &cid));
+    try std.testing.expectEqualSlices(u8, &expected, &token);
 }
 
 // Flipping this on also makes `connect` reach ngtcp2_crypto_client_initial_cb,

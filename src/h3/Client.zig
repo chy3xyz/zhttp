@@ -110,12 +110,23 @@ pub const Client = struct {
 
 /// Bridge: ngtcp2 recv_stream_data callback → nghttp3 conn_read_stream2.
 /// Called by quic.zig's recvStreamDataCb whenever stream data arrives.
-fn onQuicStreamData(h3_conn: *anyopaque, stream_id: i64, data: []const u8, fin: bool) void {
+/// Returns the flow control credit the QUIC connection gets back for this
+/// stream. nghttp3 counts only the frame bytes it parsed and deliberately
+/// leaves the payload of a DATA frame out of that count — those bytes reach the
+/// application through `recv_data` — so the whole datagram is credited here: the
+/// application consumed all of it.
+fn onQuicStreamData(h3_conn: *anyopaque, stream_id: i64, data: []const u8, fin: bool) usize {
     const conn: *nghttp3.nghttp3_conn = @alignCast(@ptrCast(h3_conn));
-    _ = nghttp3.nghttp3_conn_read_stream2(conn, stream_id, data.ptr, data.len, @intFromBool(fin), 0);
+    const consumed = nghttp3.nghttp3_conn_read_stream2(conn, stream_id, data.ptr, data.len, @intFromBool(fin), 0);
+    // A negative return means nghttp3 hit a connection error and will not be
+    // handed anything else.
+    if (consumed < 0) return 0;
+    return data.len;
 }
 
 /// Pump pending HTTP/3 write data (headers, body, FIN) into the QUIC connection.
+/// One round ends as soon as it stops making progress; whatever is left is
+/// offered again on the next I/O turn.
 fn pumpWrites(self: *Client) void {
     while (true) {
         var write_stream_id: i64 = -1;
@@ -125,12 +136,32 @@ fn pumpWrites(self: *Client) void {
         if (nvec < 0 or write_stream_id == -1) break;
 
         const data: []const u8 = if (nvec > 0) vec.base[0..vec.len] else &.{};
-        const written = quic.writeStreamPacket(&self.quic_conn, write_stream_id, write_fin != 0, data) catch break;
-        if (nvec > 0) {
-            _ = nghttp3.nghttp3_conn_add_write_offset(self.h3_session.conn, write_stream_id, written);
-        } else if (write_fin != 0) {
-            // Zero-length fin — just acknowledge
-            _ = nghttp3.nghttp3_conn_add_write_offset(self.h3_session.conn, write_stream_id, 0);
+        const result = quic.writeStreamPacket(&self.quic_conn, write_stream_id, write_fin != 0, data) catch |err| switch (err) {
+            // nghttp3 would otherwise offer the same stream forever, so it has
+            // to be told why ngtcp2 did not take its data.
+            error.StreamDataBlocked => {
+                nghttp3.nghttp3_conn_block_stream(self.h3_session.conn, write_stream_id);
+                continue;
+            },
+            error.StreamShutWrite => {
+                nghttp3.nghttp3_conn_shutdown_stream_write(self.h3_session.conn, write_stream_id);
+                continue;
+            },
+            else => break,
+        };
+
+        switch (result) {
+            .blocked, .no_stream_frame => break,
+            .wrote => |written| {
+                if (nvec > 0) {
+                    _ = nghttp3.nghttp3_conn_add_write_offset(self.h3_session.conn, write_stream_id, written);
+                    if (written == 0) break;
+                } else if (write_fin != 0) {
+                    // A packet carrying the zero length FIN went out, so the
+                    // stream's write side is done.
+                    _ = nghttp3.nghttp3_conn_add_write_offset(self.h3_session.conn, write_stream_id, 0);
+                }
+            },
         }
     }
 }
