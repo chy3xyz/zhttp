@@ -396,8 +396,6 @@ pub fn acceptsEncoding(self: *const Request, encoding: []const u8) bool {
     return std.mem.indexOf(u8, ae, encoding) != null;
 }
 
-/// RFC 2616 Section 5.2: Extract host from an absolute URI and replace
-/// any existing Host header. Returns true if a host was found.
 /// RFC 2616 Section 14.23: Validate Host header value.
 /// Must be a valid hostname or IP, optionally followed by :port.
 /// Rejects control characters, whitespace, and other invalid characters.
@@ -440,13 +438,28 @@ fn isValidHostValue(host: []const u8) bool {
     return true;
 }
 
+/// RFC 2616 Section 5.2: Extract host from an absolute URI and replace
+/// any existing Host header. Returns true if a host was found.
 fn extractHostFromAbsoluteUri(request: *Request) bool {
     const uri = request.uri;
-    // Look for "://" scheme separator
+    // An absolute-form target is `scheme "://" authority [path ["?" query]]`
+    // (RFC 7230 Section 5.3.2), and a scheme is
+    // `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` (RFC 3986 Section 3.1).
+    // A "://" anywhere else — as in "/redirect?to=http://example.com" — is not
+    // one, and taking it for one would replace the Host header this request was
+    // addressed with by a value out of the client's own URL.
     const scheme_end = std.mem.indexOf(u8, uri, "://") orelse return false;
+    if (scheme_end == 0 or !std.ascii.isAlphabetic(uri[0])) return false;
+    for (uri[0..scheme_end]) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '+', '-', '.' => {},
+            else => return false,
+        }
+    }
     const after_scheme = uri[scheme_end + 3 ..];
-    // Host ends at '/' or end of URI
-    const host_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
+    // The authority ends at the path, the query or the fragment, or at the end
+    // of the URI.
+    const host_end = std.mem.indexOfAny(u8, after_scheme, "/?#") orelse after_scheme.len;
     const host = after_scheme[0..host_end];
     if (host.len == 0) return false;
     // Remove any existing Host header; the absolute URI takes precedence.
@@ -1812,6 +1825,51 @@ test "Request: absolute URI host overrides Host header" {
         "\r\n";
     const req = try Request.parseConst(raw);
     try testing.expectEqualStrings("proxy-target.com", req.headers.get("Host").?);
+}
+
+// Only an absolute-form request target carries an authority (RFC 7230 §5.3.2),
+// and this is a handler that reads Host to decide what to serve: a "://" in the
+// path or the query must not be taken for one and replace the Host header with
+// a value the client put in the URL.
+test "Request: a path or query does not supply the Host header" {
+    const raw =
+        "GET /redirect?to=http://evil.example/x HTTP/1.1\r\n" ++
+        "Host: good.example\r\n" ++
+        "\r\n";
+    const req = try Request.parseConst(raw);
+    try testing.expectEqualStrings("good.example", req.headers.get("Host").?);
+    try testing.expectEqualStrings("/redirect?to=http://evil.example/x", req.uri);
+}
+
+test "Request: an authority without a scheme does not supply the Host header" {
+    const raw =
+        "GET //evil.example/x HTTP/1.1\r\n" ++
+        "Host: good.example\r\n" ++
+        "\r\n";
+    const req = try Request.parseConst(raw);
+    try testing.expectEqualStrings("good.example", req.headers.get("Host").?);
+}
+
+test "Request: a scheme that is not one does not supply the Host header" {
+    inline for ([_][]const u8{
+        "GET ://evil.example/x HTTP/1.1\r\n",
+        "GET 1http://evil.example/x HTTP/1.1\r\n",
+        "GET ht_tp://evil.example/x HTTP/1.1\r\n",
+    }) |request_line| {
+        const raw = request_line ++ "Host: good.example\r\n\r\n";
+        const req = try Request.parseConst(raw);
+        try testing.expectEqualStrings("good.example", req.headers.get("Host").?);
+    }
+}
+
+// The authority of an absolute target ends at the path, the query or the
+// fragment, so a URI without a path still carries one (RFC 3986 Section 3.2).
+test "Request: absolute URI without a path provides Host" {
+    const raw =
+        "GET http://example.com?x=1 HTTP/1.1\r\n" ++
+        "\r\n";
+    const req = try Request.parseConst(raw);
+    try testing.expectEqualStrings("example.com", req.headers.get("Host").?);
 }
 
 // RFC 2616 Section 14.26: If-None-Match with comma-separated ETags.
