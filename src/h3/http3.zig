@@ -580,8 +580,8 @@ fn readStreamedDataCb(
     return 1;
 }
 
-/// What the size of the buffer a streamed body's reader is offered, i.e. the
-/// largest chunk one call can produce.
+/// The size of the buffer a streamed body's reader is offered: the largest
+/// chunk one call can produce.
 pub const stream_chunk_bytes = 64 * 1024;
 
 const StreamedReadError = error{ OutOfMemory, ReaderFailed };
