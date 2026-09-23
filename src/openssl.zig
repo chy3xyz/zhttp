@@ -19,14 +19,6 @@ const Mutex = std.atomic.Mutex;
 pub const input_buffer_len = 16645;
 pub const output_buffer_len = 16469;
 
-// SSL_set_tlsext_host_name is a C macro — replicate its constant here.
-const SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55;
-const TLSEXT_NAMETYPE_host_name: c_long = 0;
-
-// SSL_CTX_set_tlsext_servername_callback is a C macro — use the underlying ctrl constant.
-const SSL_CTRL_SET_TLSEXT_SERVERNAME_CB: c_int = 53;
-const SSL_CTRL_SET_TLSEXT_SERVERNAME_CB_ARG: c_int = 54;
-
 pub const config = struct {
     pub const cert = struct {
         pub const Bundle = enum {
@@ -322,13 +314,13 @@ pub fn client(fd: posix.fd_t, opts: config.Client) !Connection {
     const ssl = c.SSL_new(ctx) orelse return error.TlsHandshakeFailure;
     errdefer c.SSL_free(ssl);
 
-    // Set SNI hostname (SSL_set_tlsext_host_name is a C macro, use SSL_ctrl directly)
+    // Set SNI hostname
     if (opts.host.len > 0) {
         var host_buf: [256]u8 = undefined;
         if (opts.host.len < host_buf.len) {
             @memcpy(host_buf[0..opts.host.len], opts.host);
             host_buf[opts.host.len] = 0;
-            _ = c.SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, @ptrCast(&host_buf));
+            _ = c.SSL_set_tlsext_host_name(ssl, &host_buf);
         }
     }
 
@@ -386,20 +378,8 @@ pub const SniContext = struct {
     }
 
     fn installSniCallback(self: *SniContext) void {
-        // SSL_CTX_set_tlsext_servername_callback is a C macro that Zig can't
-        // translate. Use SSL_CTX_callback_ctrl with the underlying control code.
-        _ = c.SSL_CTX_callback_ctrl(
-            self.default_ctx,
-            SSL_CTRL_SET_TLSEXT_SERVERNAME_CB,
-            @ptrCast(&sniCallbackFn),
-        );
-        // Set the arg pointer to this SniContext
-        _ = c.SSL_CTX_ctrl(
-            self.default_ctx,
-            SSL_CTRL_SET_TLSEXT_SERVERNAME_CB_ARG,
-            0,
-            @ptrCast(self),
-        );
+        _ = c.SSL_CTX_set_tlsext_servername_callback(self.default_ctx, sniCallbackFn);
+        _ = c.SSL_CTX_set_tlsext_servername_arg(self.default_ctx, @ptrCast(self));
     }
 
     /// Add or replace a domain's TLS certificate.
@@ -471,7 +451,7 @@ pub fn sniCallbackFn(
     arg: ?*anyopaque,
 ) callconv(.c) c_int {
     const sni_ctx: *SniContext = @ptrCast(@alignCast(arg orelse return c.SSL_TLSEXT_ERR_OK));
-    const hostname_ptr = c.SSL_get_servername(ssl, @intCast(TLSEXT_NAMETYPE_host_name));
+    const hostname_ptr = c.SSL_get_servername(ssl, c.TLSEXT_NAMETYPE_host_name);
     if (hostname_ptr == null) return c.SSL_TLSEXT_ERR_OK;
 
     const hostname = mem.sliceTo(hostname_ptr, 0);

@@ -27,3 +27,9 @@ jobs:
 
       - name: Build Examples
         run: zig build
+
+      # HTTP/3 is opt-in, so it needs its own pass to stay covered.
+      - name: Run Tests and Build with HTTP/3
+        run: |
+          zig build test -Dh3=true
+          zig build -Dh3=true

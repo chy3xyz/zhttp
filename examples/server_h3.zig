@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
             _ = req;
             return alloc.dupe(u8, "Hello from httpz HTTP/3 Server!") catch "Hello from httpz HTTP/3 Server!";
         }
-    }.handle);
+    }.handle, .{});
     defer server.deinit();
 
     std.debug.print("httpz HTTP/3 Server running on UDP 127.0.0.1:8443...\n", .{});

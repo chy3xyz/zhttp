@@ -32,4 +32,5 @@ const std = @import("std");
 
 test {
     std.testing.refAllDecls(@This());
+    if (httpz_options.h3) _ = @import("h3/root.zig");
 }

@@ -7,7 +7,7 @@ An HTTP/1.1, HTTP/2, and HTTP/3 library for Zig 0.17, built on the `std.Io` asyn
 - **HTTP Server** — HTTP/1.1, HTTP/2, and HTTP/3, keep-alive, chunked transfer encoding, connection limits, slowloris protection
 - **HTTP Client** — HTTP/1.1, HTTP/2, and HTTP/3, configurable timeouts, response size limits
 - **HTTP/2** — ALPN negotiation, h2c (cleartext), HPACK compression, stream multiplexing, flow control, server push, trailers
-- **HTTP/3** — QUIC via ngtcp2, HTTP/3 framing via nghttp3, 0-RTT support, connection migration
+- **HTTP/3** — opt-in via `-Dh3=true`: QUIC via ngtcp2, HTTP/3 framing via nghttp3, connection ID rotation, Alt-Svc advertisement
 - **Router** — path parameters (`:id`), catch-all segments (`*rest`), AIP-136 custom methods (`:archive`), comptime dispatch, custom 404 handlers
 - **WebSocket** — RFC 6455 upgrade, text/binary frames, fragmentation reassembly, per-route handlers
 - **Streaming Responses** — chunked encoding, Server-Sent Events, zero-copy file serving
@@ -61,6 +61,8 @@ const zhttp_dep = b.dependency("zhttp", .{ .target = target });
 const zhttp_mod = zhttp_dep.module("zhttp");
 exe.root_module.addImport("zhttp", zhttp_mod);
 ```
+
+HTTP/3 is off by default; add `.h3 = true` to `b.dependency` to build it in.
 
 ## Routing
 
@@ -584,7 +586,13 @@ fn handler(allocator: std.mem.Allocator, _: std.Io, _: *const httpz.Request) htt
 
 ## HTTP/3
 
-HTTP/3 runs over QUIC (UDP) instead of TCP. Enabled via the `httpz.h3` module — requires system libraries `libngtcp2` and `libnghttp3`.
+HTTP/3 runs over QUIC (UDP) instead of TCP. It is opt-in — build with `-Dh3=true` to compile it in:
+
+```sh
+zig build -Dh3=true
+```
+
+Building it requires the system libraries `libngtcp2` and `libnghttp3`; they are neither translated nor linked otherwise.
 
 ### Server
 
@@ -595,9 +603,9 @@ fn handler(allocator: std.mem.Allocator, request: []const u8) []const u8 {
     return allocator.dupe(u8, "Hello from H3!") catch "error";
 }
 
-var server = try h3.Server.init(allocator, 4433, handler);
+var server = try h3.Server.init(allocator, 4433, handler, .{});
 defer server.deinit();
-try server.run(); // accept loop
+try server.run(); // event loop: routes packets, serves requests, reaps idle connections
 ```
 
 ### Client
@@ -605,11 +613,15 @@ try server.run(); // accept loop
 ```zig
 const h3 = httpz.h3;
 
-var client = try h3.Client.init(allocator, "example.com", 443);
+var client = try h3.Client.init(allocator, "example.com", 443, .{});
 defer client.deinit();
 const body = try client.get("/");
 defer allocator.free(body);
 ```
+
+`Client.init` takes a `httpz.h3.quic.ClientTls`: it verifies the peer against the
+system CA store by default, and `.insecure_skip_verify = true` turns verification
+off for local testing against a self-signed certificate.
 
 ### TLS Certificates
 
@@ -642,12 +654,17 @@ var server = httpz.Server.init(.{
 
 - QUIC transport via ngtcp2 (UDP, TLS 1.3, stream multiplexing)
 - HTTP/3 framing via nghttp3 (QPACK header compression)
-- 0-RTT early data support
-- Connection migration (CID rotation, path validation)
+- Connection ID rotation and path-validation callbacks
 - Automatic `Alt-Svc` header advertisement on HTTPS responses
-- QLog output for Wireshark/qvis analysis
+- QLog output for Wireshark/qvis analysis (`h3.quic.enableQLog`)
+
+Not implemented: 0-RTT early data (`connect` accepts the argument but ignores it,
+so a resumed session is not used) and connection migration beyond the callbacks
+above.
 
 ### Dependencies
+
+Only needed when building with `-Dh3=true`.
 
 ```sh
 # macOS
@@ -711,6 +728,7 @@ httpz.Server.init(.{
 ## Building & Testing
 
 Requires **Zig 0.17** and **OpenSSL 3** (for TLS support).
+`libngtcp2` and `libnghttp3` are only needed for HTTP/3 (`-Dh3=true`), which is off by default.
 
 ```sh
 # macOS
@@ -726,6 +744,9 @@ sudo dnf install openssl-devel libngtcp2-devel libnghttp3-devel
 ```sh
 # Run all tests (unit + integration)
 zig build test
+
+# Build everything, including HTTP/3
+zig build -Dh3=true
 
 # Run micro-benchmarks
 zig build bench

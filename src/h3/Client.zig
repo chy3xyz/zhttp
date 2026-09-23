@@ -15,12 +15,12 @@ fn sleepNs(ns: u64) void {
 
 pub const Client = struct {
     quic_conn: quic.Connection,
-    h3_session: http3.Session,
+    h3_session: *http3.Session,
     allocator: std.mem.Allocator,
     host: []const u8,
 
-    pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16) !Client {
-        var h3 = try http3.Session.init(allocator);
+    pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16, tls: quic.ClientTls) !Client {
+        const h3 = try http3.Session.init(allocator);
         errdefer h3.deinit();
 
         // Set up stream data bridge: ngtcp2 recv_stream_data → nghttp3 readStream
@@ -28,18 +28,28 @@ pub const Client = struct {
             .h3_conn = @ptrCast(h3.conn),
             .recv_stream_data = onQuicStreamData,
         };
-        var qc = try quic.connect(host, port, stream_ctx, null);
-        errdefer qc.deinit();
+        const qc = try quic.connect(host, port, stream_ctx, null, tls);
+        errdefer {
+            var conn = qc;
+            conn.deinit();
+        }
 
-        return .{
+        var client = Client{
             .quic_conn = qc,
             .h3_session = h3,
             .allocator = allocator,
             .host = host,
         };
+        // On failure the two errdefers above free the session and the
+        // connection, so this must not clean up a second time.
+        try openH3Streams(&client);
+        return client;
     }
 
     pub fn deinit(self: *Client) void {
+        // Tell the server to drop this connection instead of leaving it to its
+        // idle timeout.
+        quic.sendConnectionClose(&self.quic_conn, http3.H3_NO_ERROR, "client done");
         self.h3_session.deinit();
         self.quic_conn.deinit();
     }
@@ -59,17 +69,22 @@ pub const Client = struct {
         }
         if (stream_id < 0) return error.QuicError;
 
-        // 2. Submit HTTP/3 request
-        try self.h3_session.submitRequest(stream_id, path, self.host);
-
-        // 3. Set up response context on the nghttp3 stream
+        // 2. The response callbacks fill this in; it has to outlive the request.
         var ctx = try http3.ResponseContext.init(self.allocator);
         defer ctx.deinit();
-        _ = nghttp3.nghttp3_conn_set_stream_user_data(self.h3_session.conn, stream_id, @ptrCast(&ctx));
+
+        // 3. Submit HTTP/3 request
+        try self.h3_session.submitRequest(stream_id, path, self.host, &ctx);
 
         // 4. I/O loop: pump writes, read responses until done
         const start = nowNanos();
         while (!ctx.done) {
+            // The peer may have closed the connection: do not spin out the
+            // timeout waiting for a response that can no longer come.
+            if (ngtcp2.ngtcp2_conn_in_draining_period2(self.quic_conn.conn) != 0) {
+                return error.ConnectionClosed;
+            }
+
             // Pump outgoing data: nghttp3 → ngtcp2 → UDP
             pumpWrites(self);
 
@@ -79,6 +94,7 @@ pub const Client = struct {
             // Read incoming UDP packets — feeds QUIC engine which triggers
             // recv_stream_data → nghttp3 readStream → ctx populated
             quic.readPacket(&self.quic_conn) catch {};
+            quic.handleExpiryIfDue(&self.quic_conn);
 
             // Timeout after 30 seconds
             if (nowNanos() - start > 30 * std.time.ns_per_s) return error.Timeout;
@@ -99,38 +115,47 @@ fn onQuicStreamData(h3_conn: *anyopaque, stream_id: i64, data: []const u8, fin: 
     _ = nghttp3.nghttp3_conn_read_stream2(conn, stream_id, data.ptr, data.len, @intFromBool(fin), 0);
 }
 
-/// Pump pending HTTP/3 write data (headers, etc.) into the QUIC connection.
+/// Pump pending HTTP/3 write data (headers, body, FIN) into the QUIC connection.
 fn pumpWrites(self: *Client) void {
     while (true) {
         var write_stream_id: i64 = -1;
         var write_fin: c_int = 0;
         var vec: nghttp3.nghttp3_vec = undefined;
         const nvec = nghttp3.nghttp3_conn_writev_stream(self.h3_session.conn, &write_stream_id, &write_fin, &vec, 1);
-        if (nvec < 0) break;
-        if (write_stream_id == -1) break;
+        if (nvec < 0 or write_stream_id == -1) break;
+
+        const data: []const u8 = if (nvec > 0) vec.base[0..vec.len] else &.{};
+        const written = quic.writeStreamPacket(&self.quic_conn, write_stream_id, write_fin != 0, data) catch break;
         if (nvec > 0) {
-            var pi: ngtcp2.ngtcp2_pkt_info = undefined;
-            var dest: ngtcp2.ngtcp2_path = .{ .local = .{}, .remote = .{} };
-            const nwritten = ngtcp2.ngtcp2_conn_write_stream_versioned(
-                self.quic_conn.conn,
-                &dest,
-                ngtcp2.NGTCP2_PKT_INFO_VERSION,
-                &pi,
-                &self.quic_conn.buf,
-                self.quic_conn.buf.len,
-                null,
-                0,
-                write_stream_id,
-                vec.base,
-                vec.len,
-                nowNanos(),
-            );
-            _ = nghttp3.nghttp3_conn_add_write_offset(self.h3_session.conn, write_stream_id, if (nwritten > 0) @as(usize, @intCast(nwritten)) else 0);
+            _ = nghttp3.nghttp3_conn_add_write_offset(self.h3_session.conn, write_stream_id, written);
         } else if (write_fin != 0) {
             // Zero-length fin — just acknowledge
             _ = nghttp3.nghttp3_conn_add_write_offset(self.h3_session.conn, write_stream_id, 0);
         }
     }
+}
+
+/// Open this endpoint's control and QPACK streams and bind them to nghttp3.
+/// HTTP/3 requires both endpoints to open these, and ngtcp2 only allows it once
+/// the peer's stream limits are known.
+fn openH3Streams(client: *Client) !void {
+    const ctrl = try openUniStream(client);
+    const qpack_enc = try openUniStream(client);
+    const qpack_dec = try openUniStream(client);
+    try client.h3_session.bindControlStream(ctrl);
+    try client.h3_session.bindQpackStreams(qpack_enc, qpack_dec);
+}
+
+fn openUniStream(client: *Client) !i64 {
+    var attempt: usize = 0;
+    while (attempt < 200) : (attempt += 1) {
+        var stream_id: i64 = -1;
+        if (ngtcp2.ngtcp2_conn_open_uni_stream(client.quic_conn.conn, &stream_id, null) == 0) return stream_id;
+        quic.flushPackets(&client.quic_conn) catch {};
+        quic.readPacket(&client.quic_conn) catch {};
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+    return error.QuicError;
 }
 
 fn nowNanos() u64 {
