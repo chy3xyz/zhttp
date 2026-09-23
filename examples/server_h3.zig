@@ -1,14 +1,33 @@
 const std = @import("std");
+const Io = std.Io;
 const zhttp = @import("zhttp");
 const httpz = zhttp;
+const tls = httpz.tls;
 
 pub fn main(init: std.process.Init) !void {
+    const io = init.io;
     const allocator = init.gpa;
 
-    const cert_pem = @embedFile("cert/cert.pem");
-    const key_pem = @embedFile("cert/key.pem");
+    // The certificate is generated locally (see examples/gen_cert.sh) and is
+    // not part of the repository, so it is read at run time rather than
+    // embedded — the example has to build without it.
+    const dir = std.Io.Dir.cwd().openDir(io, "examples/cert", .{}) catch {
+        std.debug.print("\nError: Certificate directory not found.\n", .{});
+        std.debug.print("Run the following to generate certificates:\n", .{});
+        std.debug.print("  bash examples/gen_cert.sh\n\n", .{});
+        return error.NoCertificate;
+    };
+    defer dir.close(io);
 
-    try httpz.h3.quic.setServerCert(cert_pem, key_pem);
+    var auth = tls.config.CertKeyPair.fromFilePath(allocator, io, dir, "cert.pem", "key.pem") catch {
+        std.debug.print("\nError: Could not load certificates.\n", .{});
+        std.debug.print("Run the following to generate certificates:\n", .{});
+        std.debug.print("  bash examples/gen_cert.sh\n\n", .{});
+        return error.InvalidCertificate;
+    };
+    defer auth.deinit(allocator);
+
+    try httpz.h3.quic.setServerCert(auth.cert_pem, auth.key_pem);
 
     var server = try httpz.h3.Server.init(allocator, 8443, struct {
         fn handle(alloc: std.mem.Allocator, req: []const u8) []const u8 {
