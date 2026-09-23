@@ -68,13 +68,24 @@ pub fn fillRandom(buf: []u8) void {
 /// Server SSL_CTX for QUIC TLS handshake (set by setServerCert).
 var server_ssl_ctx: ?*anyopaque = null;
 
-/// Load a server certificate for QUIC TLS.
-/// Must be called BEFORE creating server connections.
-pub fn setServerCert(cert_pem: []const u8, key_pem: []const u8) !void {
-    const ctx = ossl.SSL_CTX_new(ossl.TLS_server_method()) orelse return error.TlsError;
-    errdefer ossl.SSL_CTX_free(ctx);
+/// The certificate store of an SSL_CTX, and the call that installs a CA into
+/// it. OpenSSL's usual way to trust a CA is `SSL_CTX_load_verify_locations`,
+/// which takes a path; the CA here is PEM in memory, so it goes into the store
+/// the context already has.
+const X509_STORE = opaque {};
+extern fn SSL_CTX_get_cert_store(ctx: ?*ossl.SSL_CTX) ?*X509_STORE;
+extern fn X509_STORE_add_cert(store: ?*X509_STORE, x: ?*ossl.X509) c_int;
 
-    // Load certificate
+/// `SSL_VERIFY_FAIL_IF_NO_PEER_CERT` (ssl.h): on a server, "the client sent no
+/// certificate" is a handshake failure instead of a policy the application would
+/// have to check for itself after the connection was already established.
+const SSL_VERIFY_FAIL_IF_NO_PEER_CERT: c_int = 0x02;
+
+/// Load a certificate and its private key, both PEM, into an SSL_CTX. The same
+/// call serves a server's own certificate and the certificate a client presents
+/// when a server asks for one; the X509 and EVP_PKEY are freed here because the
+/// context takes its own references to them.
+fn loadCertInto(ctx: *ossl.SSL_CTX, cert_pem: []const u8, key_pem: []const u8) !void {
     const cert_bio = ossl.BIO_new_mem_buf(cert_pem.ptr, @intCast(cert_pem.len)) orelse return error.TlsError;
     defer _ = ossl.BIO_free(cert_bio);
     const x509 = ossl.PEM_read_bio_X509(cert_bio, null, null, null) orelse return error.TlsError;
@@ -84,18 +95,50 @@ pub fn setServerCert(cert_pem: []const u8, key_pem: []const u8) !void {
     }
     ossl.X509_free(x509);
 
-    // Load private key
     const key_bio = ossl.BIO_new_mem_buf(key_pem.ptr, @intCast(key_pem.len)) orelse return error.TlsError;
     defer _ = ossl.BIO_free(key_bio);
     const pkey = ossl.PEM_read_bio_PrivateKey(key_bio, null, null, null) orelse return error.TlsError;
     defer ossl.EVP_PKEY_free(pkey);
     if (ossl.SSL_CTX_use_PrivateKey(ctx, pkey) != 1) return error.TlsError;
     if (ossl.SSL_CTX_check_private_key(ctx) != 1) return error.TlsError;
+}
+
+/// Load a server certificate for QUIC TLS.
+/// Must be called BEFORE creating server connections.
+pub fn setServerCert(cert_pem: []const u8, key_pem: []const u8) !void {
+    const ctx = ossl.SSL_CTX_new(ossl.TLS_server_method()) orelse return error.TlsError;
+    errdefer ossl.SSL_CTX_free(ctx);
+
+    try loadCertInto(ctx, cert_pem, key_pem);
 
     // QUIC mandates ALPN, and HTTP/3 peers only ever offer "h3".
     ossl.SSL_CTX_set_alpn_select_cb(ctx, alpnSelectH3Cb, null);
 
     server_ssl_ctx = @ptrCast(ctx);
+}
+
+/// Require a client certificate from every QUIC connection, verified against
+/// `ca_pem`. A client that sends nothing, or a certificate this CA does not
+/// verify, fails the handshake instead of being served.
+///
+/// Must be called after `setServerCert` — both configure the same server
+/// context — and before creating connections. It applies to every connection
+/// that context creates from then on.
+pub fn setClientCa(ca_pem: []const u8) !void {
+    const ctx: *ossl.SSL_CTX = @ptrCast(@alignCast(server_ssl_ctx orelse return error.TlsError));
+
+    const ca_bio = ossl.BIO_new_mem_buf(ca_pem.ptr, @intCast(ca_pem.len)) orelse return error.TlsError;
+    defer _ = ossl.BIO_free(ca_bio);
+    const ca = ossl.PEM_read_bio_X509(ca_bio, null, null, null) orelse return error.TlsError;
+    defer ossl.X509_free(ca);
+
+    const store = SSL_CTX_get_cert_store(ctx) orelse return error.TlsError;
+    // A CA the store already holds is reported as a failure — "cert already in
+    // hash table" — and that is the state this wants, so it is not an error
+    // here: an endpoint that trusts several CAs installs them one at a time.
+    _ = X509_STORE_add_cert(store, ca);
+
+    ossl.SSL_CTX_set_verify(ctx, ossl.SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, null);
 }
 
 /// ALPN selection for QUIC: HTTP/3 is the only protocol spoken here.
@@ -238,6 +281,13 @@ pub fn classifyReadError(conn: *ngtcp2.ngtcp2_conn, ret: c_int) Error {
     return classify(conn, ret);
 }
 
+/// A certificate and its private key, both PEM-encoded, the shape
+/// `setServerCert` takes.
+pub const CertKeyPair = struct {
+    cert_pem: []const u8,
+    key_pem: []const u8,
+};
+
 /// TLS settings for a QUIC client connection, mirroring `httpz.tls.config.Client`.
 pub const ClientTls = struct {
     /// `.system` verifies the peer against the system CA store, `.empty` trusts
@@ -245,6 +295,10 @@ pub const ClientTls = struct {
     root_ca: RootCa = .system,
     /// Skip peer verification entirely. Local testing only.
     insecure_skip_verify: bool = false,
+    /// The certificate to present to a server that asks for one (mutual TLS).
+    /// OpenSSL answers a server's CertificateRequest with it, so a client that
+    /// has one still reaches a server that asks for none.
+    auth: ?CertKeyPair = null,
 };
 
 pub const RootCa = enum { empty, system };
@@ -340,6 +394,8 @@ fn clientTlsSession(tls: ClientTls) !*TlsSession {
             return error.TlsError;
         }
     }
+
+    if (tls.auth) |auth| try loadCertInto(ssl_ctx, auth.cert_pem, auth.key_pem);
 
     const ssl = ossl.SSL_new(ssl_ctx) orelse return error.TlsError;
     errdefer ossl.SSL_free(ssl);
@@ -1294,4 +1350,135 @@ test "getNewConnIdCb: fills the requested CID length and its reset token" {
 // connection's TLS native handle, before the attempt gives up.
 test "connect: reports a handshake that never happened" {
     try std.testing.expectError(error.HandshakeTimeout, connect("127.0.0.1", 45454, null, null, .{ .insecure_skip_verify = true }));
+}
+
+// Test-only support: a real H3 server, on the other side of a real connection,
+// for the mutual-TLS tests below.
+const server_mod = @import("Server.zig");
+const client_mod = @import("Client.zig");
+
+/// Answers every request, so a mutual-TLS test only has to look at whether the
+/// answer arrived.
+fn okHandler(_: std.mem.Allocator, _: *const server_mod.Request) server_mod.Response {
+    return .{ .body = "OK" };
+}
+
+fn serveH3(server: *server_mod.Server) void {
+    server.run() catch {};
+}
+
+/// An H3 server on a background thread, with the port it bound read back, so a
+/// test can take it down and free it rather than leave the thread behind.
+const RunningServer = struct {
+    server: *server_mod.Server,
+    thread: std.Thread,
+    allocator: std.mem.Allocator,
+
+    fn start(allocator: std.mem.Allocator, handler: server_mod.Handler) !RunningServer {
+        const server = try allocator.create(server_mod.Server);
+        errdefer allocator.destroy(server);
+        server.* = try server_mod.Server.init(allocator, 0, handler, .{});
+        errdefer server.deinit();
+        return .{
+            .server = server,
+            .thread = try std.Thread.spawn(.{}, serveH3, .{server}),
+            .allocator = allocator,
+        };
+    }
+
+    fn port(self: RunningServer) u16 {
+        return std.mem.bigToNative(u16, self.server.listener.local_addr.port);
+    }
+
+    fn stop(self: RunningServer) void {
+        self.server.stop();
+        self.thread.join();
+        self.server.deinit();
+        self.allocator.destroy(self.server);
+    }
+};
+
+/// The server context is process-wide, and `setClientCa` changes it for every
+/// connection it creates from then on. `setServerCert` builds a fresh context,
+/// so calling it again drops the client-certificate requirement and leaves the
+/// rest of the test binary with plain server TLS.
+fn resetServerTls() void {
+    setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem")) catch {};
+}
+
+// The store the CA goes into lives with the server context, so a second CA
+// installed on it has to be accepted: `X509_STORE_add_cert` reports a CA that is
+// already there as a failure, and refusing it would make an endpoint that trusts
+// more than one CA impossible to configure.
+test "setClientCa: a CA that is already trusted is not an error" {
+    defer resetServerTls();
+    try setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
+    try setClientCa(@embedFile("test_cert.pem"));
+    try setClientCa(@embedFile("test_cert.pem"));
+}
+
+test "quic: a server that asks for a client certificate serves one that has it" {
+    const cert_pem = @embedFile("test_cert.pem");
+    const key_pem = @embedFile("test_key.pem");
+    defer resetServerTls();
+    try setServerCert(cert_pem, key_pem);
+    // The test certificate is self-signed with CA:TRUE and no key usage or
+    // extended key usage, so one copy of it serves as the server's certificate,
+    // as the client's certificate, and as the CA that verifies it.
+    try setClientCa(cert_pem);
+
+    const allocator = std.heap.page_allocator;
+    const server = try RunningServer.start(allocator, okHandler);
+    defer server.stop();
+
+    var client = try client_mod.Client.init(allocator, "127.0.0.1", server.port(), .{
+        .insecure_skip_verify = true,
+        .auth = .{ .cert_pem = cert_pem, .key_pem = key_pem },
+    });
+    defer client.deinit();
+
+    const body = try client.get("/");
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("OK", body);
+}
+
+test "quic: a server that asks for a client certificate refuses one without" {
+    const cert_pem = @embedFile("test_cert.pem");
+    defer resetServerTls();
+    try setServerCert(cert_pem, @embedFile("test_key.pem"));
+    try setClientCa(cert_pem);
+
+    const allocator = std.heap.page_allocator;
+    const server = try RunningServer.start(allocator, okHandler);
+    defer server.stop();
+
+    // The certificate goes out in the same flight as the client's Finished, and
+    // the client's handshake is finished by then, so this succeeds: what the
+    // server refuses is the connection, not the handshake this endpoint had
+    // already completed before the server could see the certificate.
+    var client = try client_mod.Client.init(allocator, "127.0.0.1", server.port(), .{ .insecure_skip_verify = true });
+    defer client.deinit();
+
+    // RFC 9001: a handshake that fails reaches the peer as a CONNECTION_CLOSE
+    // whose CRYPTO_ERROR code carries the TLS alert. ngtcp2 reports that as the
+    // draining state, so the request fails at once instead of waiting out its
+    // own timeout for a response that cannot come.
+    const start = nowNanos();
+    try std.testing.expectError(error.ConnectionClosed, client.get("/"));
+    const elapsed_ms = (nowNanos() - start) / std.time.ns_per_ms;
+    try std.testing.expect(elapsed_ms < 5000);
+}
+
+// A client certificate that cannot be loaded is a failed connection attempt of
+// its own: it is reported as the TLS error it is, before anything goes on the
+// wire, and never as a handshake that ran out of time.
+test "connect: a client certificate that does not load is a TLS error" {
+    try std.testing.expectError(error.TlsError, connect("127.0.0.1", 45455, null, null, .{
+        .insecure_skip_verify = true,
+        .auth = .{ .cert_pem = "not a certificate", .key_pem = @embedFile("test_key.pem") },
+    }));
+    try std.testing.expectError(error.TlsError, connect("127.0.0.1", 45455, null, null, .{
+        .insecure_skip_verify = true,
+        .auth = .{ .cert_pem = @embedFile("test_cert.pem"), .key_pem = "not a key" },
+    }));
 }
