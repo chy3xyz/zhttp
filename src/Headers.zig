@@ -103,11 +103,26 @@ pub fn remove(self: *Headers, name: []const u8) void {
 /// token = 1*<any CHAR except CTLs or separators>
 pub fn isValidToken(s: []const u8) bool {
     if (s.len == 0) return false;
+    // `token_chars` answers `isTokenChar` for every byte, so the loop is a load
+    // and an `and` per byte rather than a range check, a separator switch and a
+    // branch. The `&` (not `and`) keeps it branch-free over the whole name; a
+    // name is at most `max_name_len` bytes, so scanning it all costs nothing.
+    var ok = true;
     for (s) |c| {
-        if (!isTokenChar(c)) return false;
+        ok = ok & token_chars[c];
     }
-    return true;
+    return ok;
 }
+
+/// `isTokenChar` tabulated over all 256 byte values. Built once at comptime.
+const token_chars: [256]bool = blk: {
+    @setEvalBranchQuota(2000);
+    var map: [256]bool = undefined;
+    for (&map, 0..) |*slot, i| {
+        slot.* = isTokenChar(@intCast(i));
+    }
+    break :blk map;
+};
 
 /// RFC 2616 Section 2.2: Token characters.
 /// separators = "(" | ")" | "<" | ">" | "@" | "," | ";" | ":" | "\" | <">

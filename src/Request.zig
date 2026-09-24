@@ -180,7 +180,20 @@ pub const ParseError = error{
 ///   CRLF
 ///   [message-body]
 pub fn parse(data: []u8) ParseError!Request {
-    var request: Request = .{};
+    // The fields are set one by one rather than with `.{}`: `Request` is 2528
+    // bytes, mostly the `undefined` entry arrays inside `Headers`, `Params` and
+    // `Context`, and an aggregate initializer makes the compiler emit a
+    // 2528-byte copy of a constant for every request.
+    var request: Request = undefined;
+    request.method = .GET;
+    request.uri = "/";
+    request.version = .http_1_1;
+    request.headers = .{ .len = 0 };
+    request.body = "";
+    request.raw = "";
+    request.params = .{ .len = 0 };
+    request.action = null;
+    request.context = .{ .len = 0 };
     var pos: usize = 0;
 
     // RFC 2616 Section 4.1: "In the interest of robustness, servers SHOULD
@@ -245,26 +258,60 @@ pub fn parse(data: []u8) ParseError!Request {
     // Store raw request (request-line + headers + blank line) for TRACE echo.
     request.raw = data[0..pos];
 
+    // One pass over the header table for the four fields the parser needs,
+    // instead of four scans of it. The name lengths of the other headers a
+    // request carries almost never collide with these three, so the switch
+    // rejects an entry without comparing its name.
+    var host_count: usize = 0;
+    var host_value: ?[]const u8 = null;
+    var te: ?[]const u8 = null;
+    var cl_value: ?[]const u8 = null;
+    var cl_count: usize = 0;
+    for (request.headers.entries[0..request.headers.len]) |entry| {
+        switch (entry.name.len) {
+            4 => if (Headers.eqlIgnoreCase(entry.name, "Host")) {
+                if (host_count == 0) host_value = entry.value;
+                host_count += 1;
+            },
+            14 => if (Headers.eqlIgnoreCase(entry.name, "Content-Length")) {
+                if (cl_count == 0) cl_value = entry.value;
+                cl_count += 1;
+            },
+            17 => if (Headers.eqlIgnoreCase(entry.name, "Transfer-Encoding")) {
+                if (te == null) te = entry.value;
+            },
+            else => {},
+        }
+    }
+
     // RFC 2616 Section 14.23: HTTP/1.1 requests MUST include exactly one
     // Host header. Multiple Host headers MUST be rejected with 400.
     if (request.version == .http_1_1) {
-        var host_buf: [2][]const u8 = undefined;
-        const host_count = request.headers.getAll("Host", &host_buf);
         if (host_count > 1) return error.MultipleHostHeaders;
 
         // RFC 2616 Section 5.2: If the Request-URI is an absoluteURI, the
         // host is part of the Request-URI. Any Host header field value MUST
         // be ignored in favor of the URI's host.
-        if (extractHostFromAbsoluteUri(&request)) {
-            // Host extracted from absolute URI; remove any existing Host header
-            // and use the URI's host instead (already appended by extract fn).
-        } else if (host_count == 0) {
-            return error.MissingHostHeader;
+        switch (extractHostFromAbsoluteUri(&request)) {
+            // The URI's authority replaced every Host header, so that value is
+            // the one to validate.
+            .replaced => |host| host_value = host,
+            // The authority was taken out of the headers but could not be
+            // stored (it held a bare CR or LF), so no Host header is left and
+            // there is nothing to validate. A request that carried no Host
+            // header at all is still missing one.
+            .dropped => {
+                if (host_count == 0) return error.MissingHostHeader;
+                host_value = null;
+            },
+            // Not an absolute-form target: nothing was removed, so the first
+            // Host header is still the one the request carried.
+            .none => if (host_count == 0) return error.MissingHostHeader,
         }
 
         // Validate Host header value: no control characters, no whitespace,
         // must match host[:port] pattern.
-        if (request.headers.get("Host")) |host| {
+        if (host_value) |host| {
             if (!isValidHostValue(host)) return error.InvalidHostHeader;
         }
     }
@@ -272,21 +319,21 @@ pub fn parse(data: []u8) ParseError!Request {
     // RFC 2616 Section 4.4: Message Length
     // Rule 3: If Transfer-Encoding is present and is not "identity",
     // it takes precedence over Content-Length.
-    const te = request.headers.get("Transfer-Encoding");
-    if (te != null and !Headers.eqlIgnoreCase(te.?, "identity")) {
+    const chunked = if (te) |t| !Headers.eqlIgnoreCase(t, "identity") else false;
+    if (chunked) {
         // Chunked body data starts at pos; store raw data for later decoding.
         // The server is responsible for calling parseChunkedBody on a mutable buffer.
         request.body = data[pos..];
-    } else if (request.headers.get("Content-Length")) |cl_str| {
+    } else if (cl_value) |cl_str| {
         // RFC 2616 Section 4.4: Multiple Content-Length headers with
         // differing values indicate an invalid message (request smuggling risk).
         // Check ALL Content-Length values against the first to prevent
         // smuggling via 3+ headers where only the first two match.
-        var cl_vals: [Headers.max_headers][]const u8 = undefined;
-        const cl_count = request.headers.getAll("Content-Length", &cl_vals);
         if (cl_count > 1) {
+            var cl_vals: [Headers.max_headers][]const u8 = undefined;
+            const n = request.headers.getAll("Content-Length", &cl_vals);
             const first = trimOws(cl_vals[0]);
-            for (cl_vals[1..cl_count]) |v| {
+            for (cl_vals[1..n]) |v| {
                 if (!std.mem.eql(u8, first, trimOws(v))) {
                     return error.ConflictingContentLength;
                 }
@@ -430,17 +477,44 @@ fn isValidHostValue(host: []const u8) bool {
     }
 
     for (hostname) |c| {
-        switch (c) {
-            'a'...'z', 'A'...'Z', '0'...'9', '-', '.' => {},
-            else => return false,
-        }
+        if (!host_chars[c]) return false;
     }
     return true;
 }
 
+/// The character class the old scalar loop accepted, tabulated. Validating a
+/// hostname is then a load and a branch per byte instead of a range switch.
+const host_chars: [256]bool = blk: {
+    @setEvalBranchQuota(2000);
+    var map: [256]bool = undefined;
+    for (&map, 0..) |*slot, i| {
+        slot.* = isHostChar(@intCast(i));
+    }
+    break :blk map;
+};
+
+fn isHostChar(c: u8) bool {
+    return switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '-', '.' => true,
+        else => false,
+    };
+}
+
+/// What `extractHostFromAbsoluteUri` did to the headers.
+const HostFromUri = union(enum) {
+    /// The request target is not absolute-form; the headers were not touched.
+    none,
+    /// The target carried an authority, which replaced any Host header.
+    replaced: []const u8,
+    /// The authority was removed from the headers but could not be stored
+    /// under "Host" (it was empty or held a bare CR or LF), so no Host header
+    /// remains.
+    dropped,
+};
+
 /// RFC 2616 Section 5.2: Extract host from an absolute URI and replace
-/// any existing Host header. Returns true if a host was found.
-fn extractHostFromAbsoluteUri(request: *Request) bool {
+/// any existing Host header.
+fn extractHostFromAbsoluteUri(request: *Request) HostFromUri {
     const uri = request.uri;
     // An absolute-form target is `scheme "://" authority [path ["?" query]]`
     // (RFC 7230 Section 5.3.2), and a scheme is
@@ -448,12 +522,17 @@ fn extractHostFromAbsoluteUri(request: *Request) bool {
     // A "://" anywhere else — as in "/redirect?to=http://example.com" — is not
     // one, and taking it for one would replace the Host header this request was
     // addressed with by a value out of the client's own URL.
-    const scheme_end = std.mem.indexOf(u8, uri, "://") orelse return false;
-    if (scheme_end == 0 or !std.ascii.isAlphabetic(uri[0])) return false;
+    //
+    // A scheme is `ALPHA ...`, so a target that does not start with a letter —
+    // the origin-form "/..." of nearly every request included — cannot be an
+    // absolute URI. Reject it before scanning the URI for "://".
+    if (uri.len == 0 or !std.ascii.isAlphabetic(uri[0])) return .none;
+    const scheme_end = std.mem.indexOf(u8, uri, "://") orelse return .none;
+    if (scheme_end == 0) return .none;
     for (uri[0..scheme_end]) |c| {
         switch (c) {
             'a'...'z', 'A'...'Z', '0'...'9', '+', '-', '.' => {},
-            else => return false,
+            else => return .none,
         }
     }
     const after_scheme = uri[scheme_end + 3 ..];
@@ -461,11 +540,11 @@ fn extractHostFromAbsoluteUri(request: *Request) bool {
     // of the URI.
     const host_end = std.mem.indexOfAny(u8, after_scheme, "/?#") orelse after_scheme.len;
     const host = after_scheme[0..host_end];
-    if (host.len == 0) return false;
+    if (host.len == 0) return .none;
     // Remove any existing Host header; the absolute URI takes precedence.
     request.headers.remove("Host");
-    request.headers.append("Host", host) catch return false;
-    return true;
+    request.headers.append("Host", host) catch return .dropped;
+    return .{ .replaced = host };
 }
 
 /// RFC 2616 Section 14.25: Check if the resource has been modified since
@@ -818,10 +897,18 @@ pub fn containsPathTraversal(uri: []const u8) bool {
         break :blk uri;
     };
 
-    // Null bytes in URI are always suspicious
+    // Null bytes in URI are always suspicious, and every check below needs a
+    // literal '.' or a '%' to have anything to find: a segment only decodes to
+    // ".." when one of its characters is a dot or a percent escape, and the
+    // encoded-null and double-encoding probes only ever look at '%'. Rule out
+    // all four at once for a path like "/api/v1/users/123".
+    var interesting = false;
     for (path) |c| {
         if (c == 0) return true;
+        if (c == '.' or c == '%') interesting = true;
     }
+    if (!interesting) return false;
+
     // Check for encoded null bytes (%00)
     if (containsEncodedByte(path, 0x00)) return true;
 
@@ -986,8 +1073,27 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+/// Find the offset of the first CRLF at or after `start`.
+///
+/// The scan looks for CR with 16-byte vectors and only checks for the LF where
+/// a CR was actually seen, so a line costs one load per 16 bytes instead of one
+/// branch per byte. A CR that is not followed by LF is not a terminator: the
+/// scan resumes just past it, which is what the scalar loop did.
 fn findCrlf(data: []const u8, start: usize) ?usize {
     var i = start;
+    // `i + 17 <= data.len` keeps `data[i + 15 + 1]` (the LF check) in bounds.
+    while (i + 17 <= data.len) {
+        const chunk: @Vector(16, u8) = data[i..][0..16].*;
+        const is_cr = chunk == @as(@Vector(16, u8), @splat('\r'));
+        const mask: u16 = @bitCast(is_cr);
+        if (mask != 0) {
+            const cr = i + @ctz(mask);
+            if (data[cr + 1] == '\n') return cr;
+            i = cr + 1;
+            continue;
+        }
+        i += 16;
+    }
     while (i + 1 < data.len) : (i += 1) {
         if (data[i] == '\r' and data[i + 1] == '\n') return i;
     }
@@ -1870,6 +1976,27 @@ test "Request: absolute URI without a path provides Host" {
         "\r\n";
     const req = try Request.parseConst(raw);
     try testing.expectEqualStrings("example.com", req.headers.get("Host").?);
+}
+
+// An authority holding a bare CR cannot be stored as a Host value, so the
+// absolute target supplies no Host at all: RFC 2616 Section 14.23 still wants
+// exactly one, and a request that never had one is rejected.
+test "Request: an unstorable authority leaves the request without a Host" {
+    try testing.expectError(error.MissingHostHeader, Request.parseConst(
+        "GET http://a\rb.com/ HTTP/1.1\r\n\r\n",
+    ));
+}
+
+// With a Host header present, the unstorable authority still takes precedence:
+// every Host header is removed and nothing replaces it, so the value the
+// request carried is never validated.
+test "Request: an unstorable authority drops the Host header" {
+    const raw =
+        "GET http://a\rb.com/ HTTP/1.1\r\n" ++
+        "Host: bad host\r\n" ++
+        "\r\n";
+    const req = try Request.parseConst(raw);
+    try testing.expect(req.headers.get("Host") == null);
 }
 
 // RFC 2616 Section 14.26: If-None-Match with comma-separated ETags.
