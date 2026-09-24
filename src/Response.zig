@@ -143,7 +143,12 @@ stream_context: ?*anyopaque = null,
 /// HTTP/2 trailer headers. When set, these are sent as a trailing HEADERS
 /// frame with END_STREAM after the response body DATA frames.
 /// In HTTP/1.1 chunked encoding, trailers are appended after the final chunk.
-trailers: ?Headers = null,
+///
+/// A pointer rather than the table itself: `Response` is returned by value from
+/// every handler, and a second header table would add two kilobytes to each one
+/// for a feature almost no response uses. The headers are read when the
+/// response is sent, so they have to outlive it.
+trailers: ?*const Headers = null,
 
 /// HTTP/2 server push promises. Each entry is a path that the server
 /// will proactively push to the client. Only used in HTTP/2 connections

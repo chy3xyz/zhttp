@@ -252,7 +252,7 @@ const Response = struct {
     ws_handler: ?WebSocket.Handler = null,       // per-route WebSocket handler
     stream_fn: ?*const fn (?*anyopaque, *std.Io.Writer) void = null,  // streaming body callback
     stream_context: ?*anyopaque = null,          // opaque state for stream_fn
-    trailers: ?Headers = null,                   // HTTP/2 trailing headers
+    trailers: ?*const Headers = null,            // HTTP/2 trailing headers, held by the caller
     push_paths: [4]?[]const u8 = .{ null, null, null, null },  // HTTP/2 server push paths
     push_count: u8 = 0,
 };

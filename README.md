@@ -571,7 +571,10 @@ fn handler(allocator: std.mem.Allocator, _: std.Io, _: *const httpz.Request) htt
     var resp = httpz.Response.init(.ok, "application/octet-stream", body);
     var trailers = httpz.Headers.init(allocator);
     trailers.append("checksum", "sha256=abc123") catch {};
-    resp.trailers = trailers;
+    // A `Response` is returned by value from every handler, so it holds a
+    // pointer to the trailers rather than a second header table. They are read
+    // when the response is sent, so they have to outlive it.
+    resp.trailers = &trailers;
     return resp;
 }
 ```
