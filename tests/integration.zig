@@ -981,6 +981,85 @@ test "integration: a graceful stop that runs out of deadline reports the connect
     try testing.expectEqual(std.heap.Check.ok, gpa.deinit());
 }
 
+// The same drain over HTTP/2. A connection that is serving a request has to be
+// told with a GOAWAY and then allowed to finish it: the HTTP/1.1 loop reports
+// whether it has work in flight, and an HTTP/2 connection that did not would be
+// cut off when the deadline passed with a response still owed to its client.
+test "integration: an HTTP/2 request in flight is drained, not cut off" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var threaded = Io.Threaded.init(gpa.allocator(), .{});
+    const io = threaded.io();
+
+    resetSlowHandler();
+
+    var server = httpz.Server.init(.{
+        .port = 0, // ephemeral: two test processes must not fight over a port
+        .address = "127.0.0.1",
+        .max_connections = 8,
+        .sweeper_interval_ms = 20,
+        .accept_poll_interval_ms = 20,
+    }, slowHandler);
+    const background = try startServer(&server, io);
+
+    // Prior knowledge, so the connection speaks HTTP/2 from its first byte:
+    // that is the server's h2c path rather than its HTTP/1.1 one.
+    var client = try httpz.Client.init(gpa.allocator(), .{
+        .host = "127.0.0.1",
+        .port = background.port,
+        .read_timeout_s = 5,
+        .h2_prior_knowledge = true,
+    });
+    try client.connect(io);
+
+    // The slow request runs on a thread of its own: this one has to be free to
+    // ask for the stop and then release the handler.
+    var answer: ?httpz.Response = null;
+    const Requester = struct {
+        fn run(c: *httpz.Client, sio: Io, out: *?httpz.Response) void {
+            out.* = c.request(sio, .GET, "/slow", null, null) catch return;
+        }
+    };
+    const requester = try std.Thread.spawn(.{}, Requester.run, .{ &client, io, &answer });
+    try waitForSlowHandler();
+
+    var cut_off: u32 = 0;
+    const Drainer = struct {
+        fn run(srv: *httpz.Server, sio: Io, out: *u32) void {
+            out.* = srv.stopGraceful(sio, 5 * std.time.ns_per_s);
+        }
+    };
+    const drainer = try std.Thread.spawn(.{}, Drainer.run, .{ &server, io, &cut_off });
+
+    // The drain has the connection by now — it is serving, not waiting — and
+    // releasing the handler is what lets the request finish inside the
+    // deadline. A drain that cut it off would report it and leave no answer.
+    osSleep(50);
+    slow_release.store(true, .release);
+
+    drainer.join();
+    requester.join();
+
+    try testing.expectEqual(@as(u32, 0), cut_off);
+    try testing.expect(!slow_canceled.load(.acquire));
+    if (answer) |*response| {
+        try testing.expectEqual(httpz.Response.StatusCode.ok, response.status);
+        try testing.expectEqualStrings("slow done", response.body);
+    } else {
+        return error.RequestNotAnswered;
+    }
+
+    // Everything is released by hand rather than by a `defer`: a defer runs
+    // after the leak check at the end of this test, and whatever it freed
+    // would be reported as a leak.
+    background.thread.join();
+    server.deinit();
+    if (answer) |*response| response.deinit(gpa.allocator());
+    client.deinit();
+    threaded.deinit();
+
+    try testing.expectEqual(std.heap.Check.ok, gpa.deinit());
+}
+
 // ─── WebSocket Tests ────────────────────────────────────────────
 
 test "integration: websocket upgrade and echo" {
