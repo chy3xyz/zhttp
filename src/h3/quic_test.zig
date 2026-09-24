@@ -428,6 +428,96 @@ fn streamBulkHandler(_: std.mem.Allocator, _: *const server_mod.Request) server_
     };
 }
 
+/// A body produced in pieces far smaller than a packet, which is the case that
+/// makes ngtcp2 end a stream with a frame that carries only FIN.
+const tiny_len = 32 * 1024;
+
+const TinySource = struct {
+    chunk_bytes: usize,
+    offset: usize = 0,
+};
+
+var tiny_one_byte: TinySource = .{ .chunk_bytes = 1 };
+var tiny_two_hundred: TinySource = .{ .chunk_bytes = 200 };
+
+fn tinyBulkReader(context: ?*anyopaque, buf: []u8) anyerror!usize {
+    const src: *TinySource = @ptrCast(@alignCast(context.?));
+    if (src.offset >= tiny_len) return 0;
+    const n = @min(@min(tiny_len - src.offset, src.chunk_bytes), buf.len);
+    for (buf[0..n], 0..) |*b, i| b.* = responseByte(src.offset + i);
+    src.offset += n;
+    return n;
+}
+
+/// Streams the bulk body in pieces of one path's size, and answers anything else
+/// with a short body so one connection can ask for both.
+fn tinyChunkHandler(_: std.mem.Allocator, request: *const server_mod.Request) server_mod.Response {
+    const src: *TinySource = if (std.mem.eql(u8, request.path, "/one-byte"))
+        &tiny_one_byte
+    else if (std.mem.eql(u8, request.path, "/two-hundred"))
+        &tiny_two_hundred
+    else
+        return .{ .body = "OK" };
+    src.offset = 0;
+    return .{
+        .content_type = "application/octet-stream",
+        .body_reader = tinyBulkReader,
+        .body_context = src,
+    };
+}
+
+/// One small-chunk run: the whole body has to arrive byte for byte, and the
+/// connection has to still serve a request afterwards.
+fn expectTinyChunkRun(client: *Client, path: []const u8) !void {
+    const answer = try client.request(path);
+    defer std.heap.page_allocator.free(answer.header_text);
+    defer std.heap.page_allocator.free(answer.body);
+
+    try std.testing.expectEqual(@as(u16, 200), answer.status);
+    try std.testing.expectEqual(@as(usize, tiny_len), answer.body.len);
+    for (answer.body, 0..) |b, i| {
+        if (b != responseByte(i)) return error.BodyCorrupted;
+    }
+
+    const again = try client.get("/");
+    defer std.heap.page_allocator.free(again);
+    try std.testing.expectEqualStrings("OK", again);
+}
+
+// The end of a stream like this is where the peer runs out of room in the packet
+// it is filling and ends the stream with a frame that has no payload at all —
+// ngtcp2.h allows that ("|datalen| may be 0 if and only if |fin| is nonzero") and
+// hands the receiver a null pointer for it.
+test "h3: a streamed body produced a byte at a time arrives whole" {
+    try quic.setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
+
+    const allocator = std.heap.page_allocator;
+    const server = try allocator.create(Server);
+    server.* = try Server.init(allocator, 0, tinyChunkHandler, .{});
+    const port = std.mem.bigToNative(u16, server.listener.local_addr.port);
+    _ = try std.Thread.spawn(.{}, serve, .{server});
+
+    var client = try Client.init(allocator, "127.0.0.1", port, .{ .insecure_skip_verify = true });
+    defer client.deinit();
+
+    try expectTinyChunkRun(&client, "/one-byte");
+}
+
+test "h3: a streamed body produced in a couple of hundred byte pieces arrives whole" {
+    try quic.setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
+
+    const allocator = std.heap.page_allocator;
+    const server = try allocator.create(Server);
+    server.* = try Server.init(allocator, 0, tinyChunkHandler, .{});
+    const port = std.mem.bigToNative(u16, server.listener.local_addr.port);
+    _ = try std.Thread.spawn(.{}, serve, .{server});
+
+    var client = try Client.init(allocator, "127.0.0.1", port, .{ .insecure_skip_verify = true });
+    defer client.deinit();
+
+    try expectTinyChunkRun(&client, "/two-hundred");
+}
+
 test "h3: a streamed response larger than the flow control window arrives complete" {
     try quic.setServerCert(@embedFile("test_cert.pem"), @embedFile("test_key.pem"));
 

@@ -480,6 +480,16 @@ pub const Connection = struct {
     }
 };
 
+/// Slices the bytes a C callback was handed. ngtcp2 passes a null `data` with a
+/// zero `datalen` for a STREAM frame that carries only FIN (ngtcp2.h:
+/// "`|datalen|` may be 0 if and only if `|fin|` is nonzero"), and slicing a C
+/// pointer checks it for null, so the empty case has to be built without
+/// touching the pointer — a peer that ends a stream with an empty frame would
+/// otherwise take the endpoint down.
+fn cBytes(ptr: [*c]const u8, len: usize) []const u8 {
+    return if (len == 0) &.{} else ptr[0..len];
+}
+
 pub fn recvStreamDataCb(
     conn: ?*ngtcp2.ngtcp2_conn,
     flags: u32,
@@ -497,7 +507,7 @@ pub fn recvStreamDataCb(
     // The timestamp ngtcp2 is working off is the one this packet was read with,
     // so nghttp3 sees the same clock ngtcp2 does and never sees it go backwards.
     const ts = if (conn) |quic_conn| ngtcp2.ngtcp2_conn_get_timestamp(quic_conn) else nowNanos();
-    switch (ctx.recv_stream_data(ctx.h3_conn, stream_id, data[0..datalen], fin, ts)) {
+    switch (ctx.recv_stream_data(ctx.h3_conn, stream_id, cBytes(data, datalen), fin, ts)) {
         .consumed => |consumed| {
             if (conn) |quic_conn| extendFlowControl(quic_conn, stream_id, consumed);
             return 0;
@@ -1253,6 +1263,9 @@ pub fn pathValidationCb(
 /// ngtcp2 rand callback — mandatory for every connection. ngtcp2 calls it for
 /// unpredictable bytes it derives itself (stateless reset tokens, CIDs).
 pub fn randCb(dest: [*c]u8, destlen: usize, _: [*c]const ngtcp2.ngtcp2_rand_ctx) callconv(.c) void {
+    // A null `dest` with a zero length is possible in principle, and slicing it
+    // would trip the C pointer's null check.
+    if (destlen == 0) return;
     fillRandom(dest[0..destlen]);
 }
 
@@ -1504,4 +1517,42 @@ test "quic: a client with an empty root_ca store trusts the peer" {
     const body = try client.get("/");
     defer allocator.free(body);
     try std.testing.expectEqualStrings("OK", body);
+}
+
+// ngtcp2 hands a STREAM frame that carries only FIN over with a null `data` and
+// a zero `datalen` (ngtcp2.h: "|datalen| may be 0 if and only if |fin| is
+// nonzero"), which is what a peer that ends a stream without sending anything
+// more produces — every stream that ends after its last packet was filled, and
+// small streamed chunks in particular. Slicing that pointer panics, so the
+// callback has to pass an empty slice through instead.
+test "recvStreamDataCb: a FIN with no data does not touch the pointer" {
+    const Recorder = struct {
+        var seen_len: usize = 0;
+        var seen_fin: bool = false;
+        fn recv(_: *anyopaque, _: i64, data: []const u8, fin: bool, _: u64) StreamRead {
+            seen_len = data.len;
+            seen_fin = fin;
+            return .{ .consumed = data.len };
+        }
+    };
+    Recorder.seen_len = 0;
+    Recorder.seen_fin = false;
+
+    var h3_conn: u8 = 0;
+    var ctx = StreamDataCtx{
+        .h3_conn = @ptrCast(&h3_conn),
+        .recv_stream_data = Recorder.recv,
+    };
+    ctx.connection = null;
+
+    const ret = recvStreamDataCb(null, NGTCP2_STREAM_DATA_FLAG_FIN, 0, 0, null, 0, &ctx, null);
+    try std.testing.expectEqual(@as(c_int, 0), ret);
+    try std.testing.expectEqual(@as(usize, 0), Recorder.seen_len);
+    try std.testing.expect(Recorder.seen_fin);
+
+    // The same callback with bytes still passes them through.
+    const payload = "abc";
+    const ret2 = recvStreamDataCb(null, NGTCP2_STREAM_DATA_FLAG_FIN, 0, 0, payload.ptr, payload.len, &ctx, null);
+    try std.testing.expectEqual(@as(c_int, 0), ret2);
+    try std.testing.expectEqual(@as(usize, 3), Recorder.seen_len);
 }

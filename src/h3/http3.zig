@@ -442,6 +442,11 @@ fn recvDataCb(
     stream_user_data: ?*anyopaque,
 ) callconv(.c) c_int {
     const session: *Session = @ptrCast(@alignCast(conn_user_data orelse return nghttp3.NGHTTP3_ERR_CALLBACK_FAILURE));
+    // A DATA frame may carry no payload (RFC 9114 Section 7.2.1). There is
+    // nothing to append for one, and `data` — a C pointer, whose slice would
+    // check it for null — is left alone.
+    if (datalen == 0) return 0;
+
     if (session.server) {
         // The whole body is kept, up to what the request accepts. A body beyond
         // that is dropped rather than refused: the credit for it goes back to
