@@ -130,6 +130,15 @@ pub const ServerRequest = struct {
         self.arena.deinit();
         self.allocator.destroy(self);
     }
+
+    /// Whether the response to this request has been produced in full — it was
+    /// submitted, and a streamed body's reader said it was done. What the
+    /// transport has done with the bytes since is not part of it: a drain gives
+    /// the transport a moment of its own for that (see `Server.drainStep`).
+    pub fn answered(self: *const ServerRequest) bool {
+        if (!self.responded) return false;
+        return self.body_reader == null or self.body_eof;
+    }
 };
 
 pub const Session = struct {

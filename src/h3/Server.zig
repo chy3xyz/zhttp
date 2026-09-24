@@ -75,6 +75,9 @@ const H3Conn = struct {
     qpack_enc_stream: ?i64 = null,
     qpack_dec_stream: ?i64 = null,
     h3_streams_bound: bool = false,
+    /// Set once this connection has been told the endpoint is going away (see
+    /// `Server.drainStep`). Only the server's own thread touches it.
+    draining: bool = false,
     last_activity_ns: u64,
     /// Set once this connection started closing: it stays around until then,
     /// answering the peer with the same CONNECTION_CLOSE.
@@ -107,6 +110,23 @@ pub const Server = struct {
     /// Set by `stop` and read by the run loop, so the server can be taken down
     /// from another thread.
     stopping: std.atomic.Value(bool) = .init(false),
+    /// Set by `stopGraceful`: the connections are told the endpoint is going
+    /// away, no new one is accepted, and the loop keeps serving until the
+    /// requests in flight are done or the deadline passes.
+    draining: std.atomic.Value(bool) = .init(false),
+    /// When a drain gives up on the requests still running, set with `draining`
+    /// and read by the loop.
+    drain_deadline_ns: std.atomic.Value(u64) = .init(0),
+    /// Set by the loop when a drain is over: nothing is in flight any more, or
+    /// the deadline passed.
+    drained: std.atomic.Value(bool) = .init(false),
+    /// How many connections still had a request in flight when the loop last
+    /// looked. Written every turn while a drain is running, so `stopGraceful`
+    /// can report the last count it saw however the drain ended.
+    drained_left: std.atomic.Value(u32) = .init(0),
+    /// When the flush window that follows the last answered request ends. Only
+    /// the server's own thread touches it.
+    drain_flush_until_ns: u64 = 0,
     /// How many connections are in their closing period: told the connection is
     /// over, still answering every packet the peer sends with the same
     /// CONNECTION_CLOSE, and kept until the period is out. Derived from the
@@ -116,6 +136,18 @@ pub const Server = struct {
     closing_connections: std.atomic.Value(usize) = .init(0),
 
     const reap_interval_ns = 1 * std.time.ns_per_s;
+    /// How long the loop may wait in `poll` while a drain is in progress: the
+    /// drain has a deadline to meet and responses to keep pumping, so it turns
+    /// often enough to do both.
+    const drain_poll_ns = 5 * std.time.ns_per_ms;
+    /// How often `stopGraceful` looks at the count the loop publishes.
+    const drain_check_ns = std.time.ns_per_ms;
+    /// How long a drain keeps pumping after the last request has been answered,
+    /// before the connections are closed. The response is the application's
+    /// work; putting it on the wire is the transport's, and a connection closed
+    /// the instant the handler returned would drop whatever the transport had
+    /// not sent yet.
+    const drain_flush_ns = 250 * std.time.ns_per_ms;
 
     pub fn init(allocator: std.mem.Allocator, port: u16, handler: Handler, options: Options) !Server {
         return .{
@@ -136,9 +168,50 @@ pub const Server = struct {
     /// to a second when nothing is happening — and then closes what it was
     /// serving. This is a stop, not a graceful shutdown: requests in flight are
     /// cut off rather than drained, and the peers get a CONNECTION_CLOSE rather
-    /// than a GOAWAY.
+    /// than a GOAWAY. `stopGraceful` is the other half of that choice, and an
+    /// abrupt stop supersedes a drain in progress.
     pub fn stop(self: *Server) void {
         self.stopping.store(true, .release);
+    }
+
+    /// Stops taking new connections and new requests, lets the requests in
+    /// flight finish, and ends the connections when they have or when
+    /// `timeout_ns` passes. Returns how many connections still had a request in
+    /// flight then — which is 0 when every one of them had been answered and
+    /// acknowledged.
+    ///
+    /// Each connection is told with a GOAWAY
+    /// (`nghttp3_conn_submit_shutdown_notice`) that this endpoint is going
+    /// away, so a peer moves its next request somewhere else instead of opening
+    /// one on a connection that is about to end, and `nghttp3_conn_shutdown` is
+    /// what makes nghttp3 refuse the ones it opens anyway. A request counts as
+    /// finished when `nghttp3_conn_is_drained2` says so — every stream the peer
+    /// opened is closed, which includes the peer acknowledging the responses.
+    /// QUIC offers no other evidence that an answer arrived, and a response the
+    /// peer never acknowledged is one it may never have read; a client that has
+    /// gone quiet therefore holds the drain up to its deadline, which is what
+    /// the deadline is for.
+    ///
+    /// Callable from another thread while `run` serves; `run` returns shortly
+    /// after this does. A caller that asks for this while the server is not
+    /// running gets 0, because nothing was being cut off.
+    pub fn stopGraceful(self: *Server, timeout_ns: u64) u32 {
+        if (!self.draining.swap(true, .acquire)) {
+            self.drain_deadline_ns.store(nowNanos() +| timeout_ns, .release);
+        }
+
+        // The loop owns the deadline and the count — it is the only thread that
+        // may walk the routing table — so this waits for its answer rather than
+        // deciding on its own. The wait is bounded by the deadline it just set,
+        // and an abrupt stop ends it too.
+        const give_up_at = self.drain_deadline_ns.load(.acquire) +| drain_check_ns;
+        while (!self.drained.load(.acquire) and
+            !self.stopping.load(.acquire) and
+            nowNanos() < give_up_at)
+        {
+            sleepNs(drain_check_ns);
+        }
+        return self.drained_left.load(.acquire);
     }
 
     pub fn run(self: *Server) !void {
@@ -146,7 +219,7 @@ pub const Server = struct {
         std.debug.print("H3 server listening on UDP\n", .{});
 
         var last_reap = nowNanos();
-        while (!self.stopping.load(.acquire)) {
+        while (!self.stopping.load(.acquire) and !self.drained.load(.acquire)) {
             // Wait for a datagram, for the nearest QUIC timer, or for the reap
             // interval — whichever comes first. Sleeping a fixed amount here is
             // what held the whole server to one datagram per turn; a connection
@@ -158,6 +231,7 @@ pub const Server = struct {
             }
 
             self.serviceConnections();
+            if (self.draining.load(.acquire)) self.drainStep();
 
             if (nowNanos() -% last_reap >= reap_interval_ns) {
                 self.reapConnections();
@@ -174,7 +248,7 @@ pub const Server = struct {
     /// connections' QUIC timers, and never longer than the reap interval, so an
     /// idle server still runs its idle-connection bookkeeping.
     fn waitNs(self: *Server) u64 {
-        var wait: u64 = reap_interval_ns;
+        var wait: u64 = if (self.draining.load(.acquire)) drain_poll_ns else reap_interval_ns;
         const now = nowNanos();
         var it = self.listener.connections.iterator();
         while (it.next()) |entry| {
@@ -182,6 +256,80 @@ pub const Server = struct {
             wait = @min(wait, expiry -| now);
         }
         return wait;
+    }
+
+    /// One turn of a drain: tell every connection this endpoint is going away,
+    /// and settle whether the drain is over. The routing table holds one entry
+    /// per connection ID, so a connection is visited more than once — the
+    /// GOAWAY is guarded by a flag on the connection itself, and the count is
+    /// taken once per connection.
+    fn drainStep(self: *Server) void {
+        const deadline = self.drain_deadline_ns.load(.acquire);
+        const now = nowNanos();
+
+        // Connections with a request still open: what a deadline would cut off,
+        // and what `stopGraceful` reports.
+        var in_flight: u32 = 0;
+        var counted: std.ArrayList(*quic.Connection) = .empty;
+        defer counted.deinit(self.allocator);
+
+        var it = self.listener.connections.iterator();
+        while (it.next()) |entry| {
+            const conn = entry.value_ptr.*;
+            const h3 = h3Conn(conn) orelse continue;
+            if (!h3.draining) {
+                h3.draining = true;
+                // RFC 9114 Section 5.2: the GOAWAY tells the peer to stop
+                // opening requests on this connection. nghttp3.h wants
+                // `nghttp3_conn_shutdown` "a couple of RTTs" later so the peer
+                // has a chance to see it; this endpoint is closing the
+                // connection either way, so both go out in the same turn.
+                _ = nghttp3.nghttp3_conn_submit_shutdown_notice(h3.session.conn);
+                _ = nghttp3.nghttp3_conn_shutdown(h3.session.conn);
+            }
+            // A request that has been answered is not work any more, whatever
+            // the transport is still doing with the bytes. `is_drained2` would
+            // be the other candidate and is not usable here: it never reports a
+            // drained connection for a live peer (measured — see the pitfalls
+            // in docs/modules/h3.md).
+            var pending = false;
+            for (h3.session.requests.items) |req| {
+                if (!req.answered()) {
+                    pending = true;
+                    break;
+                }
+            }
+            if (!pending) continue;
+
+            var seen = false;
+            for (counted.items) |c| {
+                if (c == conn) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            counted.append(self.allocator, conn) catch break;
+            in_flight += 1;
+        }
+
+        // Published every turn, not only at the end: however the drain finishes,
+        // `stopGraceful` reports the last count it saw, and a server that never
+        // ran leaves it at 0.
+        self.drained_left.store(in_flight, .release);
+
+        // Nothing is being produced any more: give the transport the flush
+        // window before the caller closes the connections, so the last packets
+        // of the responses go out with them rather than dying in the send
+        // buffer.
+        if (in_flight > 0) {
+            if (now < deadline) return;
+        } else {
+            if (self.drain_flush_until_ns == 0) self.drain_flush_until_ns = now +| drain_flush_ns;
+            if (now < self.drain_flush_until_ns and now < deadline) return;
+        }
+
+        self.drained.store(true, .release);
     }
 
     /// Feeds every datagram already waiting on the listener socket to the
@@ -204,6 +352,11 @@ pub const Server = struct {
             self.readDatagram(conn, buf[0..n], peer_addr);
             return;
         }
+        // A drain ends this server: a packet that would start a new connection
+        // is dropped rather than answered, and the peer finds out from the
+        // connection it is already missing (or from its next attempt to one
+        // that is gone).
+        if (self.draining.load(.acquire)) return;
         self.acceptConnection(buf, n, dcid, peer_addr) catch {};
     }
 
@@ -676,6 +829,16 @@ fn nowNanos() u64 {
     var ts: posix.timespec = undefined;
     _ = std.c.clock_gettime(posix.CLOCK.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+/// Sleeps for `ns`. `stopGraceful` waits on a count the server's own thread
+/// publishes; it holds no `Io`, and `std.Thread.sleep` is gone in this std.
+fn sleepNs(ns: u64) void {
+    var req = posix.timespec{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    while (posix.errno(posix.system.nanosleep(&req, &req)) == .INTR) {}
 }
 
 test "H3 Server init/deinit" {
