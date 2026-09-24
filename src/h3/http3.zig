@@ -48,17 +48,24 @@ pub const HeaderField = struct {
 /// many bytes were written, 0 at the end of the body.
 pub const BodyReader = *const fn (context: ?*anyopaque, buf: []u8) anyerror!usize;
 
-/// A chunk of a streamed response body. ngtcp2 keeps the bytes it is given so
-/// it can retransmit a lost packet ("The caller must keep the portion of data
-/// covered by |*pdatalen| bytes intact until
-/// :member:`ngtcp2_callbacks.acked_stream_data_offset` indicates that they are
-/// acknowledged" — ngtcp2.h), so a chunk stays where it is until the peer
-/// acknowledges it.
+/// A block of memory the chunks of a streamed response body come out of.
+/// ngtcp2 keeps the bytes it is given so it can retransmit a lost packet ("The
+/// caller must keep the portion of data covered by |*pdatalen| bytes intact
+/// until :member:`ngtcp2_callbacks.acked_stream_data_offset` indicates that they
+/// are acknowledged" — ngtcp2.h), so a block stays where it is until the peer
+/// acknowledges every byte handed out of it.
+///
+/// Chunks come out of the block being filled rather than getting an allocation
+/// each: a reader that produces a byte at a time would otherwise cost one
+/// allocation per byte, and the block is the unit that is reused.
 const BodyChunk = struct {
     buf: []u8,
-    /// Offset in the body just past this chunk. The buffer holds nothing the
-    /// peer may need once the acknowledgement has reached it.
-    end: usize,
+    /// Offset in the body of the block's first byte.
+    start: usize = 0,
+    /// How many of the block's bytes have been handed out; they run from
+    /// `start` to `start + filled`. Everything before `filled` is what the peer
+    /// may still need.
+    filled: usize = 0,
 };
 
 /// A request the server received, plus the response being sent for it. Answers
@@ -99,13 +106,14 @@ pub const ServerRequest = struct {
     /// it is passed. Set by `submitStreamingResponse`.
     body_reader: ?BodyReader = null,
     body_context: ?*anyopaque = null,
-    /// The buffer the reader fills. Every chunk is read out of it and copied
-    /// into a buffer of its own, so the same buffer serves the whole response;
-    /// it is taken from the arena with the first chunk, so a response that does
-    /// not stream never allocates it.
+    /// The buffer the reader fills. What it produces is copied out of it into
+    /// the blocks below, so the one buffer serves the whole response; it is
+    /// taken from the arena with the first chunk, so a response that does not
+    /// stream never allocates it.
     read_buf: []u8 = &.{},
-    /// Chunks handed to nghttp3 and not acknowledged yet. Bounded by the peer's
-    /// flow control window: its bytes are what may still need resending.
+    /// The blocks the chunks handed to nghttp3 came out of, and which the peer
+    /// has not acknowledged in full yet — its flow control window bounds what
+    /// they hold, because they hold what may still need resending.
     chunks: std.ArrayList(BodyChunk) = .empty,
     /// Body bytes handed to nghttp3, and how many of them the peer has
     /// acknowledged (see `ackedStreamDataCb`).
@@ -626,22 +634,50 @@ fn readStreamedChunk(req: *ServerRequest) StreamedReadError![]u8 {
     return chunk;
 }
 
-/// A buffer for the next chunk of a streamed body: one an acknowledged chunk
-/// has given back, or a new one. Everything a response holds comes from its
-/// arena, so what it holds is the chunks the peer has not acknowledged yet,
-/// which its flow control window bounds.
+/// Where the next chunk of a streamed body goes: the block being filled if it
+/// has room, a block the peer has acknowledged in full if there is one, and
+/// otherwise a new one. Everything a response holds comes from its arena, so
+/// what it holds is the chunks the peer has not acknowledged yet — which its
+/// flow control window bounds — rounded up to whole blocks.
 fn takeChunk(req: *ServerRequest, a: std.mem.Allocator, len: usize) StreamedReadError![]u8 {
-    const end = req.body_sent + len;
-    for (req.chunks.items) |*chunk| {
-        if (chunk.end > req.body_acked) continue;
-        if (chunk.buf.len < len) continue;
-        chunk.end = end;
-        return chunk.buf[0..len];
+    // The block being filled: chunks come out of it one after another, which is
+    // what makes a reader that produces a byte at a time cost one allocation
+    // per block rather than one per byte. It is the last block in the list.
+    if (req.chunks.items.len > 0) {
+        const block = &req.chunks.items[req.chunks.items.len - 1];
+        if (block.buf.len - block.filled >= len) {
+            const slice = block.buf[block.filled..][0..len];
+            block.filled += len;
+            return slice;
+        }
     }
 
-    const buf = try a.alloc(u8, len);
-    try req.chunks.append(a, .{ .buf = buf, .end = end });
-    return buf;
+    // A block every byte of which has been acknowledged can start over. It
+    // takes the place of the block being filled — at the end of the list —
+    // because chunks are handed out of that one: leaving it where it was would
+    // put every later chunk in a new block instead.
+    var reusable: ?usize = null;
+    for (req.chunks.items, 0..) |block, i| {
+        if (block.filled == 0) continue;
+        if (block.buf.len < len) continue;
+        if (block.start + block.filled > req.body_acked) continue;
+        reusable = i;
+        break;
+    }
+    if (reusable) |i| {
+        const recycled = req.chunks.swapRemove(i);
+        try req.chunks.append(a, recycled);
+        const block = &req.chunks.items[req.chunks.items.len - 1];
+        block.start = req.body_sent;
+        block.filled = len;
+        return block.buf[0..len];
+    }
+
+    // Nothing to hand out of: a block of its own, with room for the chunks that
+    // come after this one.
+    const buf = try a.alloc(u8, @max(len, stream_chunk_bytes));
+    try req.chunks.append(a, .{ .buf = buf, .start = req.body_sent, .filled = len });
+    return buf[0..len];
 }
 
 /// Hands the request body to nghttp3 in one piece — the client side of
@@ -709,7 +745,7 @@ fn smallChunkReader(context: ?*anyopaque, buf: []u8) anyerror!usize {
 /// get right: the pieces arrive in the body's order, and what the response
 /// holds at any point is bounded by what the peer has not acknowledged —
 /// `window` stands in for its flow control window, which is what bounds the
-/// chunks a retransmission could still need (see `BodyChunk`).
+/// bytes a retransmission could still need (see `BodyChunk`).
 fn expectSmallChunkStream(chunk_bytes: usize, body_len: usize, window: usize) !void {
     var src: SmallChunkSource = .{ .body_len = body_len, .chunk_bytes = chunk_bytes };
     const req = try ServerRequest.init(std.testing.allocator, 0, 1024);
@@ -734,15 +770,16 @@ fn expectSmallChunkStream(chunk_bytes: usize, body_len: usize, window: usize) !v
 
         var held: usize = 0;
         for (req.chunks.items) |c| held += c.buf.len;
-        try std.testing.expect(held <= window + 2 * chunk_bytes);
+        try std.testing.expect(held <= window + 2 * stream_chunk_bytes);
     }
 
     try std.testing.expectEqual(body_len, read);
-    // Buffers are reused, so the response holds one per unacknowledged chunk
-    // rather than one per chunk the body is made of — and it stops holding them
-    // altogether when it is released, which is what the arena's own leak check
-    // says on the `defer` above.
-    try std.testing.expect(req.chunks.items.len <= window / chunk_bytes + 2);
+    // Chunks come out of blocks, and a block is only reused once the peer has
+    // acknowledged every byte of it, so what the response holds is the
+    // unacknowledged window rounded up to blocks — not one buffer per chunk the
+    // body is made of. A reader producing a byte at a time therefore costs one
+    // allocation per block, however many chunks that block holds.
+    try std.testing.expect(req.chunks.items.len <= window / stream_chunk_bytes + 2);
 }
 
 test "H3: a body streamed in one-byte chunks arrives in order and holds one window's worth" {
