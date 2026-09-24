@@ -139,6 +139,63 @@ fn wsEchoHandler(conn: *httpz.WebSocket.Conn, _: *const httpz.Request) void {
     }
 }
 
+// A request the test can hold open, so "this request is in flight" is an event
+// to wait for instead of a delay to guess at.
+//
+// The handler waits on the Io it was given rather than on a clock, which is
+// what makes a cancelation request visible to it: a sleep a server cannot
+// interrupt would let the request be cut off without the test, or the handler,
+// being able to tell. The flags are atomic because the two sides are different
+// threads.
+var slow_entered = std.atomic.Value(bool).init(false);
+var slow_release = std.atomic.Value(bool).init(false);
+var slow_canceled = std.atomic.Value(bool).init(false);
+
+fn resetSlowHandler() void {
+    slow_entered.store(false, .release);
+    slow_release.store(false, .release);
+    slow_canceled.store(false, .release);
+}
+
+fn slowHandler(_: std.mem.Allocator, io: std.Io, request: *const httpz.Request) httpz.Response {
+    if (!std.mem.eql(u8, request.uri, "/slow")) {
+        return httpz.Response.init(.ok, "text/plain", "fast");
+    }
+    slow_entered.store(true, .release);
+    while (!slow_release.load(.acquire)) {
+        Io.sleep(io, Io.Duration.fromMilliseconds(1), .awake) catch |err| switch (err) {
+            error.Canceled => {
+                slow_canceled.store(true, .release);
+                return httpz.Response.init(.internal_server_error, "text/plain", "canceled");
+            },
+        };
+    }
+    return httpz.Response.init(.ok, "text/plain", "slow done");
+}
+
+/// Waits for `slowHandler` to have hold of a request, which is how a test knows
+/// one is in flight rather than hoping so.
+fn waitForSlowHandler() !void {
+    var attempts: usize = 0;
+    while (attempts < 10_000) : (attempts += 1) {
+        if (slow_entered.load(.acquire)) return;
+        osSleep(1);
+    }
+    return error.HandlerNeverEntered;
+}
+
+/// Waits for a cancelation to reach the held request. Bounded, so that a server
+/// which never gets round to cutting it off reports that rather than hanging the
+/// test on it.
+fn waitForSlowCanceled() !void {
+    var attempts: usize = 0;
+    while (attempts < 5000) : (attempts += 1) {
+        if (slow_canceled.load(.acquire)) return;
+        osSleep(1);
+    }
+    return error.HandlerWasNotCanceled;
+}
+
 // ─── Helpers ────────────────────────────────────────────────────
 
 // Kernel-level sleep that doesn't go through Io.
@@ -236,6 +293,70 @@ fn rawRequest(port: u16, request_bytes: []const u8) ![]const u8 {
     var reader = Io.net.Stream.Reader.init(stream, io, &read_buf);
 
     return reader.interface.allocRemaining(testing.allocator, .unlimited) catch return error.ReadFailed;
+}
+
+/// A server serving on a thread of its own, and the port it bound.
+const BackgroundServer = struct {
+    thread: std.Thread,
+    port: u16,
+};
+
+/// Starts `server` on a thread of its own and waits for it to bind the port it
+/// returns, which the config has to have asked for as an ephemeral one. The
+/// caller stops the server and joins `thread` before touching it again.
+fn startServer(server: *httpz.Server, io: Io) !BackgroundServer {
+    const Runner = struct {
+        fn run(srv: *httpz.Server, sio: Io) void {
+            srv.run(sio) catch {};
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ server, io });
+
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        const port = server.boundPort();
+        if (port != 0) return .{ .thread = thread, .port = port };
+        osSleep(10);
+    }
+
+    server.stop();
+    thread.join();
+    return error.ServerNeverBound;
+}
+
+/// Opens a connection without saying anything on it.
+fn connectRaw(io: Io, port: u16) !Io.net.Stream {
+    const addr = Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return error.InvalidAddress;
+    return Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.ConnectionFailed;
+}
+
+/// Reads one response — headers up to the blank line, then the body its
+/// Content-Length announces — and leaves the connection open, which is what a
+/// test of a keep-alive connection needs and what `rawRequest` cannot do: it
+/// reads to the end of the connection.
+fn readOneResponse(reader: *Io.Reader) !void {
+    var head: [1024]u8 = undefined;
+    var len: usize = 0;
+    while (len < head.len) {
+        const line = reader.takeDelimiterInclusive('\n') catch return error.ReadFailed;
+        if (len + line.len > head.len) return error.ResponseTooLarge;
+        @memcpy(head[len..][0..line.len], line);
+        len += line.len;
+        if (line.len == 2 and line[0] == '\r' and line[1] == '\n') break;
+    }
+
+    const headers = head[0..len];
+    if (std.mem.indexOf(u8, headers, "200 OK") == null) return error.UnexpectedStatus;
+    const marker = "Content-Length: ";
+    const start = std.mem.indexOf(u8, headers, marker) orelse return error.NoContentLength;
+    const end = std.mem.indexOfScalarPos(u8, headers, start + marker.len, '\r') orelse return error.NoContentLength;
+    const body_len = std.fmt.parseInt(usize, headers[start + marker.len .. end], 10) catch return error.NoContentLength;
+    reader.discardAll(body_len) catch return error.ReadFailed;
+}
+
+/// Monotonic nanoseconds, for bounding a call rather than measuring it.
+fn monotonicNs(io: Io) i96 {
+    return Io.Clock.awake.now(io).nanoseconds;
 }
 
 /// Create a connected client to the given port.
@@ -597,6 +718,263 @@ test "integration: stopping the server returns from run and leaks nothing" {
     thread.join(); // never returns if the stop did not reach the accept loop
 
     idle.close(io);
+    server.deinit();
+    threaded.deinit();
+
+    try testing.expectEqual(std.heap.Check.ok, gpa.deinit());
+}
+
+// ─── Graceful Stop Tests ────────────────────────────────────────
+
+// A request being handled when the stop lands is work the server owes the
+// client, so a graceful stop answers it before it goes: the response arrives
+// whole, it says the connection is done with, and the stop has nothing to cut
+// off and none of it to report.
+//
+// The idle connection is what makes the test deterministic: the drain closes
+// idle connections the moment it starts, so its end of file is how this thread
+// learns the drain has begun before it lets the handler go. That is also the
+// signal a clock could not give — a sleep would guess when the drain starts
+// rather than know it.
+test "integration: a request in flight when stopGraceful is called is answered in full" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var threaded = Io.Threaded.init(gpa.allocator(), .{});
+    const io = threaded.io();
+
+    resetSlowHandler();
+
+    var server = httpz.Server.init(.{
+        .port = 0, // ephemeral: two test processes must not fight over a port
+        .address = "127.0.0.1",
+        .max_connections = 8,
+        .sweeper_interval_ms = 20,
+        .accept_poll_interval_ms = 20,
+    }, slowHandler);
+    const background = try startServer(&server, io);
+
+    // A keep-alive connection with nothing on it: one request answered, then
+    // the server waiting for the next one on it.
+    const idle = try connectRaw(io, background.port);
+    var idle_write_buf: [1024]u8 = undefined;
+    var idle_read_buf: [1024]u8 = undefined;
+    var idle_writer = Io.net.Stream.Writer.init(idle, io, &idle_write_buf);
+    var idle_reader = Io.net.Stream.Reader.init(idle, io, &idle_read_buf);
+    try idle_writer.interface.writeAll("GET /fast HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    try idle_writer.interface.flush();
+    try readOneResponse(&idle_reader.interface);
+
+    // The slow request goes out on a thread of its own: this thread has to be
+    // free to release the handler while the drain is waiting for the response.
+    var response: []const u8 = &.{};
+    const Requester = struct {
+        fn run(port: u16, out: *[]const u8) void {
+            out.* = rawRequest(port, "GET /slow HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n") catch return;
+        }
+    };
+    const requester = try std.Thread.spawn(.{}, Requester.run, .{ background.port, &response });
+    try waitForSlowHandler();
+
+    var cut_off: u32 = 0;
+    const Drainer = struct {
+        fn run(srv: *httpz.Server, sio: Io, out: *u32) void {
+            out.* = srv.stopGraceful(sio, 5 * std.time.ns_per_s);
+        }
+    };
+    const drainer = try std.Thread.spawn(.{}, Drainer.run, .{ &server, io, &cut_off });
+
+    var closed_buf: [16]u8 = undefined;
+    try testing.expectError(error.EndOfStream, idle_reader.interface.readSliceAll(&closed_buf));
+
+    slow_release.store(true, .release);
+    requester.join();
+    drainer.join();
+
+    try testing.expectEqual(@as(u32, 0), cut_off);
+    try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK"));
+    try testing.expect(std.mem.endsWith(u8, response, "slow done"));
+    try testing.expect(std.mem.indexOf(u8, response, "Connection: close") != null);
+    // And the request was left alone: a cancelation request reaching the
+    // handler would have come back from its sleep as `error.Canceled`.
+    try testing.expect(!slow_canceled.load(.acquire));
+    testing.allocator.free(response);
+
+    idle.close(io);
+    background.thread.join();
+    server.deinit();
+    threaded.deinit();
+
+    try testing.expectEqual(std.heap.Check.ok, gpa.deinit());
+}
+
+// An idle keep-alive connection is not work: nothing is in flight on it, so the
+// stop closes it instead of waiting. That the call comes back long before its
+// deadline is the assertion — a drain that waited out its five seconds would
+// hold a deploy up for five seconds per idle client.
+test "integration: stopGraceful closes an idle connection rather than waiting it out" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var threaded = Io.Threaded.init(gpa.allocator(), .{});
+    const io = threaded.io();
+
+    var server = httpz.Server.init(.{
+        .port = 0,
+        .address = "127.0.0.1",
+        .max_connections = 8,
+        .sweeper_interval_ms = 20,
+        .accept_poll_interval_ms = 20,
+    }, plainHandler);
+    const background = try startServer(&server, io);
+
+    const idle = try connectRaw(io, background.port);
+    var write_buf: [1024]u8 = undefined;
+    var read_buf: [1024]u8 = undefined;
+    var writer = Io.net.Stream.Writer.init(idle, io, &write_buf);
+    var reader = Io.net.Stream.Reader.init(idle, io, &read_buf);
+    try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    try writer.interface.flush();
+    try readOneResponse(&reader.interface);
+
+    const started = monotonicNs(io);
+    const cut_off = server.stopGraceful(io, 5 * std.time.ns_per_s);
+    const elapsed = monotonicNs(io) - started;
+
+    // Nothing was in flight, so nothing was cut off — the connection was
+    // closed, which is not the same thing and not what the count is for.
+    try testing.expectEqual(@as(u32, 0), cut_off);
+    try testing.expect(elapsed < 2 * std.time.ns_per_s);
+
+    var closed_buf: [16]u8 = undefined;
+    try testing.expectError(error.EndOfStream, reader.interface.readSliceAll(&closed_buf));
+
+    idle.close(io);
+    background.thread.join();
+    server.deinit();
+    threaded.deinit();
+
+    try testing.expectEqual(std.heap.Check.ok, gpa.deinit());
+}
+
+// A connection opened after the stop has landed is never served: the server
+// takes no new ones, so the request either gets no answer or a socket that ends
+// under it. It is the listener closing with `run` that ends this one, which is
+// why the read waits for `run` to be gone first and cannot hang on a server
+// that meant to answer.
+test "integration: a connection opened during the drain is not served" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var threaded = Io.Threaded.init(gpa.allocator(), .{});
+    const io = threaded.io();
+
+    resetSlowHandler();
+
+    var server = httpz.Server.init(.{
+        .port = 0,
+        .address = "127.0.0.1",
+        .max_connections = 8,
+        .sweeper_interval_ms = 20,
+        .accept_poll_interval_ms = 20,
+    }, slowHandler);
+    const background = try startServer(&server, io);
+
+    const idle = try connectRaw(io, background.port);
+    var idle_write_buf: [1024]u8 = undefined;
+    var idle_read_buf: [1024]u8 = undefined;
+    var idle_writer = Io.net.Stream.Writer.init(idle, io, &idle_write_buf);
+    var idle_reader = Io.net.Stream.Reader.init(idle, io, &idle_read_buf);
+    try idle_writer.interface.writeAll("GET /fast HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    try idle_writer.interface.flush();
+    try readOneResponse(&idle_reader.interface);
+
+    // Hold a request in flight so that the drain has a reason to still be
+    // running when the late connection turns up.
+    var response: []const u8 = &.{};
+    const Requester = struct {
+        fn run(port: u16, out: *[]const u8) void {
+            out.* = rawRequest(port, "GET /slow HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n") catch return;
+        }
+    };
+    const requester = try std.Thread.spawn(.{}, Requester.run, .{ background.port, &response });
+    try waitForSlowHandler();
+
+    var cut_off: u32 = 0;
+    const Drainer = struct {
+        fn run(srv: *httpz.Server, sio: Io, out: *u32) void {
+            out.* = srv.stopGraceful(sio, 5 * std.time.ns_per_s);
+        }
+    };
+    const drainer = try std.Thread.spawn(.{}, Drainer.run, .{ &server, io, &cut_off });
+
+    var closed_buf: [16]u8 = undefined;
+    try testing.expectError(error.EndOfStream, idle_reader.interface.readSliceAll(&closed_buf));
+
+    // The drain has started, and this connection is opened after it did.
+    const late = try connectRaw(io, background.port);
+    var late_write_buf: [1024]u8 = undefined;
+    var late_writer = Io.net.Stream.Writer.init(late, io, &late_write_buf);
+    late_writer.interface.writeAll("GET /fast HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n") catch {};
+    late_writer.interface.flush() catch {};
+
+    slow_release.store(true, .release);
+    requester.join();
+    drainer.join();
+    background.thread.join();
+
+    // Nothing on the socket: no status line, no body, no response.
+    var late_buf: [512]u8 = undefined;
+    var late_reader = Io.net.Stream.Reader.init(late, io, &late_buf);
+    const late_bytes = late_reader.interface.readSliceShort(&late_buf) catch 0;
+    try testing.expectEqual(@as(usize, 0), late_bytes);
+
+    testing.allocator.free(response);
+    late.close(io);
+    idle.close(io);
+    server.deinit();
+    threaded.deinit();
+
+    try testing.expectEqual(std.heap.Check.ok, gpa.deinit());
+}
+
+// A drain that runs out of deadline cuts off what is left, says how much that
+// was, and gives the server its memory back all the same.
+test "integration: a graceful stop that runs out of deadline reports the connections it cut off" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var threaded = Io.Threaded.init(gpa.allocator(), .{});
+    const io = threaded.io();
+
+    resetSlowHandler();
+
+    var server = httpz.Server.init(.{
+        .port = 0,
+        .address = "127.0.0.1",
+        .max_connections = 8,
+        .sweeper_interval_ms = 20,
+        .accept_poll_interval_ms = 20,
+    }, slowHandler);
+    const background = try startServer(&server, io);
+
+    const Requester = struct {
+        fn run(port: u16) void {
+            const raw = rawRequest(port, "GET /slow HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n") catch return;
+            testing.allocator.free(raw);
+        }
+    };
+    const requester = try std.Thread.spawn(.{}, Requester.run, .{background.port});
+    try waitForSlowHandler();
+
+    // The request is still in flight when the deadline passes, so the stop does
+    // not wait for it: the one connection still serving is cut off and counted.
+    const cut_off = server.stopGraceful(io, 50 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u32, 1), cut_off);
+
+    // What the cut request's client got is not the point — it may be nothing at
+    // all. What matters is that the request was cut off rather than left to
+    // finish: `run` cancels the connection once the drain gives up on it, and
+    // the handler sees that as a cancelation.
+    const canceled = waitForSlowCanceled();
+    // Let the handler go either way, so that the joins below cannot outlive the
+    // failure they would be reporting.
+    slow_release.store(true, .release);
+    requester.join();
+    background.thread.join();
+    try canceled;
     server.deinit();
     threaded.deinit();
 

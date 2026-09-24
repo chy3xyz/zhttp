@@ -107,6 +107,11 @@ const POLLRDHUP: i16 = 0x2000;
 /// can suffer from the sweeper's own interval.
 const sweeper_max_sleep_ns = 50 * std.time.ns_per_ms;
 
+/// How long a drain waits between looks at the connections it is waiting on.
+/// The count moves only when a connection finishes, so this bounds how long the
+/// stop lingers after the last one does, not how long a request may take.
+const drain_poll_interval_ns = 2 * std.time.ns_per_ms;
+
 /// CLOSE-WAIT sweeper config.
 ///
 /// Each accepted connection's fd is registered with the sweeper. A background
@@ -207,6 +212,82 @@ const ConnSweeper = struct {
     }
 };
 
+/// The connections `run` is serving, so that a graceful stop can tell one that
+/// is waiting for its next request from one that is answering a request it
+/// already has: only the ones waiting are closed early, and only the others
+/// are worth waiting for.
+///
+/// Each connection keeps its entry on its own task's stack and registers a
+/// pointer to it for as long as it is being served, so a registered pointer
+/// names one connection for that whole lifetime.
+const Connections = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    list: std.ArrayList(*Conn) = .empty,
+    allocator: std.mem.Allocator,
+
+    const Conn = struct {
+        fd: Io.net.Socket.Handle,
+        /// True while the connection is blocked reading its next request,
+        /// which is the only moment closing it can lose no work.
+        idle: std.atomic.Value(bool) = .init(false),
+    };
+
+    fn lock(self: *Connections) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn add(self: *Connections, conn: *Conn) void {
+        self.lock();
+        defer self.mutex.unlock();
+        self.list.append(self.allocator, conn) catch {};
+    }
+
+    fn remove(self: *Connections, conn: *Conn) void {
+        self.lock();
+        defer self.mutex.unlock();
+        for (self.list.items, 0..) |existing, i| {
+            if (existing == conn) {
+                _ = self.list.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// How many connections are being served, whether or not they have a
+    /// request in flight. Counted here rather than from
+    /// `active_connections`, which is only maintained when `max_connections`
+    /// asks for a limit.
+    fn count(self: *Connections) usize {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.list.items.len;
+    }
+
+    /// Closes the connections that are waiting for their next request. They owe
+    /// a client nothing — the response to the request they served was written
+    /// before they went back to reading — and a stop that waited for them would
+    /// wait out their keep-alive timeout with their sockets, and the process,
+    /// up for that long.
+    ///
+    /// `shutdown` and not `close`: it is what breaks the read the connection
+    /// task is blocked in, while the fd stays the task's to close, so the two
+    /// cannot race over it.
+    fn closeIdle(self: *Connections) void {
+        self.lock();
+        defer self.mutex.unlock();
+        for (self.list.items) |conn| {
+            if (conn.idle.load(.acquire)) {
+                _ = std.posix.system.shutdown(conn.fd, std.posix.SHUT.RDWR);
+            }
+        }
+    }
+
+    fn deinit(self: *Connections) void {
+        std.debug.assert(self.list.items.len == 0);
+        self.list.deinit(self.allocator);
+    }
+};
+
 config: Config,
 handler: Connection.Handler,
 active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -218,6 +299,18 @@ port: std.atomic.Value(u16) = .init(0),
 /// Set by `stop` and read by the accept loop, so the server can be brought
 /// down from another thread.
 stopping: std.atomic.Value(bool) = .init(false),
+/// Set by `stopGraceful`: no connection is to be taken on, and the ones being
+/// served are to be answered and closed rather than cut off. Read by the accept
+/// loop, by the connection loops and by the read of the stop flag in `run`.
+draining: std.atomic.Value(bool) = .init(false),
+/// Set by `stopGraceful` when the drain is over — the deadline passed or the
+/// connections finished. `run` waits for it before it cancels what is left of
+/// them, which is what makes the drain a drain.
+drained: std.atomic.Value(bool) = .init(false),
+/// The connections `run` is serving. Held for the life of the `Server` rather
+/// than for the life of a `run`, so that a `stopGraceful` alongside an abrupt
+/// `stop` cannot be reading a registry that went away underneath it.
+connections: Connections = .{ .allocator = std.heap.page_allocator },
 
 pub fn init(config: Config, handler: Connection.Handler) Server {
     return .{
@@ -242,20 +335,84 @@ pub fn boundPort(self: *const Server) u16 {
 /// being cancelled. This is a stop, not a graceful shutdown: a request in
 /// flight is cut off where it stands, its connection is closed without a
 /// response, and a keep-alive connection waiting for its next request gets
-/// closed instead. Nothing tries to drain or to tell the peer why.
+/// closed instead. Nothing tries to drain or to tell the peer why. `stopGraceful`
+/// is the other half of that choice, and an abrupt stop supersedes a drain in
+/// progress: the connections a drain was giving time to are cancelled.
 pub fn stop(self: *Server) void {
     self.stopping.store(true, .release);
 }
 
+/// Stops accepting, lets the connections already being served finish, and
+/// cancels whatever is still running when `timeout_ns` passes. Returns how many
+/// connections were still open then — the ones that were cut off — which is 0
+/// when every one of them had finished.
+///
+/// Callable from another thread or task while `run` serves. What it promises:
+///
+/// - No new connection is accepted. One taken as the stop lands is closed
+///   without a response, and one that is still in the listen backlog is dropped
+///   when the listener closes with `run`: the server does not answer late
+///   arrivals with `Connection: close`, it declines to serve them at all.
+/// - A connection that is idle between requests is closed rather than kept
+///   open. That is where a stop that only waited would spend most of its time,
+///   so it is also the reason an idle keep-alive connection does not count
+///   against the deadline.
+/// - A request already being handled gets until the deadline to answer, and its
+///   response says `Connection: close`, so the client knows not to reuse the
+///   connection for anything else.
+/// - When the deadline passes, the connections still serving are cancelled
+///   where they stand: their clients get a truncated response or none at all.
+///   The returned count is how many that was, and it is also logged.
+///
+/// HTTP/2 connections (ALPN or h2c) and WebSocket sessions are not drained:
+/// they have no request boundary to stop at, so they count as in flight for the
+/// whole deadline and are cut off by it.
+///
+/// `run` returns shortly after this does — within `accept_poll_interval_ms`,
+/// plus however long the cancelled connections take to unwind — so a caller
+/// that wants the server gone, and its memory back, joins its `run` next.
+pub fn stopGraceful(self: *Server, io: Io, timeout_ns: u64) u32 {
+    self.draining.store(true, .release);
+
+    // Nothing is in flight on a connection that is waiting for its next
+    // request, so closing those loses nothing; whatever is left is what the
+    // deadline is for.
+    self.connections.closeIdle();
+
+    const deadline = Io.Clock.Timestamp.fromNow(io, .{
+        .raw = Io.Duration.fromNanoseconds(timeout_ns),
+        .clock = .awake,
+    });
+
+    while (self.connections.count() > 0 and
+        !self.stopping.load(.acquire) and
+        deadline.durationFromNow(io).raw.nanoseconds > 0)
+    {
+        Io.sleep(io, Io.Duration.fromNanoseconds(drain_poll_interval_ns), .awake) catch break;
+    }
+
+    const cut_off: u32 = @intCast(self.connections.count());
+    if (cut_off > 0) {
+        std.log.warn("graceful stop: {d} connection(s) still served after the {d}ns deadline", .{ cut_off, timeout_ns });
+    }
+
+    // The connections counted above are the ones `run` is about to cancel, so
+    // it waits for this before it does.
+    self.drained.store(true, .release);
+    return cut_off;
+}
+
 /// Releases what the server holds. Everything the server owns — the listening
 /// socket, the accepted connections, the CLOSE-WAIT sweeper — belongs to `run`
-/// and is gone by the time `run` returns, so after a stopped server this only
-/// checks that nothing was left behind. It exists so that a caller that has
-/// initialised a `Server` has the closing half of `init` to call.
+/// and is gone by the time `run` returns, so after a stopped server the only
+/// thing left to release is the connection registry, which outlives a `run` on
+/// purpose. It exists so that a caller that has initialised a `Server` has the
+/// closing half of `init` to call.
 pub fn deinit(self: *Server) void {
     std.debug.assert(self.sweeper == null);
     std.debug.assert(self.active_connections.load(.monotonic) == 0);
     std.debug.assert(self.port.load(.acquire) == 0);
+    self.connections.deinit();
 }
 
 /// Start the server. This is the main entry point for running the HTTP server
@@ -317,7 +474,7 @@ pub fn run(self: *Server, io: Io) RunError!void {
     var connection_group: Io.Group = .init;
     defer connection_group.cancel(io);
 
-    while (!self.stopping.load(.acquire)) {
+    while (!self.stopping.load(.acquire) and !self.draining.load(.acquire)) {
         // `accept` blocks with no timeout and a listening socket cannot be
         // woken from another thread, so wait for a pending connection rather
         // than blocking in accept: the loop then reads the stop flag at least
@@ -330,6 +487,14 @@ pub fn run(self: *Server, io: Io) RunError!void {
             std.debug.print("Accept error: {}\n", .{err});
             continue;
         };
+
+        // A connection taken as the drain lands is one the server will never
+        // answer. Closing it here keeps it out of the group, where a task
+        // cancelled before it ran would never have got as far as closing it.
+        if (self.draining.load(.acquire)) {
+            stream.close(io);
+            break;
+        }
 
         // Enforce connection limit atomically: increment first, then check.
         // This avoids the TOCTOU race where concurrent accepts could both
@@ -353,6 +518,16 @@ pub fn run(self: *Server, io: Io) RunError!void {
             continue;
         };
     }
+
+    // A drain is not a cancel: its caller asked for the connections being
+    // served to be given their deadline, so the group is left to itself until
+    // the drain is over. An abrupt stop supersedes one and ends the wait, so
+    // that `stop` keeps its meaning even next to a drain.
+    if (self.draining.load(.acquire)) {
+        while (!self.drained.load(.acquire) and !self.stopping.load(.acquire)) {
+            Io.sleep(io, Io.Duration.fromNanoseconds(drain_poll_interval_ns), .awake) catch break;
+        }
+    }
 }
 
 /// Waits up to `timeout_ms` for a connection to be pending on the listening
@@ -372,7 +547,7 @@ fn pollReadable(fd: Io.net.Socket.Handle, timeout_ms: u32) bool {
 /// (keep-alive).
 ///
 /// RFC 2616 Section 8.1: Persistent Connections
-fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
+fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io, state: *Connections.Conn) !void {
     const fd = stream.socket.handle;
 
     // TLS handshake if configured — OpenSSL uses the socket fd directly
@@ -491,6 +666,15 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
     defer std.heap.page_allocator.free(request_buf);
 
     while (true) {
+        // Nothing is in flight on the connection while it waits for its next
+        // request, and that is the state a graceful stop closes connections in:
+        // it shuts the socket down under this read rather than wait out a
+        // deadline for a request that may never come. The stop flag is read
+        // after the mark, so a stop that looked in between sees the mark and
+        // this read sees the stop — either way the connection does not wait.
+        state.idle.store(true, .release);
+        if (self.draining.load(.acquire)) return;
+
         // Read request headers into a sub-slice limited by max_header_size
         // to prevent unterminated headers from consuming the full request buffer.
         const header_limit = @min(self.config.max_header_size, request_buf.len);
@@ -498,6 +682,7 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             error.EndOfStream => return, // Client closed connection
             error.ReadFailed => return, // Timeout or connection reset
         };
+        state.idle.store(false, .release);
 
         // RFC 2616 Section 14.20: Check for Expect header.
         // If "100-continue", send 100 Continue before reading body.
@@ -645,6 +830,14 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io) !void {
             }
         }
 
+        // RFC 2616 Section 8.1: A graceful stop ends the keep-alive here, and
+        // says so, so the client does not send its next request into a socket
+        // the server is about to close. A 101 upgrade carries a `Connection`
+        // header of its own and is left alone.
+        if (self.draining.load(.acquire) and response.headers.get("Connection") == null) {
+            response.headers.appendServer("Connection", "close");
+        }
+
         // Serialize and send response
         var resp_buf: [Response.max_response_header_len]u8 = undefined;
 
@@ -743,7 +936,15 @@ fn handleConnectionTask(self: *Server, stream: Io.net.Stream, io: Io) Io.Cancela
     if (self.sweeper) |sw| sw.register(stream.socket.handle);
     defer if (self.sweeper) |sw| sw.unregister(stream.socket.handle);
 
-    self.handleConnection(stream, io) catch |err| {
+    // A graceful stop finds this connection through its state. The state is on
+    // this task's stack, so the pointer names one connection for as long as it
+    // is registered, and it is deregistered before the fd is closed — the defer
+    // below runs ahead of the one above.
+    var state: Connections.Conn = .{ .fd = stream.socket.handle };
+    self.connections.add(&state);
+    defer self.connections.remove(&state);
+
+    self.handleConnection(stream, io, &state) catch |err| {
         std.debug.print("Connection error: {}\n", .{err});
     };
 }
