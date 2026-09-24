@@ -40,11 +40,23 @@ fn lowerHeaderName(buf: *[256]u8, name: []const u8) []const u8 {
 ///
 /// The caller provides the reader/writer that sit on top of TLS
 /// (or raw TCP for h2c).
-pub fn serve(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) void {
-    serveImpl(reader, writer, handler, io) catch {};
+/// What the server tells a connection it is serving, so that a graceful stop
+/// can drain it rather than cut it off.
+pub const Drain = struct {
+    /// Whether this connection has nothing in flight. The server's graceful stop
+    /// closes the connections that are waiting for their next request, and this
+    /// is how an HTTP/2 connection says it is one of them.
+    idle: *std.atomic.Value(bool),
+    /// Set by `Server.stopGraceful`: send the peer a GOAWAY and finish the
+    /// streams already open.
+    draining: *const std.atomic.Value(bool),
+};
+
+pub fn serve(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io, drain: ?Drain) void {
+    serveImpl(reader, writer, handler, io, drain) catch {};
 }
 
-fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !void {
+fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io, drain: ?Drain) !void {
     // --- Connection Preface (RFC 9113 §3.4) ---
     // Client must send the 24-byte preface, then a SETTINGS frame.
     // We validate the preface, then send our own SETTINGS + ACK.
@@ -130,8 +142,22 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
     var rst_stream_count: u32 = 0;
     const max_rst_stream_per_cycle: u32 = 100;
 
+    // Set once the GOAWAY of a graceful stop has gone out.
+    var draining_sent = false;
+
     // --- Frame loop ---
     while (true) {
+        if (drain) |d| {
+            // Nothing is in flight while this is waiting for a frame, which is
+            // the state a graceful stop closes connections in: marking it here,
+            // right before the read, leaves the mark wrong for as little time
+            // as possible — and the read is what the server's shutdown breaks.
+            d.idle.store(true, .release);
+            // Everything this connection had has been answered: there is nothing
+            // left to drain.
+            if (draining_sent and registry.activeCount() == 0) return;
+        }
+
         const f = readFrameFromReader(reader) catch |err| switch (err) {
             error.EndOfStream => return,
             else => {
@@ -139,6 +165,9 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
                 return;
             },
         };
+
+        // A frame is being handled now, whatever it turns out to be.
+        if (drain) |d| d.idle.store(false, .release);
 
         // Settings timeout detection (RFC 9113 §6.5.3)
         settings_sync.frameReceived() catch {
@@ -502,6 +531,19 @@ fn serveImpl(reader: *Io.Reader, writer: *Io.Writer, handler: Handler, io: Io) !
             _ => {
                 // Unknown frame types MUST be ignored (RFC 9113 §4.1)
             },
+        }
+
+        if (drain) |d| {
+            if (!draining_sent and d.draining.load(.acquire)) {
+                // RFC 9113 §6.8: tell the peer not to open another stream here.
+                // The GOAWAY names the last stream this connection has accepted,
+                // which is why it is sent after the frame that named it rather
+                // than before it is read; the streams already open are served,
+                // and the ids above it are refused.
+                try sendGoaway(writer, last_client_stream_id, .no_error);
+                registry.goaway(last_client_stream_id);
+                draining_sent = true;
+            }
         }
 
         // Periodic GC of closed streams and reset DoS counters
@@ -953,4 +995,143 @@ fn readFrameFromReader(reader: *Io.Reader) !frame.Frame {
 fn sendGoaway(writer: *Io.Writer, last_stream_id: u31, error_code: ErrorCode) !void {
     try frame.writeGoaway(writer, last_stream_id, error_code, &.{});
     try writer.flush();
+}
+
+// --- Tests ---
+
+const testing = std.testing;
+
+/// Set by the handler once it has been called, so the test can ask for a drain
+/// while the connection is serving a request.
+var handler_calls = std.atomic.Value(usize).init(0);
+
+fn drainTestHandler(
+    allocator: std.mem.Allocator,
+    _: Io,
+    _: *const Request,
+) Response {
+    _ = allocator;
+    _ = handler_calls.fetchAdd(1, .release);
+    return Response.init(.ok, "text/plain", "OK");
+}
+
+/// Walks the frames a server wrote, one at a time.
+const FrameReader = struct {
+    data: []const u8,
+    pos: usize = 0,
+
+    fn next(self: *FrameReader) ?struct { header: FrameHeader, payload: []const u8 } {
+        if (self.pos + frame.header_size > self.data.len) return null;
+        const header = FrameHeader.parse(self.data[self.pos..][0..frame.header_size]);
+        const start = self.pos + frame.header_size;
+        if (start + header.length > self.data.len) return null;
+        self.pos = start + header.length;
+        return .{ .header = header, .payload = self.data[start..self.pos] };
+    }
+};
+
+// A graceful stop has to reach an HTTP/2 connection as a GOAWAY: a client told
+// nothing would open its next request on a connection the server is about to
+// close. The GOAWAY names the last stream the connection accepted — including
+// the one that is being served — and the connection then ends itself once the
+// streams it had are answered, which is what lets the server's drain finish
+// instead of running to its deadline.
+test "h2: a drain sends GOAWAY with the streams it accepted and then ends" {
+    handler_calls.store(0, .release);
+
+    var client_input: [512]u8 = undefined;
+    var client_writer: Io.Writer = .fixed(&client_input);
+
+    try client_writer.writeAll(frame.connection_preface);
+    try frame.writeSettings(&client_writer, &.{});
+
+    // One request: GET /, with END_STREAM so the server answers immediately.
+    var block: [128]u8 = undefined;
+    var table_buf: [1024]u8 = undefined;
+    var table_entries: [16]hpack.DynamicTable.Entry = undefined;
+    var encoder = hpack.Encoder.init(&table_buf, &table_entries);
+    var block_len: usize = 0;
+    block_len += try encoder.encodeHeader(block[block_len..], ":method", "GET");
+    block_len += try encoder.encodeHeader(block[block_len..], ":scheme", "https");
+    block_len += try encoder.encodeHeader(block[block_len..], ":path", "/");
+    block_len += try encoder.encodeHeader(block[block_len..], ":authority", "example.com");
+    try frame.writeFrame(&client_writer, .headers, .{ .value = Flags.end_headers | Flags.end_stream }, 1, block[0..block_len]);
+
+    // Frames after the request, so the loop has something to read while the
+    // drain is asked for from this thread.
+    var ping: [8]u8 = @splat(0);
+    for (0..8) |_| try frame.writeFrame(&client_writer, .ping, Flags.none, 0, &ping);
+
+    var in: Io.Reader = .fixed(client_writer.buffered());
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.ensureUnusedCapacity(1);
+
+    var idle = std.atomic.Value(bool).init(false);
+    var draining = std.atomic.Value(bool).init(false);
+
+    const Server = struct {
+        fn run(
+            r: *Io.Reader,
+            w: *Io.Writer,
+            idle_flag: *std.atomic.Value(bool),
+            draining_flag: *const std.atomic.Value(bool),
+        ) void {
+            serveImpl(r, w, drainTestHandler, testing.io, .{
+                .idle = idle_flag,
+                .draining = draining_flag,
+            }) catch {};
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Server.run, .{ &in, &out.writer, &idle, &draining });
+
+    // The request is being served: ask for the drain now, so the GOAWAY has to
+    // name the stream it is serving rather than refuse it.
+    while (handler_calls.load(.acquire) == 0) std.Thread.yield() catch {};
+    draining.store(true, .release);
+
+    // The connection ends itself once its streams are answered, so joining it
+    // cannot hang; a drain that refused the request would end the same way but
+    // would have no response to show.
+    thread.join();
+
+    var frames: FrameReader = .{ .data = out.writer.buffered() };
+    var saw_goaway = false;
+    var saw_response = false;
+    while (frames.next()) |f| {
+        switch (f.header.frame_type) {
+            .goaway => {
+                const last_stream_id = mem.readInt(u32, f.payload[0..4], .big) & 0x7FFFFFFF;
+                const code = mem.readInt(u32, f.payload[4..8], .big);
+                try testing.expectEqual(@as(u32, 1), last_stream_id);
+                try testing.expectEqual(@as(u32, 0), code);
+                saw_goaway = true;
+            },
+            .headers => if (f.header.stream_id == 1) {
+                // The status arrives as an HPACK field, so it is decoded rather
+                // than searched for.
+                var hdr_buf: [1024]u8 = undefined;
+                var hdr_entries: [16]hpack.DynamicTable.Entry = undefined;
+                var decoder = hpack.Decoder.init(&hdr_buf, &hdr_entries);
+                var fields: [16]hpack.HeaderField = undefined;
+                const count = try decoder.decode(f.payload, &fields);
+                var saw_status = false;
+                for (fields[0..count]) |field| {
+                    if (mem.eql(u8, field.name, ":status")) {
+                        try testing.expectEqualStrings("200", field.value);
+                        saw_status = true;
+                    }
+                }
+                try testing.expect(saw_status);
+                saw_response = true;
+            },
+            .data => if (f.header.stream_id == 1) {
+                try testing.expectEqualStrings("OK", f.payload);
+            },
+            else => {},
+        }
+    }
+    try testing.expect(saw_response);
+    try testing.expect(saw_goaway);
+    try testing.expectEqual(@as(usize, 1), handler_calls.load(.acquire));
 }

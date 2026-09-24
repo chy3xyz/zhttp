@@ -621,7 +621,10 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io, state: *Connec
     if (tls_conn) |tc| {
         if (tc.alpn_protocol) |proto| {
             if (std.mem.eql(u8, proto, "h2")) {
-                H2Connection.serve(reader, writer, self.handler, io);
+                H2Connection.serve(reader, writer, self.handler, io, .{
+                    .idle = &state.idle,
+                    .draining = &self.draining,
+                });
                 return;
             }
         }
@@ -654,7 +657,10 @@ fn handleConnection(self: *Server, stream: Io.net.Stream, io: Io, state: *Connec
             if (data.len >= h2.connection_preface.len and
                 std.mem.eql(u8, data[0..h2.connection_preface.len], h2.connection_preface))
             {
-                H2Connection.serve(reader, writer, self.handler, io);
+                H2Connection.serve(reader, writer, self.handler, io, .{
+                    .idle = &state.idle,
+                    .draining = &self.draining,
+                });
                 return;
             }
         }

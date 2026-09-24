@@ -64,6 +64,34 @@ pub fn init(config: Config, handler: Connection.Handler) Server
 pub fn run(self: *Server, io: Io) RunError!void
 ```
 
+```zig
+/// Port the listener is bound to while `run` is serving, 0 when it is not.
+/// Read this when the config asked for an ephemeral port (`port = 0`).
+pub fn boundPort(self: *const Server) u16
+
+/// Take the server down: `run` closes what it is serving and returns.
+/// Abrupt — a request in flight is cut off where it stands.
+pub fn stop(self: *Server) void
+
+/// Drain the server instead: stop accepting, close the connections that are
+/// waiting for their next request, give the requests being served until
+/// `timeout_ns` to answer, then cancel what is left. Returns how many
+/// connections it had to cut off, which is 0 when every request finished.
+/// An abrupt `stop` supersedes a drain in progress.
+pub fn stopGraceful(self: *Server, io: Io, timeout_ns: u64) u32
+
+/// Release what the server holds. `run` owns everything it serves and has
+/// given it all back by the time it returns, so this only checks that.
+pub fn deinit(self: *Server) void
+```
+
+A drain reaches both protocols a connection can speak. An HTTP/1.1 connection
+that is between requests is closed under its read; one that is serving gets its
+deadline and answers with `Connection: close`. An HTTP/2 connection is sent a
+GOAWAY naming the last stream it accepted — the streams already open are
+finished, the ids above it are refused — and it ends itself once those streams
+are answered.
+
 ### `Connection.Handler`
 
 ```zig
