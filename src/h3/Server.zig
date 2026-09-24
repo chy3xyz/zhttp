@@ -134,6 +134,11 @@ pub const Server = struct {
     /// read from the server's own thread — this says the same thing from any
     /// thread, so a test can wait for the state rather than for the clock.
     closing_connections: std.atomic.Value(usize) = .init(0),
+    /// How many connections are being served. A connection owns several routing
+    /// entries, so the table's length is not the answer, and the table itself
+    /// may only be read from the server's own thread — this says the same thing
+    /// from any thread, which is what a test or a metrics endpoint needs.
+    connections: std.atomic.Value(usize) = .init(0),
 
     const reap_interval_ns = 1 * std.time.ns_per_s;
     /// How long the loop may wait in `poll` while a drain is in progress: the
@@ -172,6 +177,12 @@ pub const Server = struct {
     /// abrupt stop supersedes a drain in progress.
     pub fn stop(self: *Server) void {
         self.stopping.store(true, .release);
+    }
+
+    /// How many connections are being served right now. Safe to read from any
+    /// thread, unlike the routing table this is counted from.
+    pub fn connectionCount(self: *const Server) usize {
+        return self.connections.load(.acquire);
     }
 
     /// Stops taking new connections and new requests, lets the requests in
@@ -559,6 +570,9 @@ pub const Server = struct {
             self.dropConnection(conn);
             return err;
         };
+        // The connection is routable from here on, and `dropConnection` is the
+        // single exit every connection takes, so the two keep this exact.
+        _ = self.connections.fetchAdd(1, .monotonic);
         // Until it hears from us, the client addresses its Initial and Handshake
         // packets to the connection ID it chose itself, so that alias has to
         // route to this connection too.
@@ -661,6 +675,7 @@ pub const Server = struct {
         }
         for (keys.items) |key| _ = self.listener.connections.remove(key);
 
+        _ = self.connections.fetchSub(1, .monotonic);
         if (h3Conn(conn)) |h3| {
             // Every connection leaves through here — reaped, dropped by an
             // error, or taken down by `deinit`/`stop` — so this is where a

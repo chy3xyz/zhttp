@@ -327,9 +327,10 @@ test "h3: server drops a connection as soon as the client closes it" {
     const body = try client.get("/");
     defer allocator.free(body);
     try std.testing.expectEqualStrings("OK", body);
-    // One connection, but several routing entries: the client's original
-    // connection ID plus the ones ngtcp2 issues.
-    try std.testing.expect(server.listener.connections.count() > 0);
+    // One connection, however many routing entries it owns. The count is read
+    // from the server's own bookkeeping rather than from the routing table,
+    // which the server thread mutates.
+    try std.testing.expect(server.connectionCount() > 0);
 
     // The close frame tells the server to drop the connection instead of
     // waiting out its idle timeout.
@@ -337,7 +338,7 @@ test "h3: server drops a connection as soon as the client closes it" {
 
     var waited: usize = 0;
     while (waited < 100) : (waited += 1) {
-        if (server.listener.connections.count() == 0) return;
+        if (server.connectionCount() == 0) return;
         sleepMs(50);
     }
     return error.ConnectionNotReaped;
@@ -627,11 +628,11 @@ test "h3: a reader that fails breaks its stream, not the server" {
 
     var client = try Client.init(allocator, "127.0.0.1", port, .{ .insecure_skip_verify = true });
     // The reader fails the stream, which the server answers by closing the
-    // connection: the client is told, rather than waiting out its own timeout.
-    if (client.get("/broken")) |body| {
-        allocator.free(body);
-        return error.ExpectedStreamFailure;
-    } else |_| {}
+    // connection: the client is told that, rather than waiting out its own
+    // timeout. Which of the two it hears is pinned: `error.Timeout` would mean
+    // the server never told it anything, and that is what this test is here to
+    // catch.
+    try std.testing.expectError(error.ConnectionClosed, client.get("/broken"));
     client.deinit();
 
     // A connection that never touched the broken response is unaffected.
@@ -707,7 +708,7 @@ test "h3: a second client is served while a large response is in flight" {
     // Once the server knows about A, its response is on its way; a moment later
     // the second client arrives while that transfer is still running.
     var waited: usize = 0;
-    while (server.listener.connections.count() == 0 and waited < 500) : (waited += 1) sleepMs(10);
+    while (server.connectionCount() == 0 and waited < 500) : (waited += 1) sleepMs(10);
     sleepMs(150);
 
     // Client B's request has to be answered on its own connection meanwhile.
