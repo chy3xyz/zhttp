@@ -15,8 +15,14 @@ jobs:
       # The released compiler, not master: `build.zig.zon` declares
       # `minimum_zig_version = "0.17.0"`, and a job that tracked master would
       # go red for reasons that have nothing to do with this library.
+      #
+      # v2 of the action and not v1: v1 asks for archives named
+      # `zig-<os>-<arch>-<version>.tar.xz`, which no longer exist — 0.17.0 is
+      # published as `zig-<arch>-<os>-<version>.tar.xz` — so it 404s on every
+      # mirror and then falls back to the master channel, which is what failed
+      # every run from v0.15.0 on.
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
 
