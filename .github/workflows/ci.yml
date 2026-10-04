@@ -12,10 +12,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The released compiler, not master: `build.zig.zon` declares
+      # `minimum_zig_version = "0.17.0"`, and a job that tracked master would
+      # go red for reasons that have nothing to do with this library.
       - name: Setup Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: master
+          version: 0.17.0
 
       - name: Install Dependencies
         run: |

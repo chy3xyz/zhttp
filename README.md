@@ -784,7 +784,10 @@ httpz.Server.init(.{
 
 ## Building & Testing
 
-Requires **Zig 0.17** and **OpenSSL 3** (for TLS support).
+Requires **Zig 0.17.0** — the released compiler, which is what CI and
+`build.zig.zon`'s `minimum_zig_version` both name — and **OpenSSL 3** (for TLS
+support).
+
 `libngtcp2` and `libnghttp3` are only needed for HTTP/3 (`-Dh3=true`), which is off by default.
 
 ```sh
