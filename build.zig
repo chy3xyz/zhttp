@@ -6,9 +6,19 @@ pub fn build(b: *std.Build) void {
 
     const h3 = b.option(bool, "h3", "Enable HTTP/3 support (requires nghttp3 and ngtcp2)") orelse false;
 
-    // Include paths — configurable via -D flags for cross-platform support.
-    // Defaults work for macOS Homebrew. Override for Linux/pkg-config paths.
+    // Include and library paths — configurable via -D flags for cross-platform
+    // support. Defaults work for macOS Homebrew. Override for Linux/pkg-config
+    // paths: the libraries are found on the system's own search path unless a
+    // directory is named here, which is how CI builds its own copies.
     const openssl_include = b.option([]const u8, "openssl-include", "Path to OpenSSL include directory") orelse "/opt/homebrew/opt/openssl@3/include";
+    const openssl_lib = b.option([]const u8, "openssl-lib", "Path to the OpenSSL library directory");
+    const ngtcp2_lib = b.option([]const u8, "ngtcp2-lib", "Path to the libngtcp2 library directory");
+    const nghttp3_lib = b.option([]const u8, "nghttp3-lib", "Path to the libnghttp3 library directory");
+    const lib_paths: LibPaths = .{
+        .openssl = openssl_lib,
+        .ngtcp2 = ngtcp2_lib,
+        .nghttp3 = nghttp3_lib,
+    };
 
     // Hand-written OpenSSL bindings (see src/openssl_c.zig) — no C translation,
     // so no OpenSSL headers are needed to build.
@@ -60,7 +70,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = zhttp_imports,
     });
-    linkSystemLibraries(zhttp_mod, h3);
+    linkSystemLibraries(zhttp_mod, lib_paths, h3);
 
     // Example executables
     const examples = [_][]const u8{
@@ -132,7 +142,7 @@ pub fn build(b: *std.Build) void {
         .optimize = bench_optimize,
         .imports = zhttp_imports,
     });
-    linkSystemLibraries(bench_zhttp_mod, h3);
+    linkSystemLibraries(bench_zhttp_mod, lib_paths, h3);
 
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("benches/bench_http.zig"),
@@ -189,10 +199,21 @@ pub fn build(b: *std.Build) void {
 
 /// Everything the library needs from the system: OpenSSL always, and the QUIC
 /// and HTTP/3 libraries when the h3 layer is built in.
-fn linkSystemLibraries(mod: *std.Build.Module, h3: bool) void {
+/// Where the libraries linked below live, when they are not on the system's own
+/// search path. A null field means "look it up the usual way".
+const LibPaths = struct {
+    openssl: ?[]const u8 = null,
+    ngtcp2: ?[]const u8 = null,
+    nghttp3: ?[]const u8 = null,
+};
+
+fn linkSystemLibraries(mod: *std.Build.Module, libs: LibPaths, h3: bool) void {
+    if (libs.openssl) |path| mod.addLibraryPath(.{ .cwd_relative = path });
     mod.linkSystemLibrary("ssl", .{});
     mod.linkSystemLibrary("crypto", .{});
     if (h3) {
+        if (libs.ngtcp2) |path| mod.addLibraryPath(.{ .cwd_relative = path });
+        if (libs.nghttp3) |path| mod.addLibraryPath(.{ .cwd_relative = path });
         mod.linkSystemLibrary("ngtcp2", .{});
         mod.linkSystemLibrary("ngtcp2_crypto_ossl", .{});
         mod.linkSystemLibrary("nghttp3", .{});

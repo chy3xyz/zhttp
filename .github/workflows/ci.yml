@@ -29,7 +29,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev libngtcp2-dev libnghttp3-dev
+          sudo apt-get install -y libssl-dev cmake ninja-build
 
       - name: Run Tests
         run: zig build test
@@ -42,8 +42,32 @@ jobs:
       - name: Build Examples
         run: zig build
 
+      # The distribution's libngtcp2 and libnghttp3 are older than the APIs the
+      # HTTP/3 layer uses, so the versions this library is developed against are
+      # built here. The include and library directories are passed to the build
+      # with the -D flags it takes for exactly this.
+      - name: Build libngtcp2 and libnghttp3
+        run: |
+          set -eux
+          prefix="$RUNNER_TEMP/h3"
+          git clone --depth 1 --branch v1.24.0 https://github.com/ngtcp2/ngtcp2 "$RUNNER_TEMP/ngtcp2"
+          cmake -S "$RUNNER_TEMP/ngtcp2" -B "$RUNNER_TEMP/ngtcp2/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DENABLE_OPENSSL=ON -DENABLE_LIB_ONLY=ON \
+            -DCMAKE_INSTALL_PREFIX="$prefix"
+          cmake --build "$RUNNER_TEMP/ngtcp2/build" -j"$(nproc)"
+          cmake --install "$RUNNER_TEMP/ngtcp2/build"
+
+          git clone --depth 1 --branch v1.17.0 https://github.com/ngtcp2/nghttp3 "$RUNNER_TEMP/nghttp3"
+          cmake -S "$RUNNER_TEMP/nghttp3" -B "$RUNNER_TEMP/nghttp3/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DENABLE_LIB_ONLY=ON \
+            -DCMAKE_INSTALL_PREFIX="$prefix"
+          cmake --build "$RUNNER_TEMP/nghttp3/build" -j"$(nproc)"
+          cmake --install "$RUNNER_TEMP/nghttp3/build"
+
       # HTTP/3 is opt-in, so it needs its own pass to stay covered.
       - name: Run Tests and Build with HTTP/3
+        env:
+          H3: -Dh3=true -Dngtcp2-include=${{ runner.temp }}/h3/include -Dngtcp2-lib=${{ runner.temp }}/h3/lib -Dnghttp3-include=${{ runner.temp }}/h3/include -Dnghttp3-lib=${{ runner.temp }}/h3/lib -Dopenssl-include=/usr/include
         run: |
-          zig build test -Dh3=true
-          zig build -Dh3=true
+          zig build test $H3
+          zig build $H3
