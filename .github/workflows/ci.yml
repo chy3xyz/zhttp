@@ -82,9 +82,13 @@ jobs:
         run: |
           set -eux
           prefix="$RUNNER_TEMP/h3"
-          git clone --depth 1 --branch v1.24.0 https://github.com/ngtcp2/ngtcp2 "$RUNNER_TEMP/ngtcp2"
+          # The submodules too: libngtcp2's tests want munit, and CMake fails
+          # outright when it cannot find it.
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            --branch v1.24.0 https://github.com/ngtcp2/ngtcp2 "$RUNNER_TEMP/ngtcp2"
           cmake -S "$RUNNER_TEMP/ngtcp2" -B "$RUNNER_TEMP/ngtcp2/build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DENABLE_OPENSSL=ON -DENABLE_LIB_ONLY=ON \
+            -DBUILD_TESTING=OFF \
             -DOPENSSL_ROOT_DIR="$prefix" -DCMAKE_INSTALL_PREFIX="$prefix"
           cmake --build "$RUNNER_TEMP/ngtcp2/build" -j"$(nproc)"
           cmake --install "$RUNNER_TEMP/ngtcp2/build"
@@ -93,9 +97,10 @@ jobs:
         run: |
           set -eux
           prefix="$RUNNER_TEMP/h3"
-          git clone --depth 1 --branch v1.17.0 https://github.com/ngtcp2/nghttp3 "$RUNNER_TEMP/nghttp3"
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            --branch v1.17.0 https://github.com/ngtcp2/nghttp3 "$RUNNER_TEMP/nghttp3"
           cmake -S "$RUNNER_TEMP/nghttp3" -B "$RUNNER_TEMP/nghttp3/build" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DENABLE_LIB_ONLY=ON \
+            -DCMAKE_BUILD_TYPE=Release -DENABLE_LIB_ONLY=ON -DBUILD_TESTING=OFF \
             -DCMAKE_INSTALL_PREFIX="$prefix"
           cmake --build "$RUNNER_TEMP/nghttp3/build" -j"$(nproc)"
           cmake --install "$RUNNER_TEMP/nghttp3/build"
