@@ -7,6 +7,7 @@ on:
     branches: [ main ]
 
 jobs:
+  # The HTTP/1.1 and HTTP/2 library, on the released compiler.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -20,7 +21,7 @@ jobs:
       # `zig-<os>-<arch>-<version>.tar.xz`, which no longer exist — 0.17.0 is
       # published as `zig-<arch>-<os>-<version>.tar.xz` — so it 404s on every
       # mirror and then falls back to the master channel, which is what failed
-      # every run from v0.15.0 on.
+      # every run from v0.15.0 to v0.20.0.
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -29,7 +30,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev cmake ninja-build
+          sudo apt-get install -y libssl-dev
 
       - name: Run Tests
         run: zig build test
@@ -42,21 +43,56 @@ jobs:
       - name: Build Examples
         run: zig build
 
-      # The distribution's libngtcp2 and libnghttp3 are older than the APIs the
-      # HTTP/3 layer uses, so the versions this library is developed against are
-      # built here. The include and library directories are passed to the build
-      # with the -D flags it takes for exactly this.
-      - name: Build libngtcp2 and libnghttp3
+  # HTTP/3 is opt-in and needs OpenSSL 3.2 or newer, libngtcp2 and libnghttp3
+  # that are newer than the distribution's — so this job builds all three. It
+  # is a job of its own so that the library's own tests report first, and so
+  # that a missing QUIC API in the system's OpenSSL is visible as exactly that
+  # rather than as a failure of the tests above.
+  h3:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build perl
+
+      # Ubuntu 24.04 ships OpenSSL 3.0, which has no QUIC interface at all —
+      # ngtcp2 refuses to configure its OpenSSL backend against it — and
+      # libngtcp2 1.x/nghttp3 1.x older than the APIs the layer uses. These are
+      # the versions this library is developed against.
+      - name: Build OpenSSL
+        run: |
+          set -eux
+          prefix="$RUNNER_TEMP/h3"
+          curl -fsSL https://github.com/openssl/openssl/releases/download/openssl-3.6.5/openssl-3.6.5.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/openssl-3.6.5"
+          ./Configure --prefix="$prefix" --libdir=lib no-tests no-docs no-apps
+          make -j"$(nproc)"
+          make install_sw
+
+      - name: Build libngtcp2
         run: |
           set -eux
           prefix="$RUNNER_TEMP/h3"
           git clone --depth 1 --branch v1.24.0 https://github.com/ngtcp2/ngtcp2 "$RUNNER_TEMP/ngtcp2"
           cmake -S "$RUNNER_TEMP/ngtcp2" -B "$RUNNER_TEMP/ngtcp2/build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DENABLE_OPENSSL=ON -DENABLE_LIB_ONLY=ON \
-            -DCMAKE_INSTALL_PREFIX="$prefix"
+            -DOPENSSL_ROOT_DIR="$prefix" -DCMAKE_INSTALL_PREFIX="$prefix"
           cmake --build "$RUNNER_TEMP/ngtcp2/build" -j"$(nproc)"
           cmake --install "$RUNNER_TEMP/ngtcp2/build"
 
+      - name: Build libnghttp3
+        run: |
+          set -eux
+          prefix="$RUNNER_TEMP/h3"
           git clone --depth 1 --branch v1.17.0 https://github.com/ngtcp2/nghttp3 "$RUNNER_TEMP/nghttp3"
           cmake -S "$RUNNER_TEMP/nghttp3" -B "$RUNNER_TEMP/nghttp3/build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DENABLE_LIB_ONLY=ON \
@@ -64,10 +100,11 @@ jobs:
           cmake --build "$RUNNER_TEMP/nghttp3/build" -j"$(nproc)"
           cmake --install "$RUNNER_TEMP/nghttp3/build"
 
-      # HTTP/3 is opt-in, so it needs its own pass to stay covered.
+      # The include and library directories are what the build's -D flags are
+      # for; the HTTP/3 layer is off unless -Dh3=true asks for it.
       - name: Run Tests and Build with HTTP/3
         env:
-          H3: -Dh3=true -Dngtcp2-include=${{ runner.temp }}/h3/include -Dngtcp2-lib=${{ runner.temp }}/h3/lib -Dnghttp3-include=${{ runner.temp }}/h3/include -Dnghttp3-lib=${{ runner.temp }}/h3/lib -Dopenssl-include=/usr/include
+          H3: -Dh3=true -Dngtcp2-include=${{ runner.temp }}/h3/include -Dngtcp2-lib=${{ runner.temp }}/h3/lib -Dnghttp3-include=${{ runner.temp }}/h3/include -Dnghttp3-lib=${{ runner.temp }}/h3/lib -Dopenssl-include=${{ runner.temp }}/h3/include -Dopenssl-lib=${{ runner.temp }}/h3/lib
         run: |
           zig build test $H3
           zig build $H3
