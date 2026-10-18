@@ -21,6 +21,7 @@ test {
     _ = @import("h3/native/batch_p23_test.zig");
     _ = @import("h3/native/batch_p3_test.zig");
     _ = @import("h3/native/qlog_test.zig");
+    _ = @import("h3/native/production_safety_test.zig");
 }
 
 test "zquic Initial keys interoperate between client and server" {

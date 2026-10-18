@@ -184,6 +184,22 @@ pub const NegotiatedPeerTransportParameters = struct {
 
 pub const OwnedRawPacket = struct {
     data: []u8,
+    /// TLS encryption-level index this datagram was protected at: 0 Initial,
+    /// 2 Handshake, 3 1-RTT. Queue producers that do not know the level leave
+    /// the default; the transport only uses it to exempt handshake progress
+    /// from congestion-window enforcement.
+    level: u8 = 3,
+    /// Plaintext bytes recorded for loss recovery when this datagram was
+    /// scheduled. Zero for callers that queue an already-protected packet
+    /// without transport accounting.
+    plaintext_len: usize = 0,
+    /// True when the packet is ack-eliciting and therefore counts toward
+    /// bytes in flight. Kept beside the bytes so a flush can subtract packets
+    /// that are still queued but not yet on the wire.
+    ack_eliciting: bool = false,
+    /// Plaintext bytes this packet contributes to the congestion window.
+    /// Nonzero exactly when the scheduled packet is ack-eliciting.
+    in_flight_bytes: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, bytes: []const u8) Error.ZquicError!OwnedRawPacket {
         return .{ .data = allocator.dupe(u8, bytes) catch return Error.ZquicError.OutOfMemory };
@@ -357,6 +373,17 @@ fn packetSpaceTypeForLevel(level: PacketCryptoMod.EncryptionLevel) PacketSpace.P
         .initial => .initial,
         .handshake => .handshake,
         .early_data, .application => .application,
+    };
+}
+
+/// Encryption-level index stored on queued datagrams, matching the transport's
+/// packet-space numbering (Initial = 0, Handshake = 2, 1-RTT = 3).
+fn encryptionLevelIndex(level: PacketCryptoMod.EncryptionLevel) u8 {
+    return switch (level) {
+        .initial => 0,
+        .early_data => 1,
+        .handshake => 2,
+        .application => 3,
     };
 }
 
@@ -1170,12 +1197,69 @@ pub const SuperConnection = struct {
         self.outgoing_raw_packets.append(self.allocator, .{ .data = bytes }) catch return Error.ZquicError.OutOfMemory;
     }
 
+    /// Queue an owned protected packet together with the congestion/loss
+    /// accounting captured when it was scheduled. Ownership of `bytes`
+    /// transfers even when this function returns an error.
+    pub fn queueOutgoingRawPacketOwnedWithMetadata(
+        self: *Self,
+        bytes: []u8,
+        level: u8,
+        plaintext_len: usize,
+        ack_eliciting: bool,
+    ) Error.ZquicError!void {
+        errdefer self.allocator.free(bytes);
+        self.outgoing_raw_packets.append(self.allocator, .{
+            .data = bytes,
+            .level = level,
+            .plaintext_len = plaintext_len,
+            .ack_eliciting = ack_eliciting,
+            .in_flight_bytes = if (ack_eliciting) plaintext_len else 0,
+        }) catch return Error.ZquicError.OutOfMemory;
+    }
+
+    /// Prepend owned protected packets ahead of every queued outgoing packet,
+    /// preserving the order of `packets`. No packet bytes are copied; only the
+    /// owning structs move. Ownership transfers on success and is released on
+    /// allocation failure.
+    pub fn queueOutgoingRawPacketsFront(self: *Self, packets: []const OwnedRawPacket) Error.ZquicError!void {
+        if (packets.len == 0) return;
+        errdefer for (packets) |packet| self.allocator.free(packet.data);
+
+        var merged: std.ArrayListUnmanaged(OwnedRawPacket) = .empty;
+        errdefer merged.deinit(self.allocator);
+        merged.ensureTotalCapacity(self.allocator, packets.len + self.outgoing_raw_packets.items.len) catch
+            return Error.ZquicError.OutOfMemory;
+        merged.appendSliceAssumeCapacity(packets);
+        merged.appendSliceAssumeCapacity(self.outgoing_raw_packets.items);
+
+        self.outgoing_raw_packets.deinit(self.allocator);
+        self.outgoing_raw_packets = merged;
+    }
+
     pub fn drainOutgoingRawPackets(self: *Self, allocator: std.mem.Allocator) Error.ZquicError![]OwnedRawPacket {
         const result = allocator.alloc(OwnedRawPacket, self.outgoing_raw_packets.items.len) catch return Error.ZquicError.OutOfMemory;
         errdefer allocator.free(result);
         @memcpy(result, self.outgoing_raw_packets.items);
         self.outgoing_raw_packets.clearRetainingCapacity();
         return result;
+    }
+
+    /// Bytes in flight for congestion control: the sum of SentPacket.in_flight
+    /// payload bytes across the Initial, Handshake, and application spaces.
+    pub fn bytesInFlight(self: *const Self) u64 {
+        return @intCast(self.packet_spaces.totalBytesInFlight());
+    }
+
+    /// In-flight bytes attributable to protected packets that are still in the
+    /// outgoing queue. A sender subtracts this from `bytesInFlight` to obtain
+    /// the bytes actually on the wire before deciding whether one more packet
+    /// fits in the congestion window.
+    pub fn queuedInFlightBytes(self: *const Self) u64 {
+        var total: u64 = 0;
+        for (self.outgoing_raw_packets.items) |packet| {
+            total +|= packet.in_flight_bytes;
+        }
+        return total;
     }
 
     pub fn sendProtectedRawPacket(
@@ -1192,7 +1276,12 @@ pub const SuperConnection = struct {
         const raw = packet_crypto.createProtectedRawPacket(level, packet_type, dest_conn_id, src_conn_id, plaintext_payload) catch return Error.ZquicError.CryptoError;
         // The queue owns the protected allocation. Copy-on-queue is only kept
         // for callers that hold a borrowed slice.
-        try self.queueOutgoingRawPacketOwned(raw);
+        try self.queueOutgoingRawPacketOwnedWithMetadata(
+            raw,
+            encryptionLevelIndex(level),
+            plaintext_payload.len,
+            ack_eliciting,
+        );
         // Only ack-eliciting packets need their plaintext for loss recovery.
         // ACK-only packets keep the previous no-retention behavior.
         try self.recordRawPacketSent(
@@ -1239,7 +1328,12 @@ pub const SuperConnection = struct {
         // Queue first so the only remaining failure (recording the send) cannot
         // strand the protected bytes. queueOutgoingRawPacketOwned frees `raw`
         // on failure; the plaintext is freed exactly once below.
-        self.queueOutgoingRawPacketOwned(raw) catch |err| {
+        self.queueOutgoingRawPacketOwnedWithMetadata(
+            raw,
+            encryptionLevelIndex(level),
+            plaintext_len,
+            ack_eliciting,
+        ) catch |err| {
             self.allocator.free(plaintext_owned);
             return err;
         };

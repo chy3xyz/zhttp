@@ -27,6 +27,7 @@ pub const Stats = stats.Stats;
 const FlowControl = flow_control.FlowControl;
 
 const Packet = zquic.Packet;
+const OwnedRawPacket = zquic.Connection.OwnedRawPacket;
 const QuicFrames = zquic.core.QuicFrames;
 const TransportParametersMod = zquic.core.TransportParameters;
 const TransportParameters = TransportParametersMod.TransportParameters;
@@ -420,6 +421,14 @@ pub const Connection = struct {
     /// valid for every Initial this connection sends afterwards.
     retry_token: std.ArrayListUnmanaged(u8) = .empty,
 
+    /// RFC 9000 Section 8.1 anti-amplification state. A server may send at
+    /// most three times the bytes it has received until the client's address
+    /// is validated by an accepted Retry token or a successfully decrypted
+    /// Handshake/1-RTT packet. Clients and post-validation servers ignore it.
+    address_validated: bool = false,
+    bytes_received_unvalidated: u64 = 0,
+    bytes_sent_unvalidated: u64 = 0,
+
     largest_pn: [4]?u64 = .{ null, null, null, null },
     acks: [4]AckState = .{ .{}, .{}, .{}, .{} },
     peer_params_applied: bool = false,
@@ -736,6 +745,28 @@ pub const Connection = struct {
         return self.closed;
     }
 
+    /// Mark the peer address validated, lifting the RFC 9000 Section 8.1
+    /// anti-amplification limit. The listener calls this after admitting a
+    /// valid Retry token; handlePacket calls it after authenticating a
+    /// Handshake or 1-RTT packet. Initial and 0-RTT packets never validate.
+    pub fn markAddressValidated(self: *Connection) void {
+        self.address_validated = true;
+    }
+
+    pub fn isAddressValidated(self: *const Connection) bool {
+        return self.address_validated;
+    }
+
+    /// Bytes received while the address was unvalidated. Exposed for the
+    /// production-safety tests and operational observability.
+    pub fn unvalidatedBytesReceived(self: *const Connection) u64 {
+        return self.bytes_received_unvalidated;
+    }
+
+    pub fn unvalidatedBytesSent(self: *const Connection) u64 {
+        return self.bytes_sent_unvalidated;
+    }
+
     /// Return a by-value copy of this connection's counters. No pointer is
     /// exposed and the snapshot stays valid after Connection.deinit.
     pub fn statsSnapshot(self: *const Connection) Stats {
@@ -781,6 +812,11 @@ pub const Connection = struct {
         if (self.closed or self.closing) return;
         self.stats.packets_received +|= 1;
         self.stats.bytes_received +|= @intCast(datagram.len);
+        // RFC 9000 Section 8.1 counts every UDP datagram carrying a packet
+        // received from the unvalidated peer, including its padding.
+        if (self.role == .server and !self.address_validated) {
+            self.bytes_received_unvalidated +|= @intCast(datagram.len);
+        }
         self.last_activity_us = nowMicros();
         var offset: usize = 0;
         while (offset < datagram.len) {
@@ -825,6 +861,15 @@ pub const Connection = struct {
         // 0-RTT is not implemented; never let replayable early data reach the
         // HTTP/3 state machine.
         if (processed.encryption_level == .early_data) return;
+        // A successfully authenticated Handshake or 1-RTT packet proves the
+        // peer owns its address (RFC 9000 Section 8.1). Initial and 0-RTT
+        // packets are explicitly not sufficient.
+        if (self.role == .server and !self.address_validated) {
+            switch (processed.encryption_level) {
+                .handshake, .application => self.markAddressValidated(),
+                .initial, .early_data => {},
+            }
+        }
 
         var ack_eliciting = false;
         var rx_ack_frames: usize = 0;
@@ -1653,14 +1698,77 @@ pub const Connection = struct {
         return &.{};
     }
 
-    fn flush(self: *Connection) !void {
+    /// Largest payload the peer's anti-amplification allowance still permits.
+    fn amplificationBudget(self: *const Connection) u64 {
+        return self.bytes_received_unvalidated *| 3;
+    }
+
+    /// RFC 9000 Section 8.1: a server must not send more than three times the
+    /// bytes it has received before validating the client address.
+    fn withinAmplificationLimit(self: *const Connection, packet_len: usize) bool {
+        if (self.role != .server or self.address_validated) return true;
+        const budget = self.amplificationBudget();
+        const remaining = budget -| self.bytes_sent_unvalidated;
+        return @as(u64, @intCast(packet_len)) <= remaining;
+    }
+
+    /// Congestion control applies to ack-eliciting 1-RTT packets. ACK-only
+    /// packets do not count in flight, and Initial/Handshake packets are
+    /// allowed through so the handshake can make progress and never deadlock
+    /// on a window that has not grown yet.
+    ///
+    /// zquic records a packet in flight when it is scheduled, so bytes that
+    /// are still queued are subtracted: the check is about what is actually on
+    /// the wire plus the packet we are about to send.
+    fn congestionAllows(
+        self: *const Connection,
+        packet: *const OwnedRawPacket,
+        queued_in_flight: u64,
+    ) bool {
+        if (!packet.ack_eliciting or packet.level != 3) return true;
+        const in_flight = self.quic.super_connection.bytesInFlight();
+        const on_wire = in_flight -| queued_in_flight;
+        return self.quic.super_connection.loss_recovery.canSend(
+            on_wire,
+            @intCast(packet.data.len),
+        );
+    }
+
+    fn canTransmitNow(
+        self: *const Connection,
+        packet: *const OwnedRawPacket,
+        queued_in_flight: u64,
+    ) bool {
+        return self.withinAmplificationLimit(packet.data.len) and
+            self.congestionAllows(packet, queued_in_flight);
+    }
+
+    /// Drain the queued protected packets in order. A packet that exceeds the
+    /// anti-amplification allowance or the congestion window is put back at
+    /// the front of zquic's outgoing queue with every packet behind it, and
+    /// the flush stops. Nothing is dropped: the next service pass retries once
+    /// an ACK grows the window or the peer proves it owns its address.
+    ///
+    /// qlog pending entries are consumed only for packets the loop actually
+    /// attempted, so requeued packets keep their pairing.
+    pub fn flush(self: *Connection) !void {
+        var remaining_queued_in_flight = self.quic.super_connection.queuedInFlightBytes();
         const packets = self.quic.super_connection.drainOutgoingRawPackets(self.allocator) catch return error.QuicError;
         defer self.allocator.free(packets);
         const pending_log = self.qlog_pending;
         const drop_log_batch = if (pending_log) |pending| pending.overflow else false;
-        for (packets) |*packet| {
-            defer packet.deinit(self.allocator);
-            if (packet.data.len == 0) continue;
+        var blocked_at: ?usize = null;
+
+        for (packets, 0..) |*packet, index| {
+            if (packet.data.len == 0) {
+                remaining_queued_in_flight -|= packet.in_flight_bytes;
+                packet.deinit(self.allocator);
+                continue;
+            }
+            if (!self.canTransmitNow(packet, remaining_queued_in_flight)) {
+                blocked_at = index;
+                break;
+            }
             const outcome = self.packet_io.sendDatagram(self.socket, packet.data);
             // The pending qlog entry is consumed for every attempt, including a
             // synthetic test drop; only a successful send is logged.
@@ -1681,9 +1789,26 @@ pub const Connection = struct {
                     }
                 }
             }
-            if (outcome != .sent) continue;
-            self.stats.packets_sent +|= 1;
-            self.stats.bytes_sent +|= @intCast(packet.data.len);
+            remaining_queued_in_flight -|= packet.in_flight_bytes;
+            if (outcome == .sent) {
+                self.stats.packets_sent +|= 1;
+                self.stats.bytes_sent +|= @intCast(packet.data.len);
+                if (self.role == .server and !self.address_validated) {
+                    self.bytes_sent_unvalidated +|= @intCast(packet.data.len);
+                }
+            }
+            packet.deinit(self.allocator);
+        }
+
+        if (blocked_at) |index| {
+            // Ownership of packets[index..] moves to zquic. On allocation
+            // failure the API releases them; reset the qlog pairing rather
+            // than leave entries for packets that no longer exist.
+            self.quic.super_connection.queueOutgoingRawPacketsFront(packets[index..]) catch {
+                if (pending_log) |pending| pending.reset();
+                return error.QuicError;
+            };
+            return;
         }
         if (pending_log) |pending| pending.reset();
     }
@@ -2000,6 +2125,9 @@ pub const Listener = struct {
             self.qlog_reference,
         );
         errdefer connection.deinit();
+        // The token was verified against this peer's address above, so the
+        // address is validated before the connection sends its first packet.
+        if (self.retry_enabled) connection.markAddressValidated();
         connection.handler = self.handler;
         try self.addConnection(connection);
         if (self.on_connection) |hook| hook.callback(hook.context, connection);

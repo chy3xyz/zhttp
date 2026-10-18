@@ -67,6 +67,11 @@ In `src/core/packet_space.zig` / `src/core/connection.zig`:
 - `SuperConnection.pto_probes_enabled` stays at its default `true`. zhttp no
   longer suppresses PTO probes: a tail loss needs a probe ACK so loss
   detection can surface the original packet.
+- `OwnedRawPacket` carries encryption level, plaintext length, ack-eliciting,
+  and in-flight bytes so zhttp can enforce the congestion window and requeue
+  blocked packets. `queueOutgoingRawPacketOwnedWithMetadata`,
+  `queueOutgoingRawPacketsFront`, `bytesInFlight`, and `queuedInFlightBytes`
+  are additive APIs; wire bytes are unchanged.
 - `PacketSpace.processAck` now advances `largest_acked_packet` and
   `largest_acked_time` for every valid ACK range, including packet numbers that
   loss detection already removed from `sent_packets`. Without this, a single

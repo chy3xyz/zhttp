@@ -262,13 +262,14 @@ test "qlog: loopback GET emits events and never logs header values" {
         try expectContains(client_bytes, needle);
     }
 
-    // Header values, tokens, and peer addresses must never reach the trace.
+    // Header values, token bytes, and peer addresses must never reach the
+    // trace. The fixed retry_sent reason string is allowed; it contains no
+    // token material.
     for ([_][]const u8{
         "top-secret-value",
         "request-hidden-value",
         "x-secret",
         "127.0.0.1",
-        "token",
     }) |secret| {
         try std.testing.expect(std.mem.indexOf(u8, server_bytes, secret) == null);
         try std.testing.expect(std.mem.indexOf(u8, client_bytes, secret) == null);

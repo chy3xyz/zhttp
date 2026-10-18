@@ -31,9 +31,11 @@ pub const Options = struct {
     /// Per-stream receive flow-control window advertised to clients.
     initial_max_stream_data: u64 = native.default_flow_window,
     /// Require an HMAC Retry token before allocating a Connection/Session.
-    /// The built-in zhttp H3 client does not yet answer Retry, so this is
-    /// intended for servers whose clients support RFC 9000 Retry.
-    retry: bool = false,
+    /// The built-in zhttp H3 client and aioquic answer Retry. Enabled by
+    /// default for public-internet safety: the token validates the client's
+    /// address before the handshake flight has to fit inside the RFC 9000
+    /// Section 8.1 anti-amplification budget.
+    retry: bool = true,
     /// Optional qlog sink. Disabled when null; when set, the listener writes
     /// the JSON-SEQ header before accepting any datagram and each connection
     /// emits transport/connectivity events.
