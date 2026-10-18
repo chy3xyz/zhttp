@@ -3,6 +3,10 @@
 const std = @import("std");
 const native = @import("native/transport.zig");
 const h3 = @import("native/http3.zig");
+const qlog = @import("native/qlog.zig");
+
+/// qlog types are re-exported here so callers do not need a native import.
+pub const Qlog = qlog;
 
 pub const Method = h3.Method;
 pub const Headers = h3.Headers;
@@ -30,6 +34,10 @@ pub const Options = struct {
     /// The built-in zhttp H3 client does not yet answer Retry, so this is
     /// intended for servers whose clients support RFC 9000 Retry.
     retry: bool = false,
+    /// Optional qlog sink. Disabled when null; when set, the listener writes
+    /// the JSON-SEQ header before accepting any datagram and each connection
+    /// emits transport/connectivity events.
+    qlog: ?qlog.Config = null,
 };
 
 /// Owns the sessions for accepted connections. Heap-allocated so its address
@@ -195,6 +203,7 @@ pub const Server = struct {
         listener.local_max_data = options.initial_max_data;
         listener.local_max_stream_data = options.initial_max_stream_data;
         if (options.retry) listener.enableRetry();
+        if (options.qlog) |config| listener.installQlog(config);
 
         const registry = if (context_handler) |ch|
             try Registry.createWithContext(allocator, context, ch, options.max_request_body_bytes)

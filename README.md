@@ -713,10 +713,12 @@ var server = httpz.Server.init(.{
 - `h3.Adapter` bridges an existing `Router`/middleware `Connection.Handler`
   into the native H3 server, with lowercased headers and arena-owned response
   slices
-- Peer SETTINGS, QPACK stream validation, and a 4096-byte decoder dynamic table,
-  with RFC 9204 0x0201-0x0203 errors
+- Peer SETTINGS, QPACK stream validation, a 4096-byte decoder dynamic table,
+  blocked request resume, and decoder-stream acknowledgments, with RFC 9204
+  0x0201-0x0203 errors
 - `Server.stats()` / `Client.stats()` snapshots for packets, bytes, retransmits,
   streams, flow-control updates, and ACKs
+- Optional qlog JSON-SEQ traces for connections, packets, loss, Retry, and errors
 - Frame-level retransmission: ack-eliciting packets are retained until ACKed
   and resent under a new packet number after an RTT-derived timeout
   (2×SRTT, clamped to 200 ms–1 s)

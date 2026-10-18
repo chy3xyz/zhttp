@@ -5,14 +5,18 @@ test {
     _ = @import("h3/native/qpack.zig");
     _ = @import("h3/native/qtls.zig");
     _ = @import("h3/native/transport.zig");
+    _ = @import("h3/native/flow_control_test.zig");
     _ = @import("h3/native/stats_test.zig");
     _ = @import("h3/native/recovery_observe_test.zig");
+    _ = @import("h3/native/recovery_owner_test.zig");
     _ = @import("h3/native/retry_client_test.zig");
     _ = @import("h3/native/http3.zig");
     _ = @import("h3/native/http3_test.zig");
     _ = @import("h3/native/qtls_test.zig");
     _ = @import("h3/native/fuzz_test.zig");
     _ = @import("h3/native/batch_test.zig");
+    _ = @import("h3/native/batch_p23_test.zig");
+    _ = @import("h3/native/qlog_test.zig");
 }
 
 test "zquic Initial keys interoperate between client and server" {

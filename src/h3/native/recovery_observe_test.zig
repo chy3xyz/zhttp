@@ -1,8 +1,10 @@
 //! Transport-level observation of zquic lost packets.
 //!
-//! This test intentionally exercises both recovery owners: zquic now reports
-//! the packets it declares lost (with their retained plaintext), while the
-//! transport's existing SentPacket retransmitter keeps making HTTP/3 progress.
+//! zquic owns loss detection and reports each lost packet with its retained
+//! plaintext. The transport copies that plaintext into a bounded queue during
+//! the callback and resends it later from service; this test proves the
+//! callback, the counters, and the zquic-driven resend path work together on a
+//! real loopback HTTP/3 request.
 
 const std = @import("std");
 const posix = std.posix;
@@ -41,7 +43,34 @@ const Context = struct {
     }
 };
 
-test "transport observes zquic lost packets while HTTP/3 retransmission still works" {
+fn pumpOnce(
+    client_conn: *transport.Connection,
+    client: *http3.Session,
+    listener: *transport.Listener,
+    sessions: []const *http3.Session,
+    buf: []u8,
+) void {
+    client_conn.service() catch {};
+    client.service() catch {};
+    _ = listener.readAndDispatch(buf, 8);
+    listener.serviceAll();
+    for (sessions) |session| session.service() catch {};
+
+    var peer: posix.sockaddr.in = undefined;
+    var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    const n = std.c.recvfrom(
+        client_conn.socket,
+        buf.ptr,
+        buf.len,
+        std.c.MSG.DONTWAIT,
+        @ptrCast(&peer),
+        &peer_len,
+    );
+    if (n > 0) client_conn.handleDatagram(buf[0..@intCast(n)]) catch {};
+    transport.sleepNs(std.time.ns_per_ms);
+}
+
+test "transport observes zquic lost payloads and resends through the owner path" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -64,15 +93,16 @@ test "transport observes zquic lost packets while HTTP/3 retransmission still wo
         .insecure_skip_verify = true,
     });
     defer client_conn.deinit();
-    // Drop one in seven server datagrams and one in eleven client datagrams,
-    // matching the existing retransmission test. The drops make zquic's loss
-    // timer expire while the transport keeps resending frames.
+    // Drop one in seven server datagrams and one in eleven client datagrams.
+    // The drops make zquic's loss detector expire while the transport keeps
+    // servicing the session.
     client_conn.setDropOutgoingEvery(11);
     const client = try http3.Session.initClient(allocator, client_conn, 1024 * 1024);
     defer client.deinit();
 
     const lost_before = transport.test_zquic_lost_packets;
     const payload_before = transport.test_zquic_lost_payload_packets;
+    const bytes_before = transport.test_zquic_lost_payload_bytes;
     const retransmit_before = transport.test_retransmit_count;
 
     var buf: [transport.max_datagram_size]u8 = undefined;
@@ -81,23 +111,7 @@ test "transport observes zquic lost packets while HTTP/3 retransmission still wo
     var answer: ?http3.Session.Answer = null;
 
     while (transport.nowNanos() < deadline) {
-        client_conn.service() catch {};
-        client.service() catch {};
-        _ = listener.readAndDispatch(&buf, 8);
-        listener.serviceAll();
-        for (context.sessions.items) |session| session.service() catch {};
-
-        var peer: posix.sockaddr.in = undefined;
-        var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-        const n = std.c.recvfrom(
-            client_conn.socket,
-            buf[0..].ptr,
-            buf.len,
-            std.c.MSG.DONTWAIT,
-            @ptrCast(&peer),
-            &peer_len,
-        );
-        if (n > 0) client_conn.handleDatagram(buf[0..@intCast(n)]) catch {};
+        pumpOnce(client_conn, client, &listener, context.sessions.items, &buf);
 
         if (client_conn.isEstablished() and stream_id == null) {
             stream_id = try client.beginRequest("GET", "/hello", "localhost", &.{}, "");
@@ -108,7 +122,6 @@ test "transport observes zquic lost packets while HTTP/3 retransmission still wo
                 break;
             }
         }
-        transport.sleepNs(std.time.ns_per_ms);
     }
 
     const got = answer orelse return error.NoAnswer;
@@ -117,41 +130,22 @@ test "transport observes zquic lost packets while HTTP/3 retransmission still wo
     try std.testing.expectEqual(@as(u16, 200), got.status);
     try std.testing.expectEqualStrings("world", got.body);
 
-    // The existing transport retransmitter (not zquic) is what makes the
-    // request succeed here; zquic's observer must not replace it.
-    try std.testing.expect(transport.test_retransmit_count > retransmit_before);
-
-    // The request can complete before zquic's loss timer expires. Keep running
-    // the normal transport service loop so the dropped originals are declared
-    // lost by pollLossRecovery (now in zquic's clock domain).
+    // The request can complete before every dropped original is declared lost.
+    // Keep the normal service loop running until the callback has observed a
+    // non-empty loss and the transport has actually resent one payload.
     const loss_deadline = transport.nowNanos() + 3 * std.time.ns_per_s;
-    while (transport.test_zquic_lost_payload_packets == payload_before and
+    while ((transport.test_zquic_lost_payload_packets == payload_before or
+        transport.test_retransmit_count == retransmit_before) and
         transport.nowNanos() < loss_deadline)
     {
-        client_conn.service() catch {};
-        client.service() catch {};
-        _ = listener.readAndDispatch(&buf, 8);
-        listener.serviceAll();
-        for (context.sessions.items) |session| session.service() catch {};
-
-        var peer: posix.sockaddr.in = undefined;
-        var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-        const n = std.c.recvfrom(
-            client_conn.socket,
-            buf[0..].ptr,
-            buf.len,
-            std.c.MSG.DONTWAIT,
-            @ptrCast(&peer),
-            &peer_len,
-        );
-        if (n > 0) client_conn.handleDatagram(buf[0..@intCast(n)]) catch {};
-        transport.sleepNs(std.time.ns_per_ms);
+        pumpOnce(client_conn, client, &listener, context.sessions.items, &buf);
     }
 
-    // The callback runs before each retained payload is freed, so the
-    // transport counters must see real non-empty plaintext.
+    // The callback runs before zquic frees each retained payload, so the
+    // counters must see real non-empty plaintext. The resend is zquic-driven:
+    // no transport SentPacket timer remains in service.
     try std.testing.expect(transport.test_zquic_lost_packets > lost_before);
     try std.testing.expect(transport.test_zquic_lost_payload_packets > payload_before);
-    try std.testing.expect(transport.test_zquic_lost_payload_bytes > 0);
-    try std.testing.expectEqual(@as(usize, 3), transport.test_zquic_lost_last_level);
+    try std.testing.expect(transport.test_zquic_lost_payload_bytes > bytes_before);
+    try std.testing.expect(transport.test_retransmit_count > retransmit_before);
 }

@@ -38,8 +38,9 @@ any of it. The files that matter:
 
 - `src/h3/native/transport.zig` — UDP socket, CID routing, zquic
   connection wrapper, CRYPTO/STREAM dispatch, packet I/O.
-- `src/h3/native/ack.zig` / `reassembly.zig` / `recovery.zig` / `stats.zig` —
-  ACK ranges, STREAM reassembly, retained-packet state, and counters.
+- `src/h3/native/ack.zig` / `reassembly.zig` / `recovery.zig` / `stats.zig` /
+  `qlog.zig` — ACK ranges, STREAM reassembly, retained-packet state, counters,
+  and optional JSON-SEQ tracing.
 - `src/h3/native/qtls.zig` — OpenSSL's QUIC-TLS callbacks: handshake
   bytes and traffic secrets in both directions.
 - `src/h3/native/http3.zig` — HTTP/3 framing, control/QPACK streams,
@@ -54,29 +55,23 @@ any of it. The files that matter:
 
 ### Transport Split
 
-zquic owns packet protection, packet-number spaces, loss timers, stream IDs,
-and frame serialization. `recovery.zig` keeps the plaintext of every
-ack-eliciting packet until its ACK arrives, and the transport resends due
-packets under a new packet number after an SRTT-derived timeout, so
-CRYPTO/STREAM loss does not need zquic to carry a frame-level history. OpenSSL owns the TLS 1.3 handshake. This
+zquic owns packet protection, packet-number spaces, loss detection, retained
+plaintext, stream IDs, and frame serialization. Its lost-packet callback names
+each lost plaintext; the transport copies it into a bounded queue and resends
+it under a new packet number. OpenSSL owns the TLS 1.3 handshake. This
 repository owns the seam: coalesced-datagram splitting, per-level CRYPTO
 reassembly, RFC 9001 key installation from OpenSSL's secrets, HTTP/3 framing,
 and QPACK.
 
 ### Recovery Ownership
 
-ACK/loss/retransmission is currently split: transport keeps `SentPacket`
-plaintext and resends on a 2xSRTT timer, while zquic records packet spaces and
-runs `pollLossRecovery` (PTO probes). An ACK is applied in both layers. The
-intended direction is zquic-owned recovery: retain ack-eliciting payloads next
-to the PN spaces, expose lost payloads through a callback, and build ACKs from
-received packet numbers. The first safe step is now in place: zquic retains the
-plaintext and `SuperConnection.setLostPacketObserver` reports lost packets
-while the transport still owns retransmission. `pollLossRecovery` now uses
-zquic's wall-clock domain, fixing a mismatch that had made its deadline
-unreachable; zquic's duplicate PTO probes are suppressed until it becomes the
-single sender. Remaining work is switching ACK generation and retransmission to
-that single owner.
+zquic owns loss detection and data retransmission. `setLostPacketObserver`
+reports each lost plaintext before freeing it; the transport queues a bounded
+copy and, after `pollLossRecovery`, resends it under a fresh packet number at
+the same encryption level. PTO probes remain zquic's, with a short transport
+grace to absorb the race between a 1 ms loss declaration and a late ACK read.
+ACK generation/state is the only remaining transport-owned recovery piece:
+`ack.zig`, `sendAcks`, and the coalesced 1-RTT control batch.
 
 ### Closing Period
 
@@ -90,13 +85,14 @@ packet is written.
 Every endpoint opens one control stream and a QPACK encoder/decoder pair when
 the handshake completes. The control stream starts with stream type 0x00 and a
 SETTINGS frame; the QPACK streams start with 0x02 and 0x03. SETTINGS advertises
-a 4096-byte decoder dynamic table and zero blocked streams. Peer SETTINGS are
+a 4096-byte decoder dynamic table and 16 blocked streams. Peer SETTINGS are
 parsed (duplicate/reserved IDs -> 0x0109), peer QPACK streams are validated and
 critical-stream FIN -> 0x0104. The decoder applies peer insert/capacity/
-duplicate instructions and resolves pre-/post-base dynamic references; a
-required insert that has not arrived is QPACK_DECOMPRESSION_FAILED (0x0201)
-because blocked streams are not queued. Our encoder remains static-only and
-does not yet emit decoder-stream acknowledgments.
+duplicate instructions, resolves pre-/post-base dynamic references, parks
+request streams waiting for future inserts, and emits Insert Count Increment,
+Section Acknowledgment, and Stream Cancellation on the local decoder stream.
+A missing insert beyond the blocked limit/timeout is
+QPACK_DECOMPRESSION_FAILED (0x0201). Our encoder remains static-only.
 
 ### Connection ID (CID) Routing
 

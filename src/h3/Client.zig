@@ -4,9 +4,12 @@ const std = @import("std");
 const posix = std.posix;
 const native = @import("native/transport.zig");
 const h3 = @import("native/http3.zig");
+const qlog = @import("native/qlog.zig");
 
 pub const ClientTls = native.ClientTls;
 pub const Stats = native.Stats;
+/// qlog types are re-exported here so callers do not need a native import.
+pub const Qlog = qlog;
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
@@ -22,15 +25,33 @@ pub const Client = struct {
 
     pub const Header = h3.HeaderField;
 
+    pub const Options = struct {
+        /// Optional qlog sink. The header and connection_started are written
+        /// during init, before the first packet is scheduled.
+        qlog: ?qlog.Config = null,
+    };
+
     pub fn init(
         allocator: std.mem.Allocator,
         host: []const u8,
         port: u16,
         tls: ClientTls,
     ) !Client {
+        return initWithOptions(allocator, host, port, tls, .{});
+    }
+
+    /// Client constructor with optional qlog installation. The existing init
+    /// signature stays as a thin wrapper.
+    pub fn initWithOptions(
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+        tls: ClientTls,
+        options: Options,
+    ) !Client {
         const host_copy = try allocator.dupe(u8, host);
         errdefer allocator.free(host_copy);
-        const connection = try native.connect(allocator, host, port, tls);
+        const connection = try native.connectWithQlog(allocator, host, port, tls, options.qlog);
         errdefer connection.deinit();
         const session = try h3.Session.initClient(allocator, connection, 1024 * 1024);
         errdefer session.deinit();

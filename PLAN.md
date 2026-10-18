@@ -235,9 +235,18 @@ installation, HTTP/3 framing, QPACK, and the server/client state machines.
 - [x] **QPACK** (`src/h3/native/qpack.zig`) — static table, literals, Huffman decoding
 - [x] **QPACK peer SETTINGS/stream validation (P1)** — duplicate/reserved settings,
   critical QPACK streams, 0x0201/0x0202/0x0203 error mapping
-- [x] **QPACK decoder dynamic table (P2)** — 4096-byte table, peer encoder
-  instructions, pre-/post-base dynamic refs; blocked-stream resume and our
-  encoder-side dynamic inserts/acks remain pending
+- [x] **QPACK decoder dynamic table + blocked resume (P2/P3)** — 4096-byte
+  table, peer encoder instructions, pre-/post-base refs, 16 blocked streams,
+  Insert Count Increment/Section Ack/Stream Cancellation; our encoder remains
+  static-only
+- [x] **qlog P1** — JSON-SEQ connection/packet/loss/retry/error events
+- [x] **Packet batching P2** — ACK/flow/stream-limit frames coalesced with STREAM data
+- [x] **Recovery ownership** — zquic names lost plaintext; transport only queues/resends;
+  ACK generation is the remaining transport-owned recovery piece
+- [x] **Transport split: FlowControl** — windows, stream counts, MAX_* collection/commit
+- [ ] **Transport split: StreamTable / CryptoStream / PacketIo**
+- [ ] **Packet batching P3** — zquic protectRawInto/owned buffers/no duplicate retain
+- [ ] **QPACK encoder dynamic inserts** — decoder-stream acks and blocked resume are done
 - [x] **Client** (`src/h3/Client.zig`) — connect, request/response, headers, body
 - [x] **Server** (`src/h3/Server.zig`) — accept loop, handler dispatch, streaming responses, idle close
 

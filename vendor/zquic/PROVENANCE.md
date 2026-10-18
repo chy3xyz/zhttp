@@ -14,7 +14,8 @@ Vendored snapshot of the zquic working tree used by zhttp's HTTP/3 stack.
   ~~~
 
 zhttp uses these zquic surfaces: `PacketCrypto`,
-`Connection.SuperConnection` packet scheduling and loss timers,
+`Connection.SuperConnection` packet scheduling and loss timers, the
+`setLostPacketObserver` callback with retained plaintext,
 `TransportParameters`, `Tls13KeySchedule`, and the QUIC frame codec.
 
 ## zhttp hardening patch
@@ -47,11 +48,19 @@ In `src/core/packet_space.zig` / `src/core/connection.zig`:
 - Ack-eliciting plaintext is optionally retained in `SentPacket` and freed on
   ACK, loss, discard, or space teardown.
 - `SuperConnection.setLostPacketObserver` forwards time- and packet-threshold
-  losses to a callback before the retained payload is freed. This is
-  observation only; zhttp's transport still owns retransmission.
-- `SuperConnection.pto_probes_enabled` (default true) lets zhttp suppress
-  zquic's duplicate PTO PING/CRYPTO probes while its transport retransmitter
-  is still the single sender.
+  losses to a callback before the retained payload is freed. zhttp installs
+  this observer with `context = self`; the callback copies
+  `{level, packet number, plaintext}` into the transport's bounded queue and
+  service resends it through `sendProtectedRawPacket`. zquic is the single
+  loss detector/retransmission owner; ACK generation remains in the transport.
+- `SuperConnection.pto_probes_enabled` stays at its default `true`. zhttp no
+  longer suppresses PTO probes: a tail loss needs a probe ACK so loss
+  detection can surface the original packet.
+- `PacketSpace.processAck` now advances `largest_acked_packet` and
+  `largest_acked_time` for every valid ACK range, including packet numbers that
+  loss detection already removed from `sent_packets`. Without this, a single
+  premature time-threshold loss froze `largest_acked` and made every later send
+  look lost by packet threshold. This is a correctness fix, not a new API.
 
 In `src/core/quic_frames.zig`:
 
@@ -62,5 +71,7 @@ In `src/core/quic_frames.zig`:
   packet instead of leaving trailing bytes to be misparsed as frames.
 
 Re-apply or upstream this patch after refreshing the snapshot. Regression
-coverage lives in `src/h3/native/fuzz_test.zig` under the QUIC frame tests and
-in `src/h3/native/retry_client_test.zig` for client Retry handling.
+coverage lives in `src/h3/native/fuzz_test.zig` under the QUIC frame tests,
+`src/h3/native/retry_client_test.zig` for client Retry handling, and
+`src/h3/native/recovery_observe_test.zig` plus
+`src/h3/native/recovery_owner_test.zig` for zquic-driven lost-payload resends.

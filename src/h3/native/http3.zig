@@ -1,8 +1,9 @@
 //! HTTP/3 framing and request/response state for the native stack.
 //!
 //! The transport hands this layer ordered stream bytes. This file owns the
-//! HTTP/3 control/QPACK streams, the per-stream frame parser, QPACK header
-//! blocks, and the server/client exchange state machines.
+//! HTTP/3 control/QPACK streams, decoder-stream acknowledgments, blocked-stream
+//! resume, the per-stream frame parser, QPACK header blocks, and the
+//! server/client exchange state machines.
 
 const std = @import("std");
 const transport = @import("transport.zig");
@@ -80,9 +81,14 @@ pub const qpack_decoder_stream_error: u64 = 0x0203;
 /// SETTINGS_QPACK_MAX_TABLE_CAPACITY advertised by this endpoint. The decoder
 /// dynamic table can grow this large, so peers may send encoder instructions.
 pub const qpack_table_capacity: u64 = 4096;
-/// SETTINGS_QPACK_BLOCKED_STREAMS. Blocked request streams are not queued, so
-/// a field section that references a future insert is a 0x0201 failure.
-pub const qpack_blocked_streams: u64 = 0;
+/// SETTINGS_QPACK_BLOCKED_STREAMS. A small bound keeps the number of parked
+/// request streams bounded while still letting a peer reference inserts that
+/// are in flight on its encoder stream.
+const max_blocked_streams: usize = 16;
+pub const qpack_blocked_streams: u64 = max_blocked_streams;
+/// A request stream may wait this long for Required Insert Count inserts to
+/// arrive before the connection fails with QPACK_DECOMPRESSION_FAILED.
+pub const qpack_blocked_stream_timeout_ns: u64 = 2 * std.time.ns_per_s;
 
 const default_max_body = 1024 * 1024;
 
@@ -268,6 +274,20 @@ const ClientResponse = struct {
     }
 };
 
+/// One HEADERS frame parked because its Required Insert Count is ahead of
+/// the peer's encoder stream. The frame is not consumed: `parse_offset` stays
+/// at the frame start and the reassembler retains every following byte.
+const BlockedSection = struct {
+    required_insert_count: u64,
+    /// Stream offset of the HEADERS frame header.
+    frame_offset: usize,
+    /// Stream offset of the QPACK field-section payload.
+    block_offset: usize,
+    since_ns: u64,
+};
+
+const HeaderOutcome = enum { decoded, blocked };
+
 const StreamState = struct {
     allocator: std.mem.Allocator,
     id: u64,
@@ -275,6 +295,12 @@ const StreamState = struct {
     reassembler: transport.Reassembler,
     parse_offset: usize = 0,
     headers: ?qpack.HeaderList = null,
+    /// HEADERS frame waiting for peer inserts (a blocked request stream).
+    blocked: ?BlockedSection = null,
+    /// Number of decoded dynamic field sections whose Section Acknowledgment
+    /// has not been queued yet (decoder-stream backpressure or an allocation
+    /// error). A stream can carry request HEADERS and trailers.
+    section_ack_pending: u32 = 0,
     method: ?Method = null,
     method_unknown: bool = false,
     path: []const u8 = "",
@@ -344,8 +370,12 @@ pub const Session = struct {
     peer_max_field_section_size: u64 = 0,
     /// Decoder-side dynamic table. It applies the peer's encoder-stream
     /// instructions and resolves request HEADERS that reference inserted
-    /// entries. Our SETTINGS advertise 4096 bytes.
+    /// entries. Our SETTINGS advertise 4096 bytes; Insert Count Increment and
+    /// Section Acknowledgment bytes are queued on qpack_decoder_stream.
     decoder: qpack.Decoder,
+    /// Highest insert count acknowledged to the peer on our decoder stream.
+    /// Insert Count Increment always sends the delta to decoder.insertCount().
+    decoder_acked_insert_count: u64 = 0,
     goaway_id: ?u64 = null,
     max_request_stream_id: u64 = 0,
     streams: std.AutoHashMapUnmanaged(u64, *StreamState) = .empty,
@@ -460,6 +490,9 @@ pub const Session = struct {
         if (index < self.retired.capacity()) self.retired.set(index);
         if (self.streams.fetchRemove(stream_id)) |entry| {
             const state = @constCast(entry.value);
+            // A reset/retired stream may still hold an unacknowledged section.
+            // Tell the peer's encoder to drop it before releasing the state.
+            self.cancelSection(state);
             state.deinit();
         }
     }
@@ -485,6 +518,12 @@ pub const Session = struct {
 
     pub fn peerSettingsReceived(self: *const Session) bool {
         return self.peer_settings_received;
+    }
+
+    /// Number of request streams currently parked on future peer inserts.
+    /// Exposed for diagnostics and deterministic blocked-stream tests.
+    pub fn blockedStreamCount(self: *const Session) usize {
+        return self.blockedCount();
     }
 
     fn onEstablished(context: *anyopaque) anyerror!void {
@@ -527,6 +566,9 @@ pub const Session = struct {
         try writeVarint(&enc, self.allocator, qpack_encoder_stream_type);
         try self.conn.queueStreamData(self.qpack_encoder_stream, enc.items, false);
 
+        // Type 0x03 local decoder stream. queueDecoderInstruction appends
+        // Insert Count Increment, Section Acknowledgment, and Stream
+        // Cancellation instructions here as QPACK events happen.
         var dec: std.ArrayListUnmanaged(u8) = .empty;
         defer dec.deinit(self.allocator);
         try writeVarint(&dec, self.allocator, qpack_decoder_stream_type);
@@ -546,23 +588,7 @@ pub const Session = struct {
         _ = state.reassembler.insert(offset, data, fin) catch return;
         if (fin) state.fin = true;
         self.processStream(state) catch |err| {
-            // The field section references entries the decoder has not
-            // inserted (blocked streams are disabled), or an invalid dynamic
-            // index. RFC 9204 section 3.2.5 makes that
-            // QPACK_DECOMPRESSION_FAILED, not a 400.
-            if (err == error.DynamicTableReference) {
-                state.handled = true;
-                self.conn.close(qpack_decompression_failed, "QPACK decompression failed");
-                return;
-            }
-            if (self.role == .server and state.kind == .request and !state.handled) {
-                state.handled = true;
-                const status: StatusCode = if (err == error.BodyTooLarge)
-                    .request_entity_too_large
-                else
-                    .bad_request;
-                self.sendError(state.id, status, "bad request\n") catch {};
-            }
+            self.handleStreamError(state, err);
             return;
         };
     }
@@ -624,7 +650,16 @@ pub const Session = struct {
             .qpack_encoder => self.parseQpackEncoder(state),
             .qpack_decoder => self.parseQpackDecoder(state),
             .ignored => {},
-            .request => try self.parseRequest(state),
+            .request => {
+                if (state.blocked) |blocked| {
+                    if (self.decoder.insertCount() < blocked.required_insert_count) return;
+                    // The inserts arrived while other stream bytes kept coming.
+                    // Retry the parked frame; its bytes are still at
+                    // parse_offset, so request-stream order is unchanged.
+                    state.blocked = null;
+                }
+                try self.parseRequest(state);
+            },
             .unknown => {},
         }
 
@@ -714,6 +749,7 @@ pub const Session = struct {
     /// unconsumed so it can be replayed when more bytes arrive.
     fn parseQpackEncoder(self: *Session, state: *StreamState) void {
         if (self.conn.isClosed()) return;
+        const insert_count_before = self.decoder.insertCount();
         const data = state.reassembler.buf.items[0..state.reassembler.contiguous];
         var cursor = state.parse_offset;
         while (cursor < data.len) {
@@ -733,6 +769,11 @@ pub const Session = struct {
             }
         }
         state.parse_offset = cursor;
+        // Every applied insert (including duplicates) advances Insert Count;
+        // tell the peer once per batch so it can free its dynamic table. Then
+        // give any blocked request stream its turn.
+        self.queueInsertCountIncrement();
+        if (self.decoder.insertCount() > insert_count_before) self.retryBlockedStreams();
     }
 
     /// The peer's QPACK decoder stream may only acknowledge instructions this
@@ -761,6 +802,166 @@ pub const Session = struct {
         state.parse_offset = cursor;
     }
 
+    fn handleStreamError(self: *Session, state: *StreamState, err: anyerror) void {
+        if (err == error.DynamicTableReference) {
+            // The field section references entries the decoder does not have,
+            // or a blocked stream outlived QPACK_BLOCKED_STREAMS / its
+            // timeout. RFC 9204 section 3.2.5 maps these to 0x0201.
+            state.handled = true;
+            self.conn.close(qpack_decompression_failed, "QPACK decompression failed");
+            return;
+        }
+        if (self.role == .server and state.kind == .request and !state.handled) {
+            state.handled = true;
+            const status: StatusCode = if (err == error.BodyTooLarge)
+                .request_entity_too_large
+            else
+                .bad_request;
+            self.sendError(state.id, status, "bad request\n") catch {};
+        }
+    }
+
+    /// Queue one fixed-size decoder-stream instruction. The instruction is
+    /// written straight into the transport's per-stream send buffer; no
+    /// session-owned staging buffer grows with the number of acknowledgments.
+    fn queueDecoderInstruction(
+        self: *Session,
+        instruction: qpack.DecoderInstructionValue,
+    ) !void {
+        var buf: [qpack.max_decoder_instruction_len]u8 = undefined;
+        const len = try qpack.writeDecoderInstruction(&buf, instruction);
+        try self.conn.queueStreamData(self.qpack_decoder_stream, buf[0..len], false);
+    }
+
+    fn decoderBacklogged(self: *const Session) bool {
+        return self.conn.pendingStreamBytes(self.qpack_decoder_stream) >= 64 * 1024;
+    }
+
+    /// Acknowledge every insert applied so far that the peer has not yet been
+    /// told about. Increment is always positive and never exceeds the number of
+    /// inserts the decoder has actually applied.
+    fn queueInsertCountIncrement(self: *Session) void {
+        if (!self.started) return;
+        if (self.decoderBacklogged()) return;
+        const insert_count = self.decoder.insertCount();
+        if (insert_count <= self.decoder_acked_insert_count) return;
+        const increment = insert_count - self.decoder_acked_insert_count;
+        self.queueDecoderInstruction(.{ .insert_count_increment = increment }) catch return;
+        self.decoder_acked_insert_count = insert_count;
+    }
+
+    /// A dynamic field section has been decoded; Section Acknowledgment is due
+    /// as soon as the decoder stream has room.
+    fn markSectionDecoded(
+        self: *Session,
+        state: *StreamState,
+        required_insert_count: u64,
+    ) void {
+        if (required_insert_count == 0) return;
+        state.section_ack_pending += 1;
+        self.flushSectionAck(state);
+    }
+
+    fn flushSectionAck(self: *Session, state: *StreamState) void {
+        if (state.section_ack_pending == 0) return;
+        if (!self.started or self.conn.isClosed() or self.decoderBacklogged()) return;
+        // Order the insert acknowledgment before the section ack: the encoder
+        // may need the released table space before it can make progress.
+        self.queueInsertCountIncrement();
+        while (state.section_ack_pending > 0) {
+            if (self.decoderBacklogged()) return;
+            self.queueDecoderInstruction(.{ .section_acknowledgment = state.id }) catch return;
+            state.section_ack_pending -= 1;
+        }
+    }
+
+    /// The stream was reset or retired without a Section Acknowledgment. Tell
+    /// the peer's encoder it can drop the field section. A blocked section was
+    /// never decoded, so it is cancelled as well.
+    fn cancelSection(self: *Session, state: *StreamState) void {
+        if (state.blocked == null and state.section_ack_pending == 0) return;
+        state.blocked = null;
+        state.section_ack_pending = 0;
+        if (!self.started) return;
+        self.queueDecoderInstruction(.{ .stream_cancellation = state.id }) catch {};
+    }
+
+    fn blockedCount(self: *const Session) usize {
+        var count: usize = 0;
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.*.blocked != null) count += 1;
+        }
+        return count;
+    }
+
+    fn blockSection(
+        self: *Session,
+        state: *StreamState,
+        required_insert_count: u64,
+        frame_offset: usize,
+        block_offset: usize,
+    ) !void {
+        if (state.blocked == null and self.blockedCount() >= max_blocked_streams) {
+            // More blocked streams than advertised in SETTINGS is
+            // QPACK_DECOMPRESSION_FAILED (RFC 9204 section 3.2.5).
+            return error.DynamicTableReference;
+        }
+        state.blocked = .{
+            .required_insert_count = required_insert_count,
+            .frame_offset = frame_offset,
+            .block_offset = block_offset,
+            .since_ns = transport.nowNanos(),
+        };
+    }
+
+    /// Retry every parked HEADERS frame whose Required Insert Count is now
+    /// covered. The frame bytes are still at `parse_offset`, so request-stream
+    /// ordering is unchanged.
+    fn retryBlockedStreams(self: *Session) void {
+        if (self.conn.isClosed()) return;
+        const insert_count = self.decoder.insertCount();
+        var ready: [max_blocked_streams]u64 = undefined;
+        var count: usize = 0;
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr.*;
+            if (state.kind != .request) continue;
+            const blocked = state.blocked orelse continue;
+            if (blocked.required_insert_count > insert_count) continue;
+            ready[count] = entry.key_ptr.*;
+            count += 1;
+            if (count == ready.len) break;
+        }
+        for (ready[0..count]) |stream_id| {
+            const state = self.streams.get(stream_id) orelse continue;
+            state.blocked = null;
+            self.processStream(state) catch |err| self.handleStreamError(state, err);
+            if (self.conn.isClosed()) return;
+        }
+    }
+
+    fn expireBlockedStreams(self: *Session) void {
+        if (self.conn.isClosed()) return;
+        const now = transport.nowNanos();
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr.*;
+            const blocked = state.blocked orelse continue;
+            if (now < blocked.since_ns) continue;
+            if (now - blocked.since_ns < qpack_blocked_stream_timeout_ns) continue;
+            state.blocked = null;
+            self.conn.close(qpack_decompression_failed, "QPACK blocked stream timeout");
+            return;
+        }
+    }
+
+    fn flushPendingSectionAcks(self: *Session) void {
+        if (!self.started or self.conn.isClosed()) return;
+        var it = self.streams.iterator();
+        while (it.next()) |entry| self.flushSectionAck(entry.value_ptr.*);
+    }
+
     fn parseRequest(self: *Session, state: *StreamState) !void {
         if (state.id > self.max_request_stream_id) self.max_request_stream_id = state.id;
         const data = state.reassembler.buf.items[0..state.reassembler.contiguous];
@@ -783,9 +984,15 @@ pub const Session = struct {
                 cursor = frame_start;
                 break;
             }
+            const block_offset = cursor;
             const payload = data[cursor..end];
             switch (frame_type) {
-                frame_headers => try self.handleHeaders(state, payload),
+                frame_headers => {
+                    const outcome = try self.handleHeaders(state, frame_start, block_offset, payload);
+                    // A blocked HEADERS frame stays at parse_offset; every
+                    // later frame on the stream stays behind it.
+                    if (outcome == .blocked) return;
+                },
                 frame_data => try self.handleData(state, payload),
                 else => {},
             }
@@ -803,12 +1010,35 @@ pub const Session = struct {
         }
     }
 
-    fn handleHeaders(self: *Session, state: *StreamState, block: []const u8) !void {
+    fn handleHeaders(
+        self: *Session,
+        state: *StreamState,
+        frame_offset: usize,
+        block_offset: usize,
+        block: []const u8,
+    ) !HeaderOutcome {
         var headers = self.decoder.decodeBlock(block) catch |err| switch (err) {
-            error.Blocked, error.InvalidDynamicReference => return error.DynamicTableReference,
+            error.Blocked => {
+                // The prefix is valid but needs inserts that have not arrived.
+                // Park the frame without consuming it. A prefix that cannot
+                // ever be satisfied is still 0x0201.
+                const required = qpack.peekRequiredInsertCount(
+                    block,
+                    self.decoder.insertCount(),
+                    self.decoder.max_capacity,
+                ) catch return error.DynamicTableReference;
+                if (required <= self.decoder.insertCount()) return error.DynamicTableReference;
+                try self.blockSection(state, required, frame_offset, block_offset);
+                return .blocked;
+            },
+            error.InvalidDynamicReference => return error.DynamicTableReference,
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidHeaderBlock,
         };
+        // A Section Acknowledgment is due for every decoded field section with
+        // a nonzero Required Insert Count, even if HTTP/3 validation later
+        // rejects the request (the section was decoded).
+        self.markSectionDecoded(state, headers.required_insert_count);
         if (self.role == .client) {
             defer headers.deinit();
             const status_text = headers.get(":status") orelse return error.InvalidHeaderBlock;
@@ -829,14 +1059,14 @@ pub const Session = struct {
                 try response.header_text.appendSlice(self.allocator, field.value);
                 try response.header_text.appendSlice(self.allocator, "\r\n");
             }
-            return;
+            return .decoded;
         }
 
         if (state.headers != null) {
             // Trailers after the request header block. They are not surfaced to
             // the handler, and must not replace the request fields.
             headers.deinit();
-            return;
+            return .decoded;
         }
         // qpack.decode already rejects duplicate pseudo-headers, pseudo-fields
         // after regular fields, and unknown pseudo-headers (RFC 9114 section
@@ -897,6 +1127,7 @@ pub const Session = struct {
             if (field.name.len > 0 and field.name[0] == ':') continue;
             state.request_headers.append(field.name, field.value) catch {};
         }
+        return .decoded;
     }
 
     fn handleData(self: *Session, state: *StreamState, data: []const u8) !void {
@@ -1003,6 +1234,9 @@ pub const Session = struct {
     pub fn service(self: *Session) !void {
         self.reapRetired();
         if (!self.started and self.conn.isEstablished()) try self.begin();
+        self.expireBlockedStreams();
+        self.queueInsertCountIncrement();
+        self.flushPendingSectionAcks();
         var it = self.streams.iterator();
         while (it.next()) |entry| {
             const state = entry.value_ptr.*;

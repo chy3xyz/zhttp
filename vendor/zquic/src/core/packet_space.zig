@@ -281,6 +281,17 @@ pub const PacketSpace = struct {
 
         try self.validateAckRanges(acked_ranges);
 
+        // An ACK proves every packet number it covers was delivered, even if
+        // loss detection already removed that packet from sent_packets. Keep
+        // largest_acked current first; otherwise a prematurely declared loss
+        // would freeze it and make every later send look lost by threshold.
+        for (acked_ranges) |range| {
+            if (self.largest_acked_packet == null or range.end > self.largest_acked_packet.?) {
+                self.largest_acked_packet = range.end;
+                self.largest_acked_time = now;
+            }
+        }
+
         // Find newly acknowledged packets.
         for (acked_ranges) |range| {
             var pn = range.start;

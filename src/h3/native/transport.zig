@@ -13,15 +13,15 @@ const posix = std.posix;
 const zquic = @import("zquic");
 const qtls = @import("qtls.zig");
 const ack = @import("ack.zig");
-const recovery = @import("recovery.zig");
 const retry = @import("retry.zig");
 const stats = @import("stats.zig");
+const qlog = @import("qlog.zig");
+const flow_control = @import("flow_control.zig");
 
 /// Re-exported so callers can name a snapshot without importing stats.zig.
 pub const Stats = stats.Stats;
 
-const Recovery = recovery.Recovery;
-const SentPacket = recovery.SentPacket;
+const FlowControl = flow_control.FlowControl;
 
 const Packet = zquic.Packet;
 const PacketCrypto = zquic.PacketCrypto;
@@ -46,6 +46,9 @@ pub const Error = error{
 
 pub const cid_len = 8;
 pub const max_datagram_size = 65535;
+/// Re-exported for h3.Server.Options and the transport tests; the module that
+/// owns flow-control state defines the value.
+pub const default_flow_window: u64 = flow_control.default_flow_window;
 const max_handshake_bytes = 1024 * 1024;
 const handshake_timeout_ns = 15 * std.time.ns_per_s;
 
@@ -119,7 +122,7 @@ const StreamSend = struct {
 };
 
 /// One STREAM frame selected for a 1-RTT data batch. A claim only becomes
-/// visible in StreamSend.sent / Connection.sent_data after the packet carrying
+/// visible in StreamSend.sent / FlowControl.sent_data after the packet carrying
 /// it has been scheduled successfully.
 const StreamClaim = struct {
     stream_id: u64,
@@ -149,6 +152,95 @@ const BatchBuild = struct {
     used: usize = 0,
     stream_count: usize = 0,
 };
+
+/// 1-RTT control frames gathered for the current service pass, in the order
+/// they are placed ahead of STREAM data. The transport's ACK ranges, flow
+/// limits, and stream-limit counters are advanced by commitControlFrames()
+/// only after a protected packet carrying the frames was scheduled, so a
+/// failed schedule leaves the whole control set pending for the next pass.
+const ControlBatch = struct {
+    frames: std.ArrayListUnmanaged(QuicFrames.Frame) = .empty,
+    /// Owns the ACK ranges referenced by the .ack entry in frames.
+    ack: ?QuicFrames.AckFrame = null,
+    /// Set once every frame in frames has been handed to a successful
+    /// schedule call; a later packet must not repeat them in this pass.
+    sent: bool = false,
+
+    fn deinit(self: *ControlBatch, allocator: std.mem.Allocator) void {
+        if (self.ack) |ack_frame| ack_frame.deinit(allocator);
+        self.frames.deinit(allocator);
+    }
+};
+
+/// One packet scheduled for emission. qlog pairs these FIFO with the raw
+/// packets drained by flush(), after sendto succeeds.
+const PendingSend = struct {
+    packet_number: u64,
+    level: u8,
+    ptype: qlog.PacketType,
+    ack_eliciting: bool,
+    plaintext_len: u32,
+    frames: qlog.FrameSummary,
+};
+
+/// Bounded FIFO of scheduled sends for qlog. Only allocated when qlog is
+/// enabled; on overflow the whole batch is dropped rather than mislabelled.
+const max_pending_sends = 256;
+const PendingSends = struct {
+    items: [max_pending_sends]PendingSend = undefined,
+    head: usize = 0,
+    count: usize = 0,
+    overflow: bool = false,
+
+    fn push(self: *PendingSends, item: PendingSend) void {
+        if (self.count == self.items.len) {
+            self.head = 0;
+            self.count = 0;
+            self.overflow = true;
+            return;
+        }
+        self.items[(self.head + self.count) % self.items.len] = item;
+        self.count += 1;
+    }
+
+    fn pop(self: *PendingSends) ?PendingSend {
+        if (self.count == 0) return null;
+        const item = self.items[self.head];
+        self.head = (self.head + 1) % self.items.len;
+        self.count -= 1;
+        return item;
+    }
+
+    fn reset(self: *PendingSends) void {
+        self.head = 0;
+        self.count = 0;
+        self.overflow = false;
+    }
+};
+
+fn qlogPacketType(ptype: Packet.PacketType) qlog.PacketType {
+    return switch (ptype) {
+        .initial => .initial,
+        .handshake => .handshake,
+        .zero_rtt => .zero_rtt,
+        .one_rtt => .one_rtt,
+        .retry => .retry,
+        .version_negotiation => .version_negotiation,
+    };
+}
+
+/// Coarse frame categories; never serializes frame contents.
+fn summarizeFrame(summary: *qlog.FrameSummary, frame: QuicFrames.Frame) void {
+    switch (frame) {
+        .stream, .stream_fin, .stream_len, .stream_len_fin, .stream_off, .stream_off_fin, .stream_off_len, .stream_off_len_fin => summary.stream +|= 1,
+        .crypto => summary.crypto +|= 1,
+        .ack, .ack_ecn => summary.ack +|= 1,
+        .max_data, .max_stream_data, .max_streams_bidi, .max_streams_uni, .data_blocked, .stream_data_blocked, .streams_blocked_bidi, .streams_blocked_uni => summary.flow +|= 1,
+        .padding => summary.padding +|= 1,
+        .ping, .reset_stream, .stop_sending, .new_token, .new_connection_id, .retire_connection_id, .path_challenge, .path_response, .connection_close, .connection_close_app, .handshake_done => summary.control +|= 1,
+        else => summary.other +|= 1,
+    }
+}
 
 /// Minimal QUIC varint size for `value`, matching zquic's writeVarint.
 fn varintSize(value: u64) usize {
@@ -181,26 +273,48 @@ fn streamFrameDataThatFits(fixed_overhead: usize, budget_left: usize, max_take: 
     return 0;
 }
 
-/// Per-stream flow-control state. Send limits are the peer's transport
-/// parameters; receive limits are what this endpoint advertised.
-const StreamFlow = struct {
-    /// Highest absolute stream offset this endpoint may send.
-    send_limit: u64,
-    /// Highest absolute stream offset the peer may send.
-    recv_limit: u64,
-    /// Highest offset actually observed from the peer.
-    recv_offset: u64 = 0,
-    send_fin: bool = false,
-    recv_fin: bool = false,
-    closed_counted: bool = false,
-};
-
-pub const default_flow_window: u64 = 16 * 1024 * 1024;
+/// Maximum lost payloads resent in one service pass. Anything beyond this stays
+/// queued for the next pass, so a loss storm cannot monopolize the event loop.
 const max_retransmits_per_service = 64;
+
+/// Maximum lost payloads retained while waiting to be resent. The oldest entry
+/// is evicted when the queue grows past this cap.
+const max_lost_payloads_retained = 8192;
+
+/// zquic can declare a packet lost just before its ACK is read from the socket
+/// (its loss floor is 1 ms). Keep a lost payload briefly before resending so a
+/// delayed ACK wins instead of turning every control packet into a retransmit
+/// storm. This is pacing, not a second loss detector: the decision stays with
+/// zquic's callback. The synthetic drop hook bypasses the grace.
+const lost_payload_grace_us = 200_000;
 
 /// Test-visible count of successful frame retransmissions. The test runner is
 /// single-threaded; production code does not read this.
 pub var test_retransmit_count: u64 = 0;
+
+/// Test-visible capture of the most recent successful lost-payload resend.
+/// Copying and frame parsing are disabled in production;
+/// recovery_owner_test enables them.
+pub const max_captured_retransmit_payload = 2048;
+pub var test_capture_retransmit_payload: bool = false;
+pub var test_retransmit_last_old_packet_number: u64 = 0;
+pub var test_retransmit_last_new_packet_number: u64 = 0;
+pub var test_retransmit_last_level: usize = 0;
+pub var test_retransmit_last_payload_len: usize = 0;
+pub var test_retransmit_last_payload: [max_captured_retransmit_payload]u8 = @splat(0);
+
+/// One lost packet copied out of zquic's callback. zquic frees its retained
+/// plaintext as soon as the callback returns, so the transport owns this copy.
+const LostPayload = struct {
+    level: usize,
+    packet_number: u64,
+    detected_us: u64,
+    payload: []u8,
+
+    fn deinit(self: *const LostPayload, allocator: std.mem.Allocator) void {
+        allocator.free(self.payload);
+    }
+};
 
 /// Test-visible flow-control observations.
 pub var test_max_data_sent: u64 = 0;
@@ -221,33 +335,66 @@ pub var test_batch_multi_stream_packets: u64 = 0;
 pub var test_batch_largest_payload: usize = 0;
 pub var test_batch_budget: usize = 0;
 
+/// Test-visible control/data coalescing observations. A "coalesced" packet is
+/// one protected 1-RTT packet whose plaintext contains at least one control
+/// frame (ACK, MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS, HANDSHAKE_DONE) before
+/// its STREAM frames. Counters are only for this single-threaded test runner.
+pub var test_control_coalesced_packets: u64 = 0;
+pub var test_ack_coalesced_packets: u64 = 0;
+pub var test_flow_coalesced_packets: u64 = 0;
+pub var test_handshake_done_coalesced_packets: u64 = 0;
+/// Standalone 1-RTT ACK packets (the fallback when no STREAM data is queued)
+/// and the padded plaintext length of the most recent one. Header protection
+/// needs a 16-byte sample starting four bytes after the packet number, so
+/// schedule() pads every payload to at least 64 bytes.
+pub var test_standalone_ack_packets: u64 = 0;
+pub var test_standalone_ack_plaintext_len: usize = 0;
+/// Plaintext length of the most recent successfully scheduled packet.
+pub var test_last_scheduled_plaintext_len: usize = 0;
+
+/// Receive-side observations: which frame mixtures arrived and how many
+/// duplicate control frames a single protected packet carried.
+pub var test_rx_ack_frames: u64 = 0;
+pub var test_rx_max_data_frames: u64 = 0;
+pub var test_rx_max_stream_data_frames: u64 = 0;
+pub var test_rx_ack_with_stream_packets: u64 = 0;
+pub var test_rx_max_with_stream_packets: u64 = 0;
+pub var test_rx_duplicate_ack_packets: u64 = 0;
+
 /// Test-visible Retry decisions made by client connections.
 pub var test_retry_accepted: u64 = 0;
 pub var test_retry_rejected: u64 = 0;
 
-/// Test-visible observation of packets zquic declared lost. The observer only
-/// records what zquic already decided; it does not resend anything. The test
-/// runner is single-threaded.
+/// Test-visible observation of packets zquic declared lost. The callback runs
+/// before zquic frees its retained plaintext. The test runner is single-threaded.
 pub var test_zquic_lost_packets: u64 = 0;
 pub var test_zquic_lost_payload_packets: u64 = 0;
 pub var test_zquic_lost_payload_bytes: u64 = 0;
+pub var test_zquic_lost_application_payload_packets: u64 = 0;
 pub var test_zquic_lost_last_level: usize = 0;
 pub var test_zquic_lost_last_packet_number: u64 = 0;
 
-/// Lost-packet observer installed on client and server SuperConnections. The
-/// payload is only valid during this call; this intentionally keeps no copy.
+/// Lost-packet observer installed on client and server SuperConnections.
+///
+/// zquic is the retransmission owner: this callback copies each lost plaintext
+/// into the connection's bounded queue and returns immediately. Service drains
+/// the queue through sendProtectedRawPacket after pollLossRecovery, so no send
+/// happens inside zquic's packet-space iterator.
 fn observeZquicLostPacket(
-    _: ?*anyopaque,
+    context: ?*anyopaque,
     level: usize,
     packet_number: u64,
     payload: []const u8,
 ) void {
-    test_zquic_lost_packets += 1;
+    test_zquic_lost_packets +|= 1;
     test_zquic_lost_last_level = level;
     test_zquic_lost_last_packet_number = packet_number;
     if (payload.len == 0) return;
-    test_zquic_lost_payload_packets += 1;
-    test_zquic_lost_payload_bytes += payload.len;
+    test_zquic_lost_payload_packets +|= 1;
+    test_zquic_lost_payload_bytes +|= payload.len;
+    if (level == 3) test_zquic_lost_application_payload_packets +|= 1;
+    const self: *Connection = @ptrCast(@alignCast(context orelse return));
+    self.queueLostPayload(level, packet_number, payload);
 }
 
 pub const Connection = struct {
@@ -295,6 +442,10 @@ pub const Connection = struct {
 
     established: bool = false,
     handshake_done_sent: bool = false,
+    /// A server queues HANDSHAKE_DONE here and flushStreams() coalesces it
+    /// ahead of STREAM data when possible; otherwise finishControlFrames()
+    /// sends it standalone in the same service pass.
+    handshake_done_pending: bool = false,
     closing: bool = false,
     closed: bool = false,
     close_code: u64 = 0,
@@ -302,43 +453,28 @@ pub const Connection = struct {
     /// Monotonic transport counters for this connection. Single-threaded: only
     /// the owning service/dispatch thread updates them.
     stats: Stats = .{},
+    /// Allocated only when a qlog sink was installed for this connection.
+    /// Everything qlog-related is checked through this pointer first.
+    qlog: ?*qlog.Writer = null,
+    qlog_pending: ?*PendingSends = null,
 
     stream_send: std.AutoHashMapUnmanaged(u64, StreamSend) = .empty,
-    stream_flow: std.AutoHashMapUnmanaged(u64, StreamFlow) = .empty,
+    /// Stream windows, connection windows, and stream-count bookkeeping.
+    flow: FlowControl,
     finished_streams: std.ArrayListUnmanaged(u64) = .empty,
     closed_streams: std.DynamicBitSet = undefined,
     closed_streams_ready: bool = false,
-    local_max_data: u64 = default_flow_window,
-    local_max_stream_data: u64 = default_flow_window,
-    recv_data_limit: u64 = default_flow_window,
-    recv_data: u64 = 0,
-    peer_max_data: u64 = 0,
-    sent_data: u64 = 0,
-    local_max_streams_bidi: u64 = 100,
-    local_max_streams_uni: u64 = 100,
-    advertised_streams_bidi: u64 = 100,
-    advertised_streams_uni: u64 = 100,
-    peer_opened_bidi: u64 = 0,
-    peer_opened_uni: u64 = 0,
-    peer_max_streams_bidi: u64 = 0,
-    peer_max_streams_uni: u64 = 0,
-    opened_bidi: u64 = 0,
-    opened_uni: u64 = 0,
-    closed_peer_bidi: u64 = 0,
-    closed_peer_uni: u64 = 0,
-    last_max_streams_bidi_sent: u64 = 0,
-    last_max_streams_uni_sent: u64 = 0,
-    /// Retained ack-eliciting packets awaiting acknowledgment.
-    recovery: Recovery,
+    /// Plaintexts zquic declared lost, copied out of its callback and awaiting
+    /// a new packet number in service. Bounded; oldest entries are evicted.
+    lost_queue: std.ArrayListUnmanaged(LostPayload) = .empty,
+    /// Index of the first unread entry in lost_queue. Compaction reclaims the
+    /// consumed prefix without shifting on every callback.
+    lost_queue_head: usize = 0,
     /// Test hook: drop every Nth outgoing datagram (0 disables). Production
     /// callers leave this at zero; the retransmission test uses it to simulate
-    /// loss without a network shim.
+    /// loss without a network shim. zquic recorded the packet when it was
+    /// scheduled, so its loss detector recovers the dropped datagram.
     drop_outgoing_every: usize = 0,
-    /// Test hook: a datagram discarded by drop_outgoing_every is known lost, so
-    /// the next retransmitLost pass treats every retained packet as due once.
-    /// This keeps loss tests meaningful when batching changes how many
-    /// datagrams a response occupies. Always false in production.
-    force_retransmit: bool = false,
     tx_count: usize = 0,
     handler: ?Handler = null,
     last_activity_us: u64,
@@ -349,6 +485,19 @@ pub const Connection = struct {
         host: []const u8,
         port: u16,
         options: ClientTls,
+    ) !*Connection {
+        return initWithQlog(allocator, host, port, options, null);
+    }
+
+    /// Client connection constructor with an optional qlog sink. The header
+    /// and connectivity:connection_started are emitted as soon as both local
+    /// and peer CIDs exist, before the first packet is scheduled.
+    pub fn initWithQlog(
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+        options: ClientTls,
+        qlog_config: ?qlog.Config,
     ) !*Connection {
         const remote = try resolveAddress(host, port);
         const socket = try createSocket();
@@ -372,10 +521,11 @@ pub const Connection = struct {
             .packet_crypto = undefined,
             .tls = undefined,
             .crypto_rx = undefined,
-            .recovery = Recovery.init(allocator),
-            .local_max_data = options.initial_max_data,
-            .local_max_stream_data = options.initial_max_stream_data,
-            .recv_data_limit = options.initial_max_data,
+            .flow = FlowControl.init(
+                allocator,
+                options.initial_max_data,
+                options.initial_max_stream_data,
+            ),
             .last_activity_us = nowMicros(),
             .handshake_started_us = nowMicros(),
         };
@@ -383,6 +533,8 @@ pub const Connection = struct {
         self.local_cid_len = cid_len;
         self.original_dcid = original_dcid;
         self.original_dcid_len = cid_len;
+        self.installQlog(qlog_config, qlog.Reference.now(), true);
+        errdefer self.freeQlog();
 
         try self.initCrypto(original_dcid[0..cid_len]);
         self.quic.super_connection.local_conn_id = try Packet.ConnectionId.init(client_cid[0..cid_len]);
@@ -415,6 +567,38 @@ pub const Connection = struct {
         local_max_data: u64,
         local_max_stream_data: u64,
     ) !*Connection {
+        return initServerWithQlog(
+            allocator,
+            socket,
+            local_addr,
+            remote_addr,
+            initial_dcid,
+            original_dcid,
+            client_cid,
+            retry_scid,
+            local_max_data,
+            local_max_stream_data,
+            null,
+            .{},
+        );
+    }
+
+    /// Server-side constructor used by Listener.dispatch. The listener has
+    /// already written the stream header; this only emits connection events.
+    pub fn initServerWithQlog(
+        allocator: std.mem.Allocator,
+        socket: posix.fd_t,
+        local_addr: posix.sockaddr.in,
+        remote_addr: posix.sockaddr.in,
+        initial_dcid: []const u8,
+        original_dcid: []const u8,
+        client_cid: []const u8,
+        retry_scid: []const u8,
+        local_max_data: u64,
+        local_max_stream_data: u64,
+        qlog_config: ?qlog.Config,
+        qlog_reference: qlog.Reference,
+    ) !*Connection {
         const self = try allocator.create(Connection);
         errdefer allocator.destroy(self);
 
@@ -435,10 +619,7 @@ pub const Connection = struct {
             .packet_crypto = undefined,
             .tls = undefined,
             .crypto_rx = undefined,
-            .recovery = Recovery.init(allocator),
-            .local_max_data = local_max_data,
-            .local_max_stream_data = local_max_stream_data,
-            .recv_data_limit = local_max_data,
+            .flow = FlowControl.init(allocator, local_max_data, local_max_stream_data),
             .last_activity_us = nowMicros(),
             .handshake_started_us = nowMicros(),
         };
@@ -453,6 +634,8 @@ pub const Connection = struct {
         self.retry_scid = @splat(0);
         self.retry_scid_len = @intCast(retry_scid.len);
         @memcpy(self.retry_scid[0..retry_scid.len], retry_scid);
+        self.installQlog(qlog_config, qlog_reference, false);
+        errdefer self.freeQlog();
 
         try self.initCrypto(initial_dcid);
         self.quic.super_connection.local_conn_id = try Packet.ConnectionId.init(server_cid[0..cid_len]);
@@ -469,6 +652,62 @@ pub const Connection = struct {
         return self;
     }
 
+    fn vantagePoint(self: *const Connection) qlog.VantagePoint {
+        return switch (self.role) {
+            .client => .client,
+            .server => .server,
+        };
+    }
+
+    /// Allocate the per-connection writer only when a sink was installed. A
+    /// failed allocation leaves qlog disabled instead of failing the connection.
+    fn installQlog(self: *Connection, config: ?qlog.Config, reference: qlog.Reference, write_header: bool) void {
+        const cfg = config orelse return;
+        const writer = self.allocator.create(qlog.Writer) catch return;
+        writer.* = qlog.Writer.init(cfg, reference);
+        self.qlog = writer;
+        const pending = self.allocator.create(PendingSends) catch null;
+        if (pending) |p| p.* = .{};
+        self.qlog_pending = pending;
+        if (write_header) writer.writeHeader(self.vantagePoint());
+        writer.connectionStarted(
+            nowMicros(),
+            self.vantagePoint(),
+            self.local_cid[0..self.local_cid_len],
+            self.peer_cid[0..self.peer_cid_len],
+        );
+    }
+
+    fn freeQlog(self: *Connection) void {
+        if (self.qlog_pending) |pending| {
+            self.allocator.destroy(pending);
+            self.qlog_pending = null;
+        }
+        if (self.qlog) |writer| {
+            self.allocator.destroy(writer);
+            self.qlog = null;
+        }
+    }
+
+    fn qlogError(self: *Connection, now_us: u64, code: u64, reason: []const u8) void {
+        const writer = self.qlog orelse return;
+        if (code == 0x0100) return;
+        writer.errorEvent(now_us, code, reason);
+    }
+
+    fn qlogRemoteClose(self: *Connection, code: u64) void {
+        const writer = self.qlog orelse return;
+        const now = nowMicros();
+        if (code != 0 and code != 0x0100) writer.errorEvent(now, code, "peer connection close");
+        writer.connectionClosed(
+            now,
+            .remote,
+            code,
+            "peer connection close",
+            qlog.ConnectionStats.from(self.stats),
+        );
+    }
+
     fn initCrypto(self: *Connection, initial_dcid: []const u8) !void {
         const role: ConnRole = switch (self.role) {
             .client => .client,
@@ -480,12 +719,11 @@ pub const Connection = struct {
         errdefer self.packet_crypto.deinit();
         self.quic = try zquic.Connection.Connection.init(self.allocator, role, .{});
         errdefer self.quic.deinit();
-        // Observe (never retransmit) packets zquic declares lost. The existing
-        // transport retransmitter below remains the only sender on this path,
-        // so suppress zquic's duplicate PTO PING/CRYPTO probes until recovery
-        // ownership moves into zquic.
-        self.quic.super_connection.setLostPacketObserver(observeZquicLostPacket, null);
-        self.quic.super_connection.pto_probes_enabled = false;
+        // zquic owns loss detection and names the lost plaintexts; the observer
+        // copies each one into this connection's bounded queue. PTO probes stay
+        // enabled so a tail loss (no later packet to ACK) still elicits an ACK,
+        // which lets zquic's detector surface the original packet.
+        self.quic.super_connection.setLostPacketObserver(observeZquicLostPacket, self);
 
         var initialized: usize = 0;
         errdefer for (self.crypto_rx[0..initialized]) |*r| r.deinit();
@@ -508,15 +746,26 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
+        if (self.qlog) |writer| {
+            writer.connectionClosed(
+                nowMicros(),
+                .transport,
+                self.close_code,
+                "connection deinit",
+                qlog.ConnectionStats.from(self.stats),
+            );
+        }
+        self.freeQlog();
         self.retry_token.deinit(self.allocator);
         self.initial_crypto.deinit(self.allocator);
         var it = self.stream_send.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
         self.stream_send.deinit(self.allocator);
-        self.stream_flow.deinit(self.allocator);
+        self.flow.deinit();
         self.finished_streams.deinit(self.allocator);
         if (self.closed_streams_ready) self.closed_streams.deinit();
-        self.recovery.deinit();
+        self.clearLostQueue();
+        self.lost_queue.deinit(self.allocator);
         self.tls.destroy();
         self.deinitCrypto();
         if (self.local_params.len > 0) self.allocator.free(self.local_params);
@@ -550,12 +799,12 @@ pub const Connection = struct {
             // This stack routes by the original CIDs and keeps a fixed peer
             // address; advertise that migration is not supported.
             .disable_active_migration = true,
-            .initial_max_data = self.local_max_data,
-            .initial_max_stream_data_bidi_local = self.local_max_stream_data,
-            .initial_max_stream_data_bidi_remote = self.local_max_stream_data,
-            .initial_max_stream_data_uni = self.local_max_stream_data,
-            .initial_max_streams_bidi = self.local_max_streams_bidi,
-            .initial_max_streams_uni = self.local_max_streams_uni,
+            .initial_max_data = self.flow.local_max_data,
+            .initial_max_stream_data_bidi_local = self.flow.local_max_stream_data,
+            .initial_max_stream_data_bidi_remote = self.flow.local_max_stream_data,
+            .initial_max_stream_data_uni = self.flow.local_max_stream_data,
+            .initial_max_streams_bidi = self.flow.local_max_streams_bidi,
+            .initial_max_streams_uni = self.flow.local_max_streams_uni,
             .initial_source_connection_id = self.local_cid[0..self.local_cid_len],
             .original_destination_connection_id = if (server)
                 self.original_dcid[0..self.original_dcid_len]
@@ -623,12 +872,18 @@ pub const Connection = struct {
         if (processed.encryption_level == .early_data) return;
 
         var ack_eliciting = false;
+        var rx_ack_frames: usize = 0;
+        var rx_max_frames: usize = 0;
+        var rx_has_stream = false;
+        var frame_summary: qlog.FrameSummary = .{};
+        const log_frames = self.qlog != null;
         var sanitized: std.Io.Writer.Allocating = .init(self.allocator);
         defer sanitized.deinit();
         var reader = std.Io.Reader.fixed(processed.payload);
         while (reader.seek < reader.end) {
             var frame = QuicFrames.Frame.parse(&reader, self.allocator) catch break;
             defer frame.deinit(self.allocator);
+            if (log_frames) summarizeFrame(&frame_summary, frame);
 
             switch (frame) {
                 .crypto => |crypto| {
@@ -644,6 +899,7 @@ pub const Connection = struct {
                 },
                 .stream, .stream_fin, .stream_len, .stream_len_fin, .stream_off, .stream_off_fin, .stream_off_len, .stream_off_len_fin => |stream| {
                     ack_eliciting = true;
+                    rx_has_stream = true;
                     if (self.isStreamClosed(stream.stream_id)) continue;
                     const end = std.math.add(u64, stream.offset, @intCast(stream.data.len)) catch {
                         self.close(0x3, "flow control");
@@ -653,29 +909,21 @@ pub const Connection = struct {
                         self.close(if (err == error.StreamLimitExceeded) 0x4 else 0x1, "flow state");
                         return;
                     };
-                    if (end > flow.recv_limit) {
-                        self.close(0x3, "stream flow control");
+                    self.flow.receive(
+                        stream.stream_id,
+                        flow,
+                        end,
+                        stream.fin,
+                        self.role == .client,
+                    ) catch |err| {
+                        self.close(0x3, switch (err) {
+                            error.StreamFlowControlExceeded => "stream flow control",
+                            error.ConnectionFlowControlExceeded => "connection flow control",
+                        });
                         return;
-                    }
-                    if (end > flow.recv_offset) {
-                        const delta = end - flow.recv_offset;
-                        const total = std.math.add(u64, self.recv_data, delta) catch {
-                            self.close(0x3, "connection flow control");
-                            return;
-                        };
-                        if (total > self.recv_data_limit) {
-                            self.close(0x3, "connection flow control");
-                            return;
-                        }
-                        self.recv_data = total;
-                        flow.recv_offset = end;
-                    }
-                    if (stream.fin) {
-                        flow.recv_fin = true;
-                        self.maybeCountClosed(stream.stream_id, flow);
-                        if (flow.send_fin) {
-                            self.finished_streams.append(self.allocator, stream.stream_id) catch {};
-                        }
+                    };
+                    if (stream.fin and flow.send_fin) {
+                        self.finished_streams.append(self.allocator, stream.stream_id) catch {};
                     }
                     if (self.handler) |handler| {
                         handler.on_stream_frame(
@@ -687,32 +935,40 @@ pub const Connection = struct {
                         ) catch {};
                     }
                 },
-                .ack => |ack_frame| self.recovery.acknowledge(tlsLevel(processed.encryption_level), &ack_frame),
-                .ack_ecn => |ack_ecn| self.recovery.acknowledge(tlsLevel(processed.encryption_level), &ack_ecn.ack_frame),
+                .ack, .ack_ecn => {
+                    // ACK generation/retention stays in the transport for this
+                    // milestone; only the resend decision moved to zquic.
+                    rx_ack_frames += 1;
+                },
                 .max_data => |max_data| {
-                    if (max_data.maximum_data > self.peer_max_data) self.peer_max_data = max_data.maximum_data;
+                    rx_max_frames += 1;
+                    test_rx_max_data_frames +|= 1;
+                    self.flow.receiveMaxData(max_data.maximum_data);
                 },
                 .max_stream_data => |max_stream| {
-                    if (self.stream_flow.getPtr(max_stream.stream_id)) |flow| {
-                        if (max_stream.maximum_stream_data > flow.send_limit) {
-                            flow.send_limit = max_stream.maximum_stream_data;
-                        }
-                    }
+                    rx_max_frames += 1;
+                    test_rx_max_stream_data_frames +|= 1;
+                    self.flow.receiveMaxStreamData(
+                        max_stream.stream_id,
+                        max_stream.maximum_stream_data,
+                    );
                 },
                 .max_streams_bidi => |max_streams| {
-                    if (max_streams.maximum_streams > self.peer_max_streams_bidi) {
-                        self.peer_max_streams_bidi = max_streams.maximum_streams;
-                    }
+                    self.flow.receiveMaxStreams(max_streams.maximum_streams, true);
                 },
                 .max_streams_uni => |max_streams| {
-                    if (max_streams.maximum_streams > self.peer_max_streams_uni) {
-                        self.peer_max_streams_uni = max_streams.maximum_streams;
-                    }
+                    self.flow.receiveMaxStreams(max_streams.maximum_streams, false);
                 },
                 .padding, .connection_close, .connection_close_app => {
                     const tag = std.meta.activeTag(frame);
                     if (tag == .connection_close or tag == .connection_close_app) {
                         self.closed = true;
+                        const close_code: u64 = switch (frame) {
+                            .connection_close => |close_frame| close_frame.error_code,
+                            .connection_close_app => |close_frame| close_frame.error_code,
+                            else => 0,
+                        };
+                        self.qlogRemoteClose(close_code);
                         if (self.handler) |handler| handler.on_closed(handler.context, 0);
                     }
                 },
@@ -731,7 +987,27 @@ pub const Connection = struct {
             }
         }
 
+        if (rx_ack_frames > 0) {
+            test_rx_ack_frames +|= @intCast(rx_ack_frames);
+            if (rx_ack_frames > 1) test_rx_duplicate_ack_packets +|= 1;
+            if (rx_has_stream) test_rx_ack_with_stream_packets +|= 1;
+        }
+        if (rx_max_frames > 0 and rx_has_stream) {
+            test_rx_max_with_stream_packets +|= 1;
+        }
+
         self.acks[idx].record(processed.packet_number, ack_eliciting);
+        if (self.qlog) |writer| {
+            if (writer.sampleReceived()) writer.packetReceived(
+                nowMicros(),
+                processed.packet_number,
+                @intCast(idx),
+                qlogPacketType(header.packet_type),
+                ack_eliciting,
+                processed.payload.len,
+                frame_summary,
+            );
+        }
         if (sanitized.written().len > 0) {
             self.quic.super_connection.processPlaintextPayloadAtLevel(processed.encryption_level, sanitized.written()) catch {};
         }
@@ -784,11 +1060,12 @@ pub const Connection = struct {
 
         // Restart the Initial packet number space from zero (RFC 9000
         // Section 17.2.5.2) and discard everything protected with the old
-        // Initial keys, in both the transport's recovery store and zquic's
-        // own packet space.
+        // Initial keys. zquic owns sent-packet retention now; queued lost
+        // Initial payloads from before the Retry must never be resent with the
+        // new keys.
         self.packet_crypto.resetInitialPacketNumberState();
         self.packet_crypto.initial_token = self.retry_token.items;
-        self.recovery.discardLevel(0);
+        self.clearLostQueue();
         self.quic.super_connection.discardPacketNumberSpace(.initial);
         self.crypto_tx_offset[0] = 0;
         self.largest_pn[0] = null;
@@ -894,86 +1171,35 @@ pub const Connection = struct {
             };
         self.quic.super_connection.applyPeerTransportParameters(params, context) catch return error.QuicError;
         self.peer_params = params;
-        self.peer_max_data = params.initial_max_data;
-        self.peer_max_streams_bidi = params.initial_max_streams_bidi;
-        self.peer_max_streams_uni = params.initial_max_streams_uni;
-        self.refreshStreamSendLimits();
+        self.flow.applyPeerLimits(.{
+            .max_data = params.initial_max_data,
+            .max_streams_bidi = params.initial_max_streams_bidi,
+            .max_streams_uni = params.initial_max_streams_uni,
+            .max_stream_data_uni = params.initial_max_stream_data_uni,
+            .max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local,
+            .max_stream_data_bidi_remote = params.initial_max_stream_data_bidi_remote,
+        }, self.role == .client);
         self.peer_params_applied = true;
     }
 
+    /// Queue HANDSHAKE_DONE for the current service pass. flushStreams() puts
+    /// it ahead of STREAM data when the packet has room; otherwise the
+    /// standalone control path sends it before flush() drains the datagrams.
     fn sendHandshakeDone(self: *Connection) !void {
         if (!self.application_keys) return;
-        const frames = [_]QuicFrames.Frame{.{ .handshake_done = QuicFrames.HandshakeDoneFrame.init() }};
-        try self.schedule(3, .one_rtt, &frames);
-        self.handshake_done_sent = true;
+        self.handshake_done_pending = true;
     }
 
-    fn streamIsUni(stream_id: u64) bool {
-        return (stream_id & 0x2) != 0;
-    }
-
-    fn streamOpenedByUs(self: *const Connection, stream_id: u64) bool {
-        const client_initiated = (stream_id & 0x1) == 0;
-        return client_initiated == (self.role == .client);
-    }
-
-    fn initialSendLimit(self: *const Connection, stream_id: u64) u64 {
-        const params = self.peer_params orelse return 0;
-        const ours = self.streamOpenedByUs(stream_id);
-        if (streamIsUni(stream_id)) {
-            return if (ours) params.initial_max_stream_data_uni else 0;
-        }
-        return if (ours)
-            params.initial_max_stream_data_bidi_remote
-        else
-            params.initial_max_stream_data_bidi_local;
-    }
-
-    fn ensureStreamFlow(self: *Connection, stream_id: u64) !*StreamFlow {
-        const gop = try self.stream_flow.getOrPut(self.allocator, stream_id);
-        if (!gop.found_existing) {
-            const ours = self.streamOpenedByUs(stream_id);
-            if (!ours) {
-                if (streamIsUni(stream_id)) {
-                    self.peer_opened_uni += 1;
-                    if (self.peer_opened_uni > self.advertised_streams_uni) return error.StreamLimitExceeded;
-                } else {
-                    self.peer_opened_bidi += 1;
-                    if (self.peer_opened_bidi > self.advertised_streams_bidi) return error.StreamLimitExceeded;
-                }
-            }
-            const recv_limit: u64 = if (streamIsUni(stream_id) and ours)
-                0
-            else
-                self.local_max_stream_data;
-            gop.value_ptr.* = .{
-                .send_limit = self.initialSendLimit(stream_id),
-                .recv_limit = recv_limit,
-            };
-            self.stats.streams_opened +|= 1;
-        }
-        return gop.value_ptr;
+    /// Find or create flow state; a created entry counts toward
+    /// Stats.streams_opened. The statistics counter stays with Connection.
+    fn ensureStreamFlow(self: *Connection, stream_id: u64) !*flow_control.StreamFlow {
+        const ensured = try self.flow.ensureStream(stream_id, self.role == .client);
+        if (ensured.created) self.stats.streams_opened +|= 1;
+        return ensured.flow;
     }
 
     fn refreshStreamSendLimits(self: *Connection) void {
-        var it = self.stream_flow.iterator();
-        while (it.next()) |entry| {
-            const updated = self.initialSendLimit(entry.key_ptr.*);
-            if (updated > entry.value_ptr.send_limit) entry.value_ptr.send_limit = updated;
-        }
-    }
-
-    /// A bidirectional stream is closed once both sides have sent FIN. Count
-    /// peer-initiated streams so MAX_STREAMS can replace them.
-    fn maybeCountClosed(self: *Connection, stream_id: u64, flow: *StreamFlow) void {
-        if (!flow.send_fin or !flow.recv_fin or flow.closed_counted) return;
-        flow.closed_counted = true;
-        if (self.streamOpenedByUs(stream_id)) return;
-        if (streamIsUni(stream_id)) {
-            self.closed_peer_uni += 1;
-        } else {
-            self.closed_peer_bidi += 1;
-        }
+        self.flow.refreshStreamSendLimits(self.role == .client);
     }
 
     /// Append stream data and schedule it on the next service pass.
@@ -1016,30 +1242,29 @@ pub const Connection = struct {
     /// Test-visible peer stream send limit, or null when the stream has no flow
     /// state yet.
     pub fn streamSendLimit(self: *const Connection, stream_id: u64) ?u64 {
-        const flow = self.stream_flow.get(stream_id) orelse return null;
-        return flow.send_limit;
+        return self.flow.streamSendLimit(stream_id);
     }
 
     pub fn createBidiStream(self: *Connection) !u64 {
-        if (self.opened_bidi >= self.peer_max_streams_bidi) return error.StreamLimitExceeded;
+        if (self.flow.opened_bidi >= self.flow.peer_max_streams_bidi) return error.StreamLimitExceeded;
         const stream_type: zquic.core.Stream.StreamType = switch (self.role) {
             .client => .client_bidirectional,
             .server => .server_bidirectional,
         };
         const stream = self.quic.createStream(stream_type) catch return error.QuicError;
-        self.opened_bidi += 1;
+        self.flow.opened_bidi += 1;
         _ = try self.ensureStreamFlow(stream.id);
         return stream.id;
     }
 
     pub fn createUniStream(self: *Connection) !u64 {
-        if (self.opened_uni >= self.peer_max_streams_uni) return error.StreamLimitExceeded;
+        if (self.flow.opened_uni >= self.flow.peer_max_streams_uni) return error.StreamLimitExceeded;
         const stream_type: zquic.core.Stream.StreamType = switch (self.role) {
             .client => .client_unidirectional,
             .server => .server_unidirectional,
         };
         const stream = self.quic.createStream(stream_type) catch return error.QuicError;
-        self.opened_uni += 1;
+        self.flow.opened_uni += 1;
         _ = try self.ensureStreamFlow(stream.id);
         return stream.id;
     }
@@ -1094,12 +1319,21 @@ pub const Connection = struct {
     /// header, packet number, AEAD tag, and STREAM frame varints are reserved;
     /// this replaces the old hardcoded 1000-byte chunk without requiring a
     /// full packet builder yet.
-    fn maxStreamFramePayload(self: *const Connection) usize {
+    /// Plaintext bytes available in one 1-RTT packet after the short header,
+    /// packet number, and AEAD tag. 24 more bytes are reserved for a STREAM
+    /// frame's type/stream-id/offset/length varints by maxStreamFramePayload.
+    fn maxPacketPayload(self: *const Connection) usize {
         const advertised = if (self.peer_params) |params| params.max_udp_payload_size else 1472;
         const mtu: usize = @intCast(std.math.clamp(advertised, 1200, 1472));
-        const overhead: usize = 1 + self.destinationCid(3).len + 4 + 16 + 24;
+        const overhead: usize = 1 + self.destinationCid(3).len + 4 + 16;
         if (mtu <= overhead) return 0;
         return mtu - overhead;
+    }
+
+    fn maxStreamFramePayload(self: *const Connection) usize {
+        const payload = self.maxPacketPayload();
+        if (payload <= 24) return 0;
+        return payload - 24;
     }
 
     /// Build one candidate 1-RTT data batch. The caller schedules the frames as
@@ -1110,9 +1344,10 @@ pub const Connection = struct {
         streams: *std.ArrayListUnmanaged(BatchStream),
         frames: *std.ArrayListUnmanaged(QuicFrames.Frame),
         claims: *std.ArrayListUnmanaged(StreamClaim),
+        budget_limit: usize,
     ) !BatchBuild {
         var build = BatchBuild{};
-        build.budget = self.maxStreamFramePayload();
+        build.budget = budget_limit;
         if (build.budget == 0) return build;
 
         // Snapshot sendable work. No send state is mutated here; flow entries
@@ -1140,7 +1375,7 @@ pub const Connection = struct {
             if (send.fin_sent) continue;
             const flow = try self.ensureStreamFlow(stream_id);
             const credit = flow.send_limit -| send.sent;
-            if (credit == 0 or self.sent_data >= self.peer_max_data) {
+            if (credit == 0 or self.flow.sent_data >= self.flow.peer_max_data) {
                 test_send_blocked += 1;
                 continue;
             }
@@ -1167,7 +1402,7 @@ pub const Connection = struct {
             budget_left -= overhead;
         }
 
-        var connection_credit = self.peer_max_data -| self.sent_data;
+        var connection_credit = self.flow.peer_max_data -| self.flow.sent_data;
         while (budget_left > 0) {
             var remaining: usize = 0;
             for (streams.items) |*s| {
@@ -1264,27 +1499,197 @@ pub const Connection = struct {
             if (send.sent != claim.offset) continue;
             if (claim.len > 0) {
                 send.sent = claim.offset + claim.len;
-                self.sent_data += claim.len;
+                self.flow.sent_data += claim.len;
             }
             if (claim.fin) {
                 send.fin_sent = true;
-                if (self.stream_flow.getPtr(claim.stream_id)) |flow| {
-                    flow.send_fin = true;
-                    self.maybeCountClosed(claim.stream_id, flow);
-                }
+                self.flow.markSendFin(claim.stream_id, self.role == .client);
                 self.finished_streams.append(self.allocator, claim.stream_id) catch {};
             }
             if (send.fin_sent and send.sent >= send.buf.items.len) {
-                // The frames are retained in the recovery store until ACKed, so
-                // the stream's own copy can be released only after the FIN frame
-                // was successfully scheduled and committed.
+                // zquic retains the protected plaintext until ACK/loss and the
+                // lost-payload queue copies it before a resend, so the stream's
+                // own copy can be released after the FIN frame was successfully
+                // scheduled and committed.
                 send.buf.clearRetainingCapacity();
                 send.sent = 0;
             }
         }
     }
 
-    fn flushStreams(self: *Connection) !void {
+    /// Serialized size of a control frame this file emits. Only the coalescible
+    /// frame types are handled; callers never pass anything else.
+    fn controlFrameLen(frame: QuicFrames.Frame) usize {
+        return switch (frame) {
+            .ack => |ack_frame| blk: {
+                var len: usize = 1 +
+                    varintSize(ack_frame.largest_acknowledged) +
+                    varintSize(ack_frame.ack_delay) +
+                    varintSize(ack_frame.ack_range_count) +
+                    varintSize(ack_frame.first_ack_range);
+                for (ack_frame.ack_ranges) |range| {
+                    len += varintSize(range.gap) + varintSize(range.ack_range_length);
+                }
+                break :blk len;
+            },
+            .max_data => |max_data| 1 + varintSize(max_data.maximum_data),
+            .max_stream_data => |max_stream| 1 +
+                varintSize(max_stream.stream_id) +
+                varintSize(max_stream.maximum_stream_data),
+            .max_streams_bidi, .max_streams_uni => |max_streams| 1 +
+                varintSize(max_streams.maximum_streams),
+            .handshake_done => 1,
+            else => 0,
+        };
+    }
+
+    /// Exact serialized size of the gathered control frames. Used to reserve
+    /// room in the first data packet without an extra frame-size table.
+    fn controlPayloadLen(self: *Connection, control: *const ControlBatch) !usize {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        for (control.frames.items) |frame| {
+            frame.serialize(&out.writer) catch return error.OutOfMemory;
+        }
+        return out.written().len;
+    }
+
+    fn countCoalescedControl(self: *Connection, control: *const ControlBatch) void {
+        _ = self;
+        test_control_coalesced_packets +|= 1;
+        for (control.frames.items) |frame| {
+            switch (frame) {
+                .ack => test_ack_coalesced_packets +|= 1,
+                .max_data, .max_stream_data, .max_streams_bidi, .max_streams_uni => {
+                    test_flow_coalesced_packets +|= 1;
+                },
+                .handshake_done => test_handshake_done_coalesced_packets +|= 1,
+                else => {},
+            }
+        }
+    }
+
+    /// Advance the transport state for a control frame that reached a
+    /// successfully scheduled protected packet. Never call this on a frame
+    /// whose packet failed to schedule.
+    fn commitControlFrame(self: *Connection, frame: QuicFrames.Frame) void {
+        switch (frame) {
+            .ack => {
+                self.acks[3].clear();
+                self.stats.ack_frames_sent +|= 1;
+            },
+            .max_data => |max_data| {
+                self.flow.commitMaxData(max_data.maximum_data);
+                test_max_data_sent += 1;
+                self.stats.flow_updates +|= 1;
+            },
+            .max_stream_data => |max_stream| {
+                self.flow.commitMaxStreamData(
+                    max_stream.stream_id,
+                    max_stream.maximum_stream_data,
+                );
+                test_max_stream_data_sent += 1;
+                self.stats.flow_updates +|= 1;
+            },
+            .max_streams_bidi => |max_streams| {
+                self.flow.commitMaxStreams(max_streams.maximum_streams, true);
+            },
+            .max_streams_uni => |max_streams| {
+                self.flow.commitMaxStreams(max_streams.maximum_streams, false);
+            },
+            .handshake_done => {
+                self.handshake_done_sent = true;
+                self.handshake_done_pending = false;
+            },
+            else => {},
+        }
+    }
+
+    /// Send the gathered control set without STREAM data, splitting it so one
+    /// protected packet stays within the plaintext budget. Each successfully
+    /// scheduled chunk is committed immediately; a later failure leaves only
+    /// the not-yet-sent frames for the next service pass.
+    fn sendStandaloneControl(self: *Connection, control: *ControlBatch) !void {
+        var start: usize = 0;
+        const limit = self.maxPacketPayload();
+        while (start < control.frames.items.len) {
+            var end = start;
+            var used: usize = 0;
+            while (end < control.frames.items.len) {
+                const frame_len = controlFrameLen(control.frames.items[end]);
+                if (end > start and used + frame_len > limit) break;
+                used += frame_len;
+                end += 1;
+                if (used >= limit) break;
+            }
+            if (end == start) end += 1; // a single frame larger than one packet
+            try self.schedule(3, .one_rtt, control.frames.items[start..end]);
+
+            var has_ack = false;
+            for (control.frames.items[start..end]) |frame| {
+                if (std.meta.activeTag(frame) == .ack) has_ack = true;
+                self.commitControlFrame(frame);
+            }
+            if (has_ack) {
+                test_standalone_ack_packets +|= 1;
+                test_standalone_ack_plaintext_len = test_last_scheduled_plaintext_len;
+            }
+            start = end;
+        }
+        control.sent = true;
+    }
+
+    /// Send any control frames flushStreams() could not place in a data packet.
+    fn finishControlFrames(self: *Connection, control: *ControlBatch) !void {
+        if (control.sent or control.frames.items.len == 0) return;
+        if (!self.application_keys or self.closed) return;
+        try self.sendStandaloneControl(control);
+    }
+
+    /// Gather the 1-RTT control frame set for this service pass. Nothing is
+    /// committed here: ACK ranges stay required, recv limits stay put, and
+    /// MAX_STREAMS bookkeeping is untouched until a packet is scheduled.
+    fn collectControlFrames(self: *Connection, control: *ControlBatch) !void {
+        if (!self.application_keys or self.closed) return;
+        try self.collectAckFrame(control);
+        try self.collectFlowControlFrames(control);
+        try self.collectStreamLimitFrames(control);
+        if (self.handshake_done_pending and !self.handshake_done_sent) {
+            try control.frames.append(self.allocator, .{
+                .handshake_done = QuicFrames.HandshakeDoneFrame.init(),
+            });
+        }
+    }
+
+    fn collectAckFrame(self: *Connection, control: *ControlBatch) !void {
+        const state = &self.acks[3];
+        if (!state.ack_required or state.count == 0) return;
+        var ack_frame = state.buildFrame(self.allocator) catch return;
+        control.frames.append(self.allocator, .{ .ack = ack_frame }) catch {
+            ack_frame.deinit(self.allocator);
+            return error.OutOfMemory;
+        };
+        control.ack = ack_frame;
+    }
+
+    /// Queue receive-window updates. Nothing is committed here: the receive
+    /// limit advances only in commitControlFrame() after schedule() succeeds.
+    fn collectFlowControlFrames(self: *Connection, control: *ControlBatch) !void {
+        try self.flow.collectFlowControlFrames(&control.frames);
+    }
+
+    /// Queue MAX_STREAMS replacements. Advertised/last-sent counters advance at
+    /// commit time, never during collection.
+    fn collectStreamLimitFrames(self: *Connection, control: *ControlBatch) !void {
+        try self.flow.collectStreamLimitFrames(&control.frames);
+    }
+
+    /// Build and schedule 1-RTT packets. control is the same set gathered at
+    /// the start of the service pass; when it fits, its frames are placed
+    /// before the first STREAM frame of the first packet. Bookkeeping for both
+    /// the controls and the stream claims is committed only after schedule()
+    /// succeeds, and the control set is sent at most once per pass.
+    fn flushStreams(self: *Connection, control: ?*ControlBatch) !void {
         if (!self.application_keys) return;
 
         var frames: std.ArrayListUnmanaged(QuicFrames.Frame) = .empty;
@@ -1294,27 +1699,78 @@ pub const Connection = struct {
         var streams: std.ArrayListUnmanaged(BatchStream) = .empty;
         defer streams.deinit(self.allocator);
 
+        var control_pending = if (control) |batch|
+            !batch.sent and batch.frames.items.len > 0
+        else
+            false;
+        const packet_budget = self.maxStreamFramePayload();
+
         // At most 64 protected data packets per service pass. Each packet is a
         // transaction: build, schedule, then commit. schedule() failures leave
-        // every claim uncommitted, so the next service pass retries the same
-        // bytes at the same offsets.
+        // every claim and control frame uncommitted, so the next service pass
+        // retries the same bytes at the same offsets and does not resend an
+        // ACK/MAX_* that was never scheduled.
         var guard: usize = 0;
         while (guard < 64) : (guard += 1) {
             frames.clearRetainingCapacity();
             claims.clearRetainingCapacity();
             streams.clearRetainingCapacity();
 
-            const build = try self.collectStreamBatch(&streams, &frames, &claims);
-            if (frames.items.len == 0) break;
+            var control_len: usize = 0;
+            if (control_pending) control_len = try self.controlPayloadLen(control.?);
+
+            // Reserve the control bytes only when at least a minimal STREAM
+            // frame still fits; otherwise the controls go out alone first.
+            const reserve_control = control_pending and
+                control_len < packet_budget and
+                packet_budget - control_len > 26;
+            if (reserve_control) {
+                for (control.?.frames.items) |frame| {
+                    try frames.append(self.allocator, frame);
+                }
+            }
+
+            const budget = if (reserve_control) packet_budget - control_len else packet_budget;
+            const build = try self.collectStreamBatch(&streams, &frames, &claims, budget);
+
+            if (claims.items.len == 0) {
+                if (control_pending) {
+                    // No STREAM data to coalesce with: send the control set on
+                    // its own (split if necessary), then rebuild with the full
+                    // budget in case streams became sendable in between.
+                    if (reserve_control) frames.clearRetainingCapacity();
+                    try self.sendStandaloneControl(control.?);
+                    control_pending = false;
+                    continue;
+                }
+                break;
+            }
+            if (control_pending and !reserve_control) {
+                // The control set does not fit next to data. Sending it once
+                // first keeps ACK/flow state timely and guarantees it is not
+                // duplicated into a later data packet in this pass.
+                try self.sendStandaloneControl(control.?);
+                control_pending = false;
+                continue;
+            }
+
             try self.schedule(3, .one_rtt, frames.items);
 
+            if (reserve_control) {
+                self.countCoalescedControl(control.?);
+                for (control.?.frames.items) |frame| self.commitControlFrame(frame);
+                control.?.sent = true;
+                control_pending = false;
+            }
             self.commitStreamBatch(claims.items);
+
             test_batch_packets +|= 1;
-            test_batch_stream_frames +|= @intCast(frames.items.len);
-            if (frames.items.len > 1) test_batch_multi_frame_packets +|= 1;
+            test_batch_stream_frames +|= @intCast(claims.items.len);
+            if (claims.items.len > 1) test_batch_multi_frame_packets +|= 1;
             if (build.stream_count > 1) test_batch_multi_stream_packets +|= 1;
-            test_batch_largest_payload = @max(test_batch_largest_payload, build.used);
-            test_batch_budget = build.budget;
+            const plaintext_used = build.used + control_len;
+            test_batch_largest_payload = @max(test_batch_largest_payload, plaintext_used);
+            test_batch_budget = packet_budget;
         }
         self.reapFinishedStreams();
     }
@@ -1343,12 +1799,10 @@ pub const Connection = struct {
                 var send = entry.value;
                 send.deinit(self.allocator);
             }
-            if (self.stream_flow.getPtr(stream_id)) |flow| {
-                if (flow.send_fin and flow.recv_fin) {
-                    self.markStreamClosed(stream_id);
-                    _ = self.stream_flow.fetchRemove(stream_id);
-                    self.stats.streams_closed +|= 1;
-                }
+            if (self.flow.isFinished(stream_id)) {
+                self.markStreamClosed(stream_id);
+                self.flow.removeStream(stream_id);
+                self.stats.streams_closed +|= 1;
             }
         }
         self.finished_streams.clearRetainingCapacity();
@@ -1386,6 +1840,11 @@ pub const Connection = struct {
         if (bytes.len == 0) return error.QuicError;
 
         const src: []const u8 = if (ptype == .one_rtt) &.{} else self.local_cid[0..self.local_cid_len];
+        const log_packet = self.qlog != null and self.qlog_pending != null;
+        var frame_summary: qlog.FrameSummary = .{};
+        if (log_packet) {
+            for (frames) |frame| summarizeFrame(&frame_summary, frame);
+        }
         const packet_number = self.packet_crypto.nextPacketNumberForLevel(switch (level) {
             0 => .initial,
             2 => .handshake,
@@ -1404,63 +1863,222 @@ pub const Connection = struct {
             bytes,
         ) catch return error.QuicError;
 
-        if (ack_eliciting) {
-            const owned = self.allocator.dupe(u8, bytes) catch return error.OutOfMemory;
-            self.recovery.track(.{
-                .level = level,
-                .ptype = ptype,
-                .packet_number = packet_number,
-                .sent_us = nowMicros(),
-                .payload = owned,
-            }) catch return error.OutOfMemory;
+        if (log_packet) self.qlog_pending.?.push(.{
+            .packet_number = packet_number,
+            .level = @intCast(level),
+            .ptype = qlogPacketType(ptype),
+            .ack_eliciting = ack_eliciting,
+            .plaintext_len = @intCast(bytes.len),
+            .frames = frame_summary,
+        });
+
+        test_last_scheduled_plaintext_len = bytes.len;
+    }
+
+    /// Copy one lost packet out of zquic's callback. The payload is only valid
+    /// during the callback, so this is the only place it is copied; resending
+    /// happens later from service.
+    fn queueLostPayload(
+        self: *Connection,
+        level: usize,
+        packet_number: u64,
+        payload: []const u8,
+    ) void {
+        if (payload.len == 0) return;
+        // Only the three levels the transport emits are meaningful.
+        if (level != 0 and level != 2 and level != 3) return;
+
+        const owned = self.allocator.dupe(u8, payload) catch return;
+        if (self.retainedLostPayloads() >= max_lost_payloads_retained) {
+            var oldest = self.lost_queue.items[self.lost_queue_head];
+            oldest.deinit(self.allocator);
+            self.lost_queue_head += 1;
+            if (self.lost_queue_head >= 1024) self.compactLostQueue();
         }
+        self.lost_queue.append(self.allocator, .{
+            .level = level,
+            .packet_number = packet_number,
+            .detected_us = nowMicros(),
+            .payload = owned,
+        }) catch {
+            self.allocator.free(owned);
+            return;
+        };
     }
 
-    fn retransmitTimeoutUs(self: *const Connection) u64 {
-        const srtt = self.quic.super_connection.loss_recovery.getSmoothedRtt();
-        return std.math.clamp(srtt *| 2, 200_000, 1_000_000);
+    fn retainedLostPayloads(self: *const Connection) usize {
+        return self.lost_queue.items.len - self.lost_queue_head;
     }
 
-    fn retransmitLost(self: *Connection, now_us: u64) void {
-        const forced = self.force_retransmit;
-        self.force_retransmit = false;
-        const timeout_us = if (forced) 0 else self.retransmitTimeoutUs();
-        var due: std.ArrayListUnmanaged(*SentPacket) = .empty;
-        defer due.deinit(self.allocator);
-        self.recovery.collectDue(now_us, timeout_us, &due);
+    /// Move unread entries to the front and release the consumed prefix.
+    fn compactLostQueue(self: *Connection) void {
+        if (self.lost_queue_head == 0) return;
+        const unread = self.lost_queue.items[self.lost_queue_head..];
+        if (unread.len > 0) {
+            std.mem.copyForwards(LostPayload, self.lost_queue.items[0..unread.len], unread);
+        }
+        self.lost_queue.shrinkRetainingCapacity(unread.len);
+        self.lost_queue_head = 0;
+    }
 
-        var count: usize = 0;
-        for (due.items) |sent| {
-            if (count >= max_retransmits_per_service) break;
-            const dest = self.destinationCid(sent.level);
-            if (dest.len == 0) continue;
-            const src: []const u8 = if (sent.ptype == .one_rtt) &.{} else self.local_cid[0..self.local_cid_len];
-            const packet_number = self.packet_crypto.nextPacketNumberForLevel(switch (sent.level) {
-                0 => .initial,
-                2 => .handshake,
-                else => .application,
-            });
-            self.quic.super_connection.sendProtectedRawPacket(
+    /// Free every queued lost payload. Used on deinit and when Retry discards
+    /// the Initial packet number space.
+    fn clearLostQueue(self: *Connection) void {
+        for (self.lost_queue.items[self.lost_queue_head..]) |*lost| lost.deinit(self.allocator);
+        self.lost_queue.clearRetainingCapacity();
+        self.lost_queue_head = 0;
+    }
+
+    const ResendOutcome = enum { sent, retry, dropped };
+
+    /// Resend one lost plaintext under a fresh packet number at the same
+    /// encryption level. Initial keeps its type/CIDs, Handshake keeps its
+    /// type/CIDs, and application data becomes 1-RTT.
+    fn resendLostPayload(self: *Connection, lost: LostPayload) ResendOutcome {
+        const packet_type: Packet.PacketType = switch (lost.level) {
+            0 => .initial,
+            2 => .handshake,
+            3 => .one_rtt,
+            else => {
+                lost.deinit(self.allocator);
+                return .dropped;
+            },
+        };
+        if (lost.payload.len == 0) {
+            lost.deinit(self.allocator);
+            return .dropped;
+        }
+        const dest = self.destinationCid(lost.level);
+        if (dest.len == 0) {
+            self.requeueLostPayload(lost);
+            return .retry;
+        }
+        const src: []const u8 = if (packet_type == .one_rtt) &.{} else self.local_cid[0..self.local_cid_len];
+        const packet_number = self.packet_crypto.nextPacketNumberForLevel(switch (lost.level) {
+            0 => .initial,
+            2 => .handshake,
+            else => .application,
+        });
+        if (self.qlog) |writer| {
+            if (writer.sampleLost()) writer.packetLost(
+                nowMicros(),
+                lost.packet_number,
+                @intCast(lost.level),
+                lost.payload.len,
+            );
+        }
+        const send_result = switch (lost.level) {
+            0 => self.quic.super_connection.sendProtectedRawPacket(
                 &self.packet_crypto,
-                switch (sent.level) {
-                    0 => .initial,
-                    2 => .handshake,
-                    else => .application,
-                },
-                sent.ptype,
+                .initial,
+                packet_type,
                 dest,
                 src,
-                sent.payload,
-            ) catch {
-                // Keep the old entry, but do not hammer it every service pass.
-                sent.sent_us = now_us;
-                continue;
-            };
-            self.recovery.markRetransmitted(sent, packet_number, now_us);
-            count += 1;
-            test_retransmit_count += 1;
-            self.stats.retransmits +|= 1;
+                lost.payload,
+            ),
+            2 => self.quic.super_connection.sendProtectedRawPacket(
+                &self.packet_crypto,
+                .handshake,
+                packet_type,
+                dest,
+                src,
+                lost.payload,
+            ),
+            else => self.quic.super_connection.sendProtectedRawPacket(
+                &self.packet_crypto,
+                .application,
+                packet_type,
+                dest,
+                src,
+                lost.payload,
+            ),
+        };
+        send_result catch {
+            self.requeueLostPayload(lost);
+            return .retry;
+        };
+        if (self.qlog_pending) |pending| pending.push(.{
+            .packet_number = packet_number,
+            .level = @intCast(lost.level),
+            .ptype = qlogPacketType(packet_type),
+            .ack_eliciting = true,
+            .plaintext_len = @intCast(lost.payload.len),
+            .frames = .{},
+        });
+        test_retransmit_count +|= 1;
+        self.stats.retransmits +|= 1;
+        self.captureRetransmit(lost, packet_number);
+        lost.deinit(self.allocator);
+        return .sent;
+    }
+
+    fn requeueLostPayload(self: *Connection, lost: LostPayload) void {
+        if (self.retainedLostPayloads() >= max_lost_payloads_retained) {
+            var oldest = self.lost_queue.items[self.lost_queue_head];
+            oldest.deinit(self.allocator);
+            self.lost_queue_head += 1;
         }
+        self.lost_queue.append(self.allocator, lost) catch {
+            var dropped = lost;
+            dropped.deinit(self.allocator);
+        };
+    }
+
+    fn captureRetransmit(self: *Connection, lost: LostPayload, new_packet_number: u64) void {
+        if (!test_capture_retransmit_payload) return;
+        // Tests need the STREAM-carrying resend, not whichever control frame
+        // happened to be drained last in the same service pass.
+        if (!self.payloadHasStreamFrame(lost.payload)) return;
+        const copy_len = @min(lost.payload.len, test_retransmit_last_payload.len);
+        @memcpy(test_retransmit_last_payload[0..copy_len], lost.payload[0..copy_len]);
+        test_retransmit_last_payload_len = copy_len;
+        test_retransmit_last_old_packet_number = lost.packet_number;
+        test_retransmit_last_new_packet_number = new_packet_number;
+        test_retransmit_last_level = lost.level;
+    }
+
+    fn payloadHasStreamFrame(self: *Connection, payload: []const u8) bool {
+        var reader = std.Io.Reader.fixed(payload);
+        while (reader.seek < reader.end) {
+            var frame = QuicFrames.Frame.parse(&reader, self.allocator) catch return false;
+            defer frame.deinit(self.allocator);
+            switch (frame) {
+                .stream,
+                .stream_fin,
+                .stream_len,
+                .stream_len_fin,
+                .stream_off,
+                .stream_off_fin,
+                .stream_off_len,
+                .stream_off_len_fin,
+                => return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    /// Drain at most max_retransmits_per_service queued losses. Entries that
+    /// fail to send stay queued for the next pass.
+    fn resendLostPayloads(self: *Connection) void {
+        const drain_end = self.lost_queue.items.len;
+        const now = nowMicros();
+        // Production keeps the brief grace window. The synthetic loss hook is
+        // an explicit test signal, so it drains as soon as zquic reports the
+        // loss (the old force-retransmit hook had the same effect).
+        const grace_us: u64 = if (self.drop_outgoing_every != 0) 0 else lost_payload_grace_us;
+        var attempted: usize = 0;
+        while (self.lost_queue_head < drain_end and attempted < max_retransmits_per_service) {
+            const lost = self.lost_queue.items[self.lost_queue_head];
+            if (now -| lost.detected_us < grace_us) break;
+            self.lost_queue_head += 1;
+            attempted += 1;
+            switch (self.resendLostPayload(lost)) {
+                .sent, .dropped => {},
+                .retry => {}, // resendLostPayload already requeued it
+            }
+        }
+        self.compactLostQueue();
     }
 
     fn destinationCid(self: *const Connection, level: usize) []const u8 {
@@ -1472,15 +2090,17 @@ pub const Connection = struct {
     fn flush(self: *Connection) !void {
         const packets = self.quic.super_connection.drainOutgoingRawPackets(self.allocator) catch return error.QuicError;
         defer self.allocator.free(packets);
+        const pending_log = self.qlog_pending;
+        const drop_log_batch = if (pending_log) |pending| pending.overflow else false;
         for (packets) |*packet| {
             defer packet.deinit(self.allocator);
             if (packet.data.len == 0) continue;
             self.tx_count += 1;
             if (self.drop_outgoing_every != 0 and self.tx_count % self.drop_outgoing_every == 0) {
-                // A test drop never reaches the peer. Treat it as loss now
-                // instead of relying on the batch's packet count aligning with
-                // the SRTT timeout, which packet batching intentionally changes.
-                self.force_retransmit = true;
+                // A test drop never reaches the peer. zquic already recorded
+                // the packet when it was scheduled, so its loss detector (and
+                // PTO probes after a tail loss) recovers it.
+                if (pending_log) |pending| _ = pending.pop();
                 continue;
             }
             const sent = posix.system.sendto(
@@ -1491,25 +2111,39 @@ pub const Connection = struct {
                 @ptrCast(&self.remote_addr),
                 @sizeOf(posix.sockaddr.in),
             );
+            if (pending_log) |pending| {
+                if (pending.pop()) |entry| {
+                    if (!drop_log_batch and sent >= 0) {
+                        if (self.qlog) |writer| {
+                            if (writer.sampleSent()) writer.packetSent(
+                                nowMicros(),
+                                entry.packet_number,
+                                entry.level,
+                                entry.ptype,
+                                entry.ack_eliciting,
+                                entry.plaintext_len,
+                                entry.frames,
+                            );
+                        }
+                    }
+                }
+            }
             if (sent < 0) continue;
             self.stats.packets_sent +|= 1;
             self.stats.bytes_sent +|= @intCast(packet.data.len);
         }
+        if (pending_log) |pending| pending.reset();
     }
 
     /// Deliver anything queued and consume the ACK/recovery work zquic owns.
     pub fn service(self: *Connection) !void {
         if (self.closed) return;
         try self.afterTlsProgress();
-        try self.flushStreams();
-        self.reapFinishedStreams();
 
-        self.retransmitLost(nowMicros());
-
-        // PTO probes and retained-CRYPTO retransmission. zquic timestamps
-        // packets and its loss deadline with wall-clock microseconds, so the
-        // recovery poll must use that same clock; retransmitLost above keeps
-        // the transport's monotonic clock.
+        // zquic owns loss detection. Poll first so this pass sees the freshest
+        // callback queue, then resend each lost payload under a new packet
+        // number. PTO probes are still zquic's; ACK generation stays below in
+        // the transport for this milestone.
         const recovery_now: u64 = @intCast(@max(zquic.Time.nowMicros(), 0));
         _ = self.quic.super_connection.pollLossRecovery(
             &self.packet_crypto,
@@ -1517,97 +2151,33 @@ pub const Connection = struct {
             self.destinationCid(0),
             self.local_cid[0..self.local_cid_len],
         ) catch {};
-        self.sendFlowControlUpdates();
-        self.sendStreamLimitUpdates();
+        self.resendLostPayloads();
+
+        // Gather ACK/flow/stream-limit control frames once, coalesce them into
+        // the first data packet where they fit, and send any remainder on its
+        // own. Committing happens only on successful scheduling, so the same
+        // frame cannot appear in a later packet of this pass.
+        var control: ControlBatch = .{};
+        defer control.deinit(self.allocator);
+        try self.collectControlFrames(&control);
+
+        try self.flushStreams(&control);
+        try self.finishControlFrames(&control);
+        self.reapFinishedStreams();
+
         try self.sendAcks();
         try self.flush();
     }
 
-    fn sendFlowControlUpdates(self: *Connection) void {
-        if (!self.application_keys or self.closed) return;
-        var frames: std.ArrayListUnmanaged(QuicFrames.Frame) = .empty;
-        defer frames.deinit(self.allocator);
-
-        const data_half = self.local_max_data / 2;
-        if (self.recv_data + data_half >= self.recv_data_limit) {
-            const next = self.recv_data +| self.local_max_data;
-            if (next > self.recv_data_limit) {
-                frames.append(self.allocator, .{ .max_data = QuicFrames.MaxDataFrame.init(next) }) catch return;
-                test_max_data_sent += 1;
-                self.recv_data_limit = next;
-            }
-        }
-
-        var it = self.stream_flow.iterator();
-        while (it.next()) |entry| {
-            const flow = entry.value_ptr;
-            if (flow.recv_limit == 0) continue;
-            const stream_half = self.local_max_stream_data / 2;
-            if (flow.recv_offset + stream_half < flow.recv_limit) continue;
-            const next = flow.recv_offset +| self.local_max_stream_data;
-            if (next <= flow.recv_limit) continue;
-            frames.append(self.allocator, .{
-                .max_stream_data = QuicFrames.MaxStreamDataFrame.init(entry.key_ptr.*, next),
-            }) catch return;
-            test_max_stream_data_sent += 1;
-            flow.recv_limit = next;
-        }
-
-        if (frames.items.len == 0) return;
-        self.schedule(3, .one_rtt, frames.items) catch return;
-        self.stats.flow_updates +|= @intCast(frames.items.len);
-    }
-
-    fn sendStreamLimitUpdates(self: *Connection) void {
-        if (!self.application_keys or self.closed) return;
-        var frames: std.ArrayListUnmanaged(QuicFrames.Frame) = .empty;
-        defer frames.deinit(self.allocator);
-
-        const active_bidi = self.peer_opened_bidi -| self.closed_peer_bidi;
-        const bidi_due = self.closed_peer_bidi > self.last_max_streams_bidi_sent and
-            (self.closed_peer_bidi -| self.last_max_streams_bidi_sent >= 8 or
-                self.advertised_streams_bidi -| active_bidi <= 4);
-        if (bidi_due) {
-            const limit = self.local_max_streams_bidi + self.closed_peer_bidi;
-            frames.append(self.allocator, .{
-                .max_streams_bidi = QuicFrames.MaxStreamsFrame.init(limit, true),
-            }) catch return;
-            self.advertised_streams_bidi = limit;
-            self.last_max_streams_bidi_sent = self.closed_peer_bidi;
-        }
-        const active_uni = self.peer_opened_uni -| self.closed_peer_uni;
-        const uni_due = self.closed_peer_uni > self.last_max_streams_uni_sent and
-            (self.closed_peer_uni -| self.last_max_streams_uni_sent >= 8 or
-                self.advertised_streams_uni -| active_uni <= 4);
-        if (uni_due) {
-            const limit = self.local_max_streams_uni + self.closed_peer_uni;
-            frames.append(self.allocator, .{
-                .max_streams_uni = QuicFrames.MaxStreamsFrame.init(limit, false),
-            }) catch return;
-            self.advertised_streams_uni = limit;
-            self.last_max_streams_uni_sent = self.closed_peer_uni;
-        }
-
-        if (frames.items.len == 0) return;
-        self.schedule(3, .one_rtt, frames.items) catch {};
-    }
-
+    /// ACKs for the Initial and Handshake levels stay standalone; 1-RTT ACKs
+    /// are collected into ControlBatch and may share a packet with STREAM data.
     fn sendAcks(self: *Connection) !void {
-        for (0..4) |level| {
+        for ([_]usize{ 0, 2 }) |level| {
             if (!self.acks[level].ack_required or self.acks[level].count == 0) continue;
-            switch (level) {
-                0 => {},
-                2 => if (!self.handshake_keys) continue,
-                3 => if (!self.application_keys) continue,
-                else => continue,
-            }
+            if (level == 2 and !self.handshake_keys) continue;
             var ack_frame = self.acks[level].buildFrame(self.allocator) catch continue;
             defer ack_frame.deinit(self.allocator);
-            const ptype: Packet.PacketType = switch (level) {
-                0 => .initial,
-                2 => .handshake,
-                else => .one_rtt,
-            };
+            const ptype: Packet.PacketType = if (level == 0) .initial else .handshake;
             const frame = [_]QuicFrames.Frame{.{ .ack = ack_frame }};
             self.schedule(level, ptype, &frame) catch continue;
             self.stats.ack_frames_sent +|= 1;
@@ -1631,6 +2201,11 @@ pub const Connection = struct {
         self.schedule(level, ptype, &frame) catch {};
         self.flush() catch {};
         self.closed = true;
+        if (self.qlog) |writer| {
+            const now = nowMicros();
+            if (code != 0x0100) writer.errorEvent(now, code, reason);
+            writer.connectionClosed(now, .local, code, reason, qlog.ConnectionStats.from(self.stats));
+        }
     }
 
     pub fn timeoutNs(self: *const Connection) u64 {
@@ -1668,11 +2243,47 @@ pub const Listener = struct {
     /// Connection/Session is allocated.
     retry_enabled: bool = false,
     retry_key: [32]u8 = undefined,
+    /// Set by Server.initInternal from Server.Options.qlog before any
+    /// connection can be accepted. The listener owns the stream header and the
+    /// Retry events; each Connection owns its own writer.
+    qlog: ?qlog.Config = null,
+    qlog_reference: qlog.Reference = .{},
+    qlog_header_written: bool = false,
 
     pub fn enableRetry(self: *Listener) void {
         if (self.retry_enabled) return;
         qtls.fillRandom(&self.retry_key);
         self.retry_enabled = true;
+    }
+
+    /// Install the listener qlog sink and write the JSON-SEQ stream header
+    /// immediately. Must run before the listener accepts its first datagram.
+    pub fn installQlog(self: *Listener, config: qlog.Config) void {
+        self.qlog = config;
+        self.qlog_reference = qlog.Reference.now();
+        self.qlog_header_written = false;
+        self.ensureQlogHeader();
+    }
+
+    fn ensureQlogHeader(self: *Listener) void {
+        const config = self.qlog orelse return;
+        if (self.qlog_header_written) return;
+        if (self.qlog_reference.wall_ms == 0) self.qlog_reference = qlog.Reference.now();
+        var writer = qlog.Writer.init(config, self.qlog_reference);
+        writer.writeHeader(.server);
+        self.qlog_header_written = true;
+    }
+
+    fn qlogRetrySent(self: *Listener) void {
+        const config = self.qlog orelse return;
+        var writer = qlog.Writer.init(config, self.qlog_reference);
+        writer.retrySent(nowMicros());
+    }
+
+    fn qlogRetryRejected(self: *Listener, reason: []const u8) void {
+        const config = self.qlog orelse return;
+        var writer = qlog.Writer.init(config, self.qlog_reference);
+        writer.retryRejected(nowMicros(), reason);
     }
 
     pub fn init(allocator: std.mem.Allocator, port: u16) !Listener {
@@ -1743,6 +2354,7 @@ pub const Listener = struct {
     }
 
     pub fn dispatch(self: *Listener, datagram: []const u8, peer: posix.sockaddr.in) !void {
+        self.ensureQlogHeader();
         if (datagram.len < 1) return;
         const dcid = destinationCid(datagram) orelse return;
         if (self.connections.get(dcid)) |connection| {
@@ -1764,7 +2376,10 @@ pub const Listener = struct {
         var retry_scid: [20]u8 = @splat(0);
         var retry_scid_len: u8 = 0;
         if (self.retry_enabled) {
-            if (datagram.len < 1200) return;
+            if (datagram.len < 1200) {
+                self.qlogRetryRejected("short_initial");
+                return;
+            }
             var address: [6]u8 = undefined;
             @memcpy(address[0..4], std.mem.asBytes(&peer.addr));
             @memcpy(address[4..6], std.mem.asBytes(&peer.port));
@@ -1780,7 +2395,10 @@ pub const Listener = struct {
                     scid.bytes(),
                     nowMicros(),
                     &token_buf,
-                ) catch return;
+                ) catch {
+                    self.qlogRetryRejected("token_error");
+                    return;
+                };
                 var packet_buf: [retry.max_retry_packet_len]u8 = undefined;
                 const packet = retry.Retry.buildPacket(
                     header.dest_conn_id.bytes(),
@@ -1788,8 +2406,11 @@ pub const Listener = struct {
                     fresh[0..cid_len],
                     made,
                     &packet_buf,
-                ) catch return;
-                _ = posix.system.sendto(
+                ) catch {
+                    self.qlogRetryRejected("retry_build_failed");
+                    return;
+                };
+                const sent = posix.system.sendto(
                     self.socket,
                     packet.ptr,
                     @intCast(packet.len),
@@ -1797,6 +2418,7 @@ pub const Listener = struct {
                     @ptrCast(&peer),
                     @sizeOf(posix.sockaddr.in),
                 );
+                if (sent >= 0) self.qlogRetrySent() else self.qlogRetryRejected("send_failed");
                 return;
             }
             const verified = retry_impl.verifyToken(
@@ -1805,7 +2427,10 @@ pub const Listener = struct {
                 header.dest_conn_id.bytes(),
                 scid.bytes(),
                 nowMicros(),
-            ) orelse return;
+            ) orelse {
+                self.qlogRetryRejected("invalid_token");
+                return;
+            };
             const len = token[15];
             original_dcid = verified;
             original_dcid_len = len;
@@ -1819,7 +2444,7 @@ pub const Listener = struct {
         }
 
         const initial_dcid = header.dest_conn_id.bytes();
-        const connection = try Connection.initServer(
+        const connection = try Connection.initServerWithQlog(
             self.allocator,
             self.socket,
             self.local_addr,
@@ -1830,6 +2455,8 @@ pub const Listener = struct {
             retry_scid[0..retry_scid_len],
             self.local_max_data,
             self.local_max_stream_data,
+            self.qlog,
+            self.qlog_reference,
         );
         errdefer connection.deinit();
         connection.handler = self.handler;
@@ -1945,7 +2572,17 @@ pub fn connect(
     port: u16,
     options: ClientTls,
 ) !*Connection {
-    const connection = try Connection.initClient(allocator, host, port, options);
+    return connectWithQlog(allocator, host, port, options, null);
+}
+
+pub fn connectWithQlog(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    options: ClientTls,
+    qlog_config: ?qlog.Config,
+) !*Connection {
+    const connection = try Connection.initWithQlog(allocator, host, port, options, qlog_config);
     errdefer connection.deinit();
 
     var buf: [max_datagram_size]u8 = undefined;

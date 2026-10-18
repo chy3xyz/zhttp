@@ -17,7 +17,8 @@ pub const Stats = struct {
     bytes_sent: u64 = 0,
     /// Wire bytes of packets_received.
     bytes_received: u64 = 0,
-    /// Packets resent by Connection.retransmitLost after a successful send.
+    /// Lost plaintexts resent under a new packet number after zquic's
+    /// lost-packet observer surfaced them.
     retransmits: u64 = 0,
     /// Unique QUIC streams first seen by the transport, whether opened locally
     /// through createBidiStream/createUniStream or by the peer.

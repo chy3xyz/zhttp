@@ -207,7 +207,7 @@ test "batch: two streams share one 1-RTT packet" {
     try std.testing.expectEqual(before_frames + 2, transport.test_batch_stream_frames);
     try std.testing.expectEqual(before_multi_stream + 1, transport.test_batch_multi_stream_packets);
     try std.testing.expectEqual(before_multi_frame + 1, transport.test_batch_multi_frame_packets);
-    try std.testing.expectEqual(@as(u64, 10), harness.client.sent_data);
+    try std.testing.expectEqual(@as(u64, 10), harness.client.flow.sent_data);
 
     try harness.awaitStream(first, 5);
     try harness.awaitStream(second, 5);
@@ -246,7 +246,7 @@ test "batch: one 1 KiB stream body is one packet" {
     try std.testing.expectEqual(before_multi_frame, transport.test_batch_multi_frame_packets);
     try std.testing.expect(transport.test_batch_largest_payload >= payload.len);
     try std.testing.expect(transport.test_batch_largest_payload <= transport.test_batch_budget);
-    try std.testing.expectEqual(@as(u64, payload.len), harness.client.sent_data);
+    try std.testing.expectEqual(@as(u64, payload.len), harness.client.flow.sent_data);
 
     try harness.awaitStream(stream_id, payload.len);
     try std.testing.expectEqualSlices(u8, payload, harness.recorder.bytesFor(stream_id));
@@ -283,7 +283,7 @@ test "batch: large body uses the MTU budget" {
     try std.testing.expectEqual(packets, frames);
     try std.testing.expect(transport.test_batch_largest_payload > 1000);
     try std.testing.expect(transport.test_batch_largest_payload <= transport.test_batch_budget);
-    try std.testing.expectEqual(@as(u64, body_size), harness.client.sent_data);
+    try std.testing.expectEqual(@as(u64, body_size), harness.client.flow.sent_data);
 
     try harness.awaitStream(stream_id, body_size);
     try std.testing.expectEqualSlices(u8, payload, harness.recorder.bytesFor(stream_id));
@@ -371,7 +371,7 @@ test "batch: flow-control window blocks and never over-advances" {
     var harness = try Harness.init(allocator, 100, 64);
     defer harness.deinit();
     try harness.handshake();
-    try std.testing.expectEqual(@as(u64, 100), harness.client.peer_max_data);
+    try std.testing.expectEqual(@as(u64, 100), harness.client.flow.peer_max_data);
 
     const payload = try allocator.alloc(u8, 1024);
     defer allocator.free(payload);
@@ -384,14 +384,14 @@ test "batch: flow-control window blocks and never over-advances" {
     try harness.client.service();
 
     try std.testing.expect(transport.test_send_blocked > before_blocked);
-    try std.testing.expectEqual(@as(u64, 64), harness.client.sent_data);
+    try std.testing.expectEqual(@as(u64, 64), harness.client.flow.sent_data);
     var snapshot = harness.client.streamSendSnapshot(stream_id).?;
     try std.testing.expectEqual(@as(u64, 64), snapshot.sent);
     try std.testing.expectEqual(@as(usize, 960), snapshot.pending);
 
     // A second pass with the same credit must not advance anything.
     try harness.client.service();
-    try std.testing.expectEqual(@as(u64, 64), harness.client.sent_data);
+    try std.testing.expectEqual(@as(u64, 64), harness.client.flow.sent_data);
     snapshot = harness.client.streamSendSnapshot(stream_id).?;
     try std.testing.expectEqual(@as(u64, 64), snapshot.sent);
     try std.testing.expectEqual(@as(usize, 960), snapshot.pending);
@@ -400,10 +400,10 @@ test "batch: flow-control window blocks and never over-advances" {
     // the upload without resetting or double-counting the sent offset.
     const deadline = transport.nowNanos() + 12 * std.time.ns_per_s;
     while (transport.nowNanos() < deadline) {
-        if (harness.client.sent_data == payload.len) break;
+        if (harness.client.flow.sent_data == payload.len) break;
         harness.pump();
     }
-    try std.testing.expectEqual(@as(u64, payload.len), harness.client.sent_data);
+    try std.testing.expectEqual(@as(u64, payload.len), harness.client.flow.sent_data);
     try harness.awaitStream(stream_id, payload.len);
     try std.testing.expectEqualSlices(u8, payload, harness.recorder.bytesFor(stream_id));
 }
@@ -433,7 +433,7 @@ test "batch: loss and retransmission never advance sent offsets twice" {
     try harness.awaitStream(stream_id, payload.len);
     // The whole 4 KiB body was handed to schedule exactly once even though
     // packets were dropped and recovery retransmitted them.
-    try std.testing.expectEqual(@as(u64, payload.len), harness.client.sent_data);
+    try std.testing.expectEqual(@as(u64, payload.len), harness.client.flow.sent_data);
     try std.testing.expect(transport.test_retransmit_count > before_retransmits);
     try std.testing.expectEqualSlices(u8, payload, harness.recorder.bytesFor(stream_id));
     try std.testing.expectEqual(@as(usize, 1), harness.recorder.get(stream_id).?.fin_frames);
@@ -458,7 +458,7 @@ test "batch: failed schedule leaves every send offset unchanged" {
     const stream_id = try harness.client.createBidiStream();
     try harness.client.queueStreamData(stream_id, payload, true);
     const before = harness.client.streamSendSnapshot(stream_id).?;
-    const before_sent_data = harness.client.sent_data;
+    const before_sent_data = harness.client.flow.sent_data;
 
     // Force schedule() to fail at its destination-CID check before anything is
     // protected or queued. The transaction must not commit a single byte.
@@ -469,7 +469,7 @@ test "batch: failed schedule leaves every send offset unchanged" {
     harness.client.peer_cid = saved_cid;
     harness.client.peer_cid_len = saved_len;
 
-    try std.testing.expectEqual(before_sent_data, harness.client.sent_data);
+    try std.testing.expectEqual(before_sent_data, harness.client.flow.sent_data);
     const after = harness.client.streamSendSnapshot(stream_id).?;
     try std.testing.expectEqual(before.sent, after.sent);
     try std.testing.expectEqual(before.pending, after.pending);
@@ -479,7 +479,7 @@ test "batch: failed schedule leaves every send offset unchanged" {
     // The next service pass retries the identical bytes at the identical
     // offsets and completes normally.
     try harness.client.service();
-    try std.testing.expectEqual(@as(u64, payload.len), harness.client.sent_data);
+    try std.testing.expectEqual(@as(u64, payload.len), harness.client.flow.sent_data);
     try harness.awaitStream(stream_id, payload.len);
     try std.testing.expectEqualSlices(u8, payload, harness.recorder.bytesFor(stream_id));
 }

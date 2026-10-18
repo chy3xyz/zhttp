@@ -2,10 +2,11 @@
 //!
 //! The encoder is static-only. The decoder owns a dynamic table (SETTINGS
 //! advertises QPACK_MAX_TABLE_CAPACITY = 4096) and applies the peer's encoder
-//! stream instructions. Blocked streams are not implemented: a field section
-//! whose Required Insert Count exceeds the current insert count, or whose
-//! dynamic references cannot be resolved, is QPACK_DECOMPRESSION_FAILED rather
-//! than being queued for later.
+//! stream instructions. This module also serializes the three decoder-stream
+//! instructions (Insert Count Increment, Section Acknowledgment, and Stream
+//! Cancellation) into fixed-size bytes. http3.Session owns the decoder stream,
+//! queues those bytes, parks field sections whose Required Insert Count is not
+//! yet satisfied, and retries them as inserts arrive.
 
 const std = @import("std");
 const huffman = @import("../../h2/huffman.zig");
@@ -17,8 +18,9 @@ pub const Error = error{
     DynamicTableReference,
     InvalidIndex,
     InvalidHuffman,
-    /// A field section requires inserts the decoder has not applied yet.
-    /// Blocked streams are disabled (BLOCKED_STREAMS = 0), so this fails.
+    /// A field section requires inserts the decoder has not applied yet, or
+    /// its Required Insert Count prefix is outside the wraparound window.
+    /// http3.Session parks the frame when the RIC is still reachable.
     Blocked,
     /// A dynamic-table index, base, or delta base cannot be resolved.
     InvalidDynamicReference,
@@ -66,6 +68,9 @@ pub const DecoderScan = union(enum) {
     complete: struct {
         instruction: DecoderInstruction,
         end: usize,
+        /// Stream ID for Section Acknowledgment / Stream Cancellation, or the
+        /// increment for Insert Count Increment.
+        value: u64 = 0,
     },
     incomplete,
     invalid,
@@ -197,6 +202,9 @@ pub const static_table = [_]TableEntry{
 pub const HeaderList = struct {
     arena: std.heap.ArenaAllocator,
     fields: []HeaderField,
+    /// Required Insert Count of the decoded field section. Zero means the
+    /// section is static-only and needs no Section Acknowledgment.
+    required_insert_count: u64 = 0,
 
     pub fn deinit(self: *HeaderList) void {
         self.arena.deinit();
@@ -382,8 +390,9 @@ pub const Decoder = struct {
     }
 
     /// Decode one complete field section. The table must already contain every
-    /// entry the section references; otherwise this returns Blocked (there is
-    /// no blocked-stream queue) or InvalidDynamicReference.
+    /// entry the section references; otherwise this returns Blocked (the caller
+    /// may park the frame and retry after more inserts) or
+    /// InvalidDynamicReference (the section can never decode).
     pub fn decodeBlock(self: *Decoder, block: []const u8) Error!HeaderList {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
@@ -476,6 +485,7 @@ pub const Decoder = struct {
         return .{
             .arena = arena,
             .fields = try fields.toOwnedSlice(a),
+            .required_insert_count = required_insert_count,
         };
     }
 
@@ -505,6 +515,21 @@ pub const Decoder = struct {
         return self.table.getAbsolute(absolute_index) orelse error.InvalidDynamicReference;
     }
 };
+
+/// Decode only the Required Insert Count prefix. The HTTP/3 layer uses this
+/// helper for blocked-stream bookkeeping.
+/// after decodeBlock returns Blocked to distinguish a section waiting for
+/// future inserts from a prefix that can never be satisfied.
+pub fn peekRequiredInsertCount(
+    block: []const u8,
+    insert_count: u64,
+    max_capacity: usize,
+) Error!u64 {
+    if (block.len == 0) return error.InvalidHeaderBlock;
+    var cursor: usize = 0;
+    const encoded = try readPrefixedInt(block, &cursor, 8);
+    return decodeRequiredInsertCount(encoded, insert_count, max_capacity);
+}
 
 /// Decode the wrapped Required Insert Count (RFC 9204 section 4.5.1.1).
 /// `max_capacity` is the value this endpoint advertised, so MaxEntries is
@@ -816,17 +841,29 @@ pub fn scanDecoderInstruction(data: []const u8, offset: usize) DecoderScan {
     const first = data[cursor];
     if (first & 0x80 != 0) {
         // Section Acknowledgment: 1 + 7-bit stream ID.
-        _ = readInt(data, &cursor, 7) catch |err| return decoderScanFailure(err);
-        return .{ .complete = .{ .instruction = .section_acknowledgment, .end = cursor } };
+        const stream_id = readInt(data, &cursor, 7) catch |err| return decoderScanFailure(err);
+        return .{ .complete = .{
+            .instruction = .section_acknowledgment,
+            .end = cursor,
+            .value = stream_id,
+        } };
     }
     if (first & 0xc0 == 0x40) {
         // Stream Cancellation: 01 + 6-bit stream ID.
-        _ = readInt(data, &cursor, 6) catch |err| return decoderScanFailure(err);
-        return .{ .complete = .{ .instruction = .stream_cancellation, .end = cursor } };
+        const stream_id = readInt(data, &cursor, 6) catch |err| return decoderScanFailure(err);
+        return .{ .complete = .{
+            .instruction = .stream_cancellation,
+            .end = cursor,
+            .value = stream_id,
+        } };
     }
     // Insert Count Increment: 00 + 6-bit increment.
-    _ = readInt(data, &cursor, 6) catch |err| return decoderScanFailure(err);
-    return .{ .complete = .{ .instruction = .insert_count_increment, .end = cursor } };
+    const increment = readInt(data, &cursor, 6) catch |err| return decoderScanFailure(err);
+    return .{ .complete = .{
+        .instruction = .insert_count_increment,
+        .end = cursor,
+        .value = increment,
+    } };
 }
 
 fn encoderScanFailure(err: error{ Truncated, Overlong }) EncoderScan {
@@ -861,7 +898,9 @@ fn readInt(
         if (cursor.* >= data.len) return error.Truncated;
         const byte = data[cursor.*];
         cursor.* += 1;
-        if (shift > 56) return error.Overlong;
+        // A u64 needs at most ten 7-bit continuation groups; 63 is the last
+        // bit position a group can start at. Anything beyond cannot fit.
+        if (shift >= 64) return error.Overlong;
         const chunk: u64 = @as(u64, byte & 0x7f);
         const shifted = @shlWithOverflow(chunk, @as(u6, @intCast(shift)));
         if (shifted[1] != 0) return error.Overlong;
@@ -886,6 +925,62 @@ fn readPrefixedInt(data: []const u8, cursor: *usize, comptime prefix_bits: u4) E
     return readInt(data, cursor, prefix_bits) catch |err| switch (err) {
         error.Truncated, error.Overlong => error.InvalidHeaderBlock,
     };
+}
+
+/// One QPACK decoder-stream instruction to serialize (RFC 9204 section 4.4).
+pub const DecoderInstructionValue = union(enum) {
+    section_acknowledgment: u64,
+    stream_cancellation: u64,
+    insert_count_increment: u64,
+};
+
+/// Largest encoding of one decoder-stream instruction: a first byte plus ten
+/// 7-bit continuation bytes for a full u64 value.
+pub const max_decoder_instruction_len = 11;
+
+/// Serialize one decoder-stream instruction into `out` and return its length.
+/// The write is allocation-free and fixed-size so the HTTP/3 layer can queue
+/// individual acknowledgments without an unbounded staging buffer. An Insert
+/// Count Increment of zero is illegal and rejected.
+pub fn writeDecoderInstruction(
+    out: []u8,
+    instruction: DecoderInstructionValue,
+) Error!usize {
+    if (out.len < max_decoder_instruction_len) return error.InvalidHeaderBlock;
+    switch (instruction) {
+        .section_acknowledgment => |stream_id| return writePrefixedIntFixed(out, 0x80, 7, stream_id),
+        .stream_cancellation => |stream_id| return writePrefixedIntFixed(out, 0x40, 6, stream_id),
+        .insert_count_increment => |increment| {
+            if (increment == 0) return error.InvalidHeaderBlock;
+            return writePrefixedIntFixed(out, 0x00, 6, increment);
+        },
+    }
+}
+
+fn writePrefixedIntFixed(
+    out: []u8,
+    first_bits: u8,
+    comptime prefix_bits: u4,
+    value_in: u64,
+) usize {
+    const mask: u8 = @intCast((@as(u16, 1) << prefix_bits) - 1);
+    var value = value_in;
+    var n: usize = 0;
+    if (value < mask) {
+        out[n] = first_bits | @as(u8, @intCast(value));
+        return n + 1;
+    }
+    out[n] = first_bits | mask;
+    n += 1;
+    value -= mask;
+    while (value >= 0x80) {
+        out[n] = @as(u8, @intCast(value & 0x7f)) | 0x80;
+        n += 1;
+        value >>= 7;
+    }
+    out[n] = @intCast(value);
+    n += 1;
+    return n;
 }
 
 fn writePrefixedInt(
@@ -1172,4 +1267,86 @@ test "QPACK: decoder stream instructions scan incrementally" {
 
     // Section Acknowledgment needs a continuation byte before it is complete.
     try std.testing.expect(scanDecoderInstruction(&.{0xff}, 0) == .incomplete);
+}
+
+test "QPACK: decoder stream acknowledgments encode with the right prefixes" {
+    var buf: [max_decoder_instruction_len]u8 = undefined;
+
+    var n = try writeDecoderInstruction(&buf, .{ .insert_count_increment = 1 });
+    try std.testing.expectEqualSlices(u8, &.{0x01}, buf[0..n]);
+    var scan = scanDecoderInstruction(buf[0..n], 0);
+    try std.testing.expectEqual(DecoderInstruction.insert_count_increment, scan.complete.instruction);
+    try std.testing.expectEqual(@as(u64, 1), scan.complete.value);
+
+    // 63 consumes the full 6-bit prefix and needs a zero continuation byte;
+    // 64 is one past it.
+    n = try writeDecoderInstruction(&buf, .{ .insert_count_increment = 63 });
+    try std.testing.expectEqualSlices(u8, &.{ 0x3f, 0x00 }, buf[0..n]);
+    n = try writeDecoderInstruction(&buf, .{ .insert_count_increment = 64 });
+    try std.testing.expectEqualSlices(u8, &.{ 0x3f, 0x01 }, buf[0..n]);
+    scan = scanDecoderInstruction(buf[0..n], 0);
+    try std.testing.expectEqual(@as(u64, 64), scan.complete.value);
+
+    // Section Acknowledgment: 1 + 7-bit stream ID.
+    n = try writeDecoderInstruction(&buf, .{ .section_acknowledgment = 0 });
+    try std.testing.expectEqualSlices(u8, &.{0x80}, buf[0..n]);
+    n = try writeDecoderInstruction(&buf, .{ .section_acknowledgment = 4 });
+    try std.testing.expectEqualSlices(u8, &.{0x84}, buf[0..n]);
+    scan = scanDecoderInstruction(buf[0..n], 0);
+    try std.testing.expectEqual(DecoderInstruction.section_acknowledgment, scan.complete.instruction);
+    try std.testing.expectEqual(@as(u64, 4), scan.complete.value);
+    n = try writeDecoderInstruction(&buf, .{ .section_acknowledgment = 127 });
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00 }, buf[0..n]);
+    n = try writeDecoderInstruction(&buf, .{ .section_acknowledgment = 300 });
+    scan = scanDecoderInstruction(buf[0..n], 0);
+    try std.testing.expectEqual(@as(u64, 300), scan.complete.value);
+    // The fixed 11-byte buffer holds a full u64 stream ID.
+    n = try writeDecoderInstruction(&buf, .{ .section_acknowledgment = std.math.maxInt(u64) });
+    scan = scanDecoderInstruction(buf[0..n], 0);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), scan.complete.value);
+
+    // Stream Cancellation: 01 + 6-bit stream ID.
+    n = try writeDecoderInstruction(&buf, .{ .stream_cancellation = 0 });
+    try std.testing.expectEqualSlices(u8, &.{0x40}, buf[0..n]);
+    n = try writeDecoderInstruction(&buf, .{ .stream_cancellation = 4 });
+    try std.testing.expectEqualSlices(u8, &.{0x44}, buf[0..n]);
+    n = try writeDecoderInstruction(&buf, .{ .stream_cancellation = 63 });
+    try std.testing.expectEqualSlices(u8, &.{ 0x7f, 0x00 }, buf[0..n]);
+    scan = scanDecoderInstruction(buf[0..n], 0);
+    try std.testing.expectEqual(DecoderInstruction.stream_cancellation, scan.complete.instruction);
+    try std.testing.expectEqual(@as(u64, 63), scan.complete.value);
+    n = try writeDecoderInstruction(&buf, .{ .stream_cancellation = 64 });
+    try std.testing.expectEqualSlices(u8, &.{ 0x7f, 0x01 }, buf[0..n]);
+
+    // An increment of zero and an undersized output buffer are rejected.
+    try std.testing.expectError(
+        error.InvalidHeaderBlock,
+        writeDecoderInstruction(&buf, .{ .insert_count_increment = 0 }),
+    );
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectError(
+        error.InvalidHeaderBlock,
+        writeDecoderInstruction(&tiny, .{ .section_acknowledgment = 0 }),
+    );
+}
+
+test "QPACK: Required Insert Count can be peeked before decoding" {
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        try peekRequiredInsertCount(&.{ 0x03, 0x00 }, 1, 4096),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        try peekRequiredInsertCount(&.{ 0x00, 0x00 }, 7, 4096),
+    );
+    // 254 decodes to 253 when the insert count is zero, outside the 128-entry
+    // wraparound window: this prefix can never become satisfiable.
+    try std.testing.expectError(
+        error.Blocked,
+        peekRequiredInsertCount(&.{0xfe}, 0, 4096),
+    );
+    try std.testing.expectError(
+        error.InvalidHeaderBlock,
+        peekRequiredInsertCount(&.{}, 0, 4096),
+    );
 }
