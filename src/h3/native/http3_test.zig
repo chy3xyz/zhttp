@@ -1911,6 +1911,134 @@ test "native HTTP/3: repeated response header inserts and later references" {
     );
 }
 
+test "native HTTP/3: unacknowledged encoder section times out with 0x0203" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    try qtls.setServerCert(@embedFile("../test_cert.pem"), @embedFile("../test_key.pem"));
+    defer qtls.deinitServer();
+
+    var listener = try transport.Listener.init(allocator, 0);
+    defer listener.deinit();
+    var context: Context = .{ .allocator = allocator, .handler = handleDynamicResponse };
+    defer context.deinit();
+    listener.on_connection = .{ .context = &context, .callback = Context.onConnection };
+
+    const port = std.mem.bigToNative(u16, listener.local_addr.port);
+    const client_conn = try transport.Connection.initClient(allocator, "127.0.0.1", port, .{
+        .insecure_skip_verify = true,
+    });
+    defer client_conn.deinit();
+
+    var capture: Capture = .{ .allocator = allocator };
+    defer capture.deinit();
+    client_conn.handler = .{
+        .context = &capture,
+        .on_stream_frame = Capture.onStream,
+        .on_established = Capture.onEstablished,
+        .on_closed = Capture.onClosed,
+    };
+    defer client_conn.handler = null;
+
+    const request_fields = [_]http3.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = ":path", .value = "/timeout" },
+    };
+
+    // Control stream: SETTINGS with QPACK capacity 4096, blocked streams 16,
+    // and a 4096-byte field-section limit. Advertising blocked streams is what
+    // lets the server's encoder reference its fresh insert and park the
+    // response section waiting for a Section Acknowledgment that never comes.
+    const settings = [_]u8{
+        0x00, 0x04, 0x08,
+        0x01, 0x50, 0x00,
+        0x07, 0x10, 0x06,
+        0x50, 0x00,
+    };
+
+    var buf: [transport.max_datagram_size]u8 = undefined;
+    const deadline = transport.nowNanos() + 12 * std.time.ns_per_s;
+    var settings_sent = false;
+    var request_stream: ?u64 = null;
+    var response_seen = false;
+
+    while (transport.nowNanos() < deadline) {
+        client_conn.service() catch {};
+        _ = listener.readAndDispatch(&buf, 8);
+        listener.serviceAll();
+        for (context.sessions.items) |session| session.service() catch {};
+
+        var peer: std.posix.sockaddr.in = undefined;
+        var peer_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+        const n = std.c.recvfrom(
+            client_conn.socket,
+            buf[0..].ptr,
+            buf.len,
+            std.c.MSG.DONTWAIT,
+            @ptrCast(&peer),
+            &peer_len,
+        );
+        if (n > 0) client_conn.handleDatagram(buf[0..@intCast(n)]) catch {};
+
+        if (client_conn.isEstablished() and !settings_sent) {
+            const id = try client_conn.createUniStream();
+            try client_conn.queueStreamData(id, &settings, false);
+            settings_sent = true;
+        }
+
+        if (settings_sent and request_stream == null and context.sessions.items.len > 0) {
+            if (context.sessions.items[0].peerSettingsReceived()) {
+                const id = try client_conn.createBidiStream();
+                try queueRequestHeaders(allocator, client_conn, id, &request_fields);
+                request_stream = id;
+            }
+        }
+
+        if (request_stream) |id| {
+            if (!response_seen and capture.responseComplete(id)) {
+                response_seen = true;
+                // The response's dynamic section is outstanding and blocked:
+                // one insert is referenced, no ack has been sent.
+                const session = context.sessions.items[0];
+                try std.testing.expectEqual(@as(usize, 1), session.encoder.blockedStreamCount());
+                try std.testing.expectEqual(
+                    @as(usize, 1),
+                    session.encoder.outstandingSectionCount(id),
+                );
+                try std.testing.expectEqual(
+                    @as(u32, 1),
+                    session.encoder.table.referenceCount(0),
+                );
+            }
+        }
+
+        if (context.sessions.items.len > 0 and context.sessions.items[0].conn.isClosed()) {
+            const session = context.sessions.items[0];
+            // Capture.onClosed reports only that a remote close arrived; the
+            // code under test is the server-side close code.
+            try std.testing.expectEqual(
+                http3.qpack_decoder_stream_error,
+                session.conn.close_code,
+            );
+            try std.testing.expectEqual(@as(usize, 0), session.encoder.blockedStreamCount());
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                session.encoder.outstandingSectionCount(request_stream.?),
+            );
+            try std.testing.expectEqual(
+                @as(u32, 0),
+                session.encoder.table.referenceCount(0),
+            );
+            return;
+        }
+        transport.sleepNs(std.time.ns_per_ms);
+    }
+    return error.NoEncoderSectionTimeout;
+}
+
 test "native HTTP/3: Insert Count Increment over-count closes with 0x0203" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();

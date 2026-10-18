@@ -3,10 +3,10 @@
 //! zquic supplies packet protection, packet-number spaces, loss-recovery
 //! timers, stream IDs, and frame encoding. This file keeps its own ACK ranges
 //! because it decrypts packets before handing the surviving frames to zquic. OpenSSL supplies the
-//! TLS 1.3 handshake through its QUIC-TLS callback interface. This file is the
-//! seam between them: it splits coalesced datagrams, feeds CRYPTO frames to TLS,
-//! installs the RFC 9001 keys TLS yields, and dispatches STREAM frames to the
-//! HTTP/3 layer.
+//! TLS 1.3 handshake through its QUIC-TLS callback interface. packet_io.zig
+//! supplies the UDP socket and datagram seam; this file feeds CRYPTO frames to
+//! TLS, installs the RFC 9001 keys TLS yields, schedules packets, tracks ACKs,
+//! drives recovery, and dispatches STREAM frames to the HTTP/3 layer.
 
 const std = @import("std");
 const posix = std.posix;
@@ -19,6 +19,7 @@ const qlog = @import("qlog.zig");
 const flow_control = @import("flow_control.zig");
 const stream_table = @import("stream_table.zig");
 const crypto_stream = @import("crypto_stream.zig");
+const packet_io = @import("packet_io.zig");
 
 /// Re-exported so callers can name a snapshot without importing stats.zig.
 pub const Stats = stats.Stats;
@@ -43,8 +44,8 @@ pub const Error = error{
     StreamClosed,
 };
 
-pub const cid_len = 8;
-pub const max_datagram_size = 65535;
+pub const cid_len = packet_io.cid_len;
+pub const max_datagram_size = packet_io.max_datagram_size;
 /// Re-exported for h3.Server.Options and the transport tests; the module that
 /// owns flow-control state defines the value.
 pub const default_flow_window: u64 = flow_control.default_flow_window;
@@ -396,8 +397,9 @@ pub const Connection = struct {
     role: Role,
     socket: posix.fd_t,
     owns_socket: bool,
-    remote_addr: posix.sockaddr.in,
-    local_addr: posix.sockaddr.in,
+    /// Destination address, synthetic loss counter, and test drop hook. The fd
+    /// itself stays above so socket lifetime has one authority.
+    packet_io: packet_io.PacketIo,
 
     quic: zquic.Connection.Connection,
     /// TLS context, packet protection, CRYPTO reassembly, and RFC 9001 keys.
@@ -452,12 +454,6 @@ pub const Connection = struct {
     /// Index of the first unread entry in lost_queue. Compaction reclaims the
     /// consumed prefix without shifting on every callback.
     lost_queue_head: usize = 0,
-    /// Test hook: drop every Nth outgoing datagram (0 disables). Production
-    /// callers leave this at zero; the retransmission test uses it to simulate
-    /// loss without a network shim. zquic recorded the packet when it was
-    /// scheduled, so its loss detector recovers the dropped datagram.
-    drop_outgoing_every: usize = 0,
-    tx_count: usize = 0,
     handler: ?Handler = null,
     last_activity_us: u64,
     handshake_started_us: u64,
@@ -481,23 +477,22 @@ pub const Connection = struct {
         options: ClientTls,
         qlog_config: ?qlog.Config,
     ) !*Connection {
-        const remote = try resolveAddress(host, port);
-        const socket = try createSocket();
-        errdefer closeSocket(socket);
+        const remote = try packet_io.resolveAddress(host, port);
+        const socket = try packet_io.createSocket();
+        errdefer packet_io.closeSocket(socket);
 
         const self = try allocator.create(Connection);
         errdefer allocator.destroy(self);
 
-        const client_cid = try randomCid();
-        const original_dcid = try randomCid();
+        const client_cid = try packet_io.randomCid();
+        const original_dcid = try packet_io.randomCid();
 
         self.* = .{
             .allocator = allocator,
             .role = .client,
             .socket = socket,
             .owns_socket = true,
-            .remote_addr = remote,
-            .local_addr = .{ .family = posix.AF.INET, .port = 0, .addr = 0, .zero = @splat(0) },
+            .packet_io = packet_io.PacketIo.initClient(remote),
             .quic = undefined,
             .crypto = undefined,
             .flow = FlowControl.init(
@@ -585,14 +580,13 @@ pub const Connection = struct {
             var cid: [20]u8 = @splat(0);
             @memcpy(cid[0..retry_scid.len], retry_scid);
             break :blk cid;
-        } else try randomCid();
+        } else try packet_io.randomCid();
         self.* = .{
             .allocator = allocator,
             .role = .server,
             .socket = socket,
             .owns_socket = false,
-            .remote_addr = remote_addr,
-            .local_addr = local_addr,
+            .packet_io = packet_io.PacketIo.initServer(local_addr, remote_addr),
             .quic = undefined,
             .crypto = undefined,
             .flow = FlowControl.init(allocator, local_max_data, local_max_stream_data),
@@ -730,7 +724,7 @@ pub const Connection = struct {
         self.lost_queue.deinit(self.allocator);
         self.deinitCrypto();
         if (self.local_params.len > 0) self.allocator.free(self.local_params);
-        if (self.owns_socket) closeSocket(self.socket);
+        if (self.owns_socket) packet_io.closeSocket(self.socket);
         self.allocator.destroy(self);
     }
 
@@ -748,9 +742,9 @@ pub const Connection = struct {
         return self.stats;
     }
 
-    /// Test hook used by the retransmission tests; see drop_outgoing_every.
+    /// Test hook used by the retransmission tests; see PacketIo.drop_outgoing_every.
     pub fn setDropOutgoingEvery(self: *Connection, every: usize) void {
-        self.drop_outgoing_every = every;
+        self.packet_io.setDropOutgoingEvery(every);
     }
 
     fn encodeParams(self: *Connection, server: bool) ![]u8 {
@@ -790,7 +784,7 @@ pub const Connection = struct {
         self.last_activity_us = nowMicros();
         var offset: usize = 0;
         while (offset < datagram.len) {
-            const packet = nextPacket(datagram, offset) orelse break;
+            const packet = packet_io.nextPacket(datagram, offset) orelse break;
             self.handlePacket(packet) catch |err| {
                 if (err == error.ConnectionClosed) return;
                 // A packet that cannot be authenticated is dropped, as QUIC
@@ -1638,7 +1632,7 @@ pub const Connection = struct {
         // Production keeps the brief grace window. The synthetic loss hook is
         // an explicit test signal, so it drains as soon as zquic reports the
         // loss (the old force-retransmit hook had the same effect).
-        const grace_us: u64 = if (self.drop_outgoing_every != 0) 0 else lost_payload_grace_us;
+        const grace_us: u64 = if (self.packet_io.drop_outgoing_every != 0) 0 else lost_payload_grace_us;
         var attempted: usize = 0;
         while (self.lost_queue_head < drain_end and attempted < max_retransmits_per_service) {
             const lost = self.lost_queue.items[self.lost_queue_head];
@@ -1667,25 +1661,12 @@ pub const Connection = struct {
         for (packets) |*packet| {
             defer packet.deinit(self.allocator);
             if (packet.data.len == 0) continue;
-            self.tx_count += 1;
-            if (self.drop_outgoing_every != 0 and self.tx_count % self.drop_outgoing_every == 0) {
-                // A test drop never reaches the peer. zquic already recorded
-                // the packet when it was scheduled, so its loss detector (and
-                // PTO probes after a tail loss) recovers it.
-                if (pending_log) |pending| _ = pending.pop();
-                continue;
-            }
-            const sent = posix.system.sendto(
-                self.socket,
-                packet.data.ptr,
-                @intCast(packet.data.len),
-                0,
-                @ptrCast(&self.remote_addr),
-                @sizeOf(posix.sockaddr.in),
-            );
+            const outcome = self.packet_io.sendDatagram(self.socket, packet.data);
+            // The pending qlog entry is consumed for every attempt, including a
+            // synthetic test drop; only a successful send is logged.
             if (pending_log) |pending| {
                 if (pending.pop()) |entry| {
-                    if (!drop_log_batch and sent >= 0) {
+                    if (!drop_log_batch and outcome == .sent) {
                         if (self.qlog) |writer| {
                             if (writer.sampleSent()) writer.packetSent(
                                 nowMicros(),
@@ -1700,7 +1681,7 @@ pub const Connection = struct {
                     }
                 }
             }
-            if (sent < 0) continue;
+            if (outcome != .sent) continue;
             self.stats.packets_sent +|= 1;
             self.stats.bytes_sent +|= @intCast(packet.data.len);
         }
@@ -1877,23 +1858,11 @@ pub const Listener = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, port: u16) !Listener {
-        const socket = try createSocket();
-        errdefer closeSocket(socket);
-        var addr = posix.sockaddr.in{
-            .family = posix.AF.INET,
-            .port = std.mem.nativeToBig(u16, port),
-            .addr = 0,
-            .zero = @splat(0),
-        };
-        const rc = posix.system.bind(socket, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
-        if (rc < 0) return error.QuicError;
-        var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-        if (posix.system.getsockname(socket, @ptrCast(&addr), &len) < 0) return error.QuicError;
-
+        const bound = try packet_io.bindListener(port);
         return .{
             .allocator = allocator,
-            .socket = socket,
-            .local_addr = addr,
+            .socket = bound.fd,
+            .local_addr = bound.local_addr,
             .connections = std.StringHashMap(*Connection).init(allocator),
         };
     }
@@ -1913,32 +1882,18 @@ pub const Listener = struct {
         self.connections.deinit();
         for (self.key_cids.items) |key| self.allocator.free(key);
         self.key_cids.deinit(self.allocator);
-        closeSocket(self.socket);
+        packet_io.closeSocket(self.socket);
     }
 
     pub fn pollReadable(self: *Listener, timeout_ns: u64) bool {
-        const wait = @min(timeout_ns, std.time.ns_per_s);
-        const timeout_ms: i32 = @intCast((wait + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
-        var fds = [_]posix.pollfd{.{ .fd = self.socket, .events = posix.POLL.IN, .revents = 0 }};
-        const ready = posix.poll(&fds, timeout_ms) catch return false;
-        return ready > 0 and (fds[0].revents & posix.POLL.IN) != 0;
+        return packet_io.pollReadable(self.socket, timeout_ns);
     }
 
     pub fn readAndDispatch(self: *Listener, buf: []u8, max_datagrams: usize) usize {
         var handled: usize = 0;
         while (handled < max_datagrams) : (handled += 1) {
-            var peer: posix.sockaddr.in = undefined;
-            var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-            const n = std.c.recvfrom(
-                self.socket,
-                buf.ptr,
-                buf.len,
-                std.c.MSG.DONTWAIT,
-                @ptrCast(&peer),
-                &peer_len,
-            );
-            if (n <= 0) break;
-            self.dispatch(buf[0..@intCast(n)], peer) catch {};
+            const received = packet_io.recvDatagram(self.socket, buf, std.c.MSG.DONTWAIT) orelse break;
+            self.dispatch(received.data, received.peer) catch {};
         }
         return handled;
     }
@@ -1946,7 +1901,7 @@ pub const Listener = struct {
     pub fn dispatch(self: *Listener, datagram: []const u8, peer: posix.sockaddr.in) !void {
         self.ensureQlogHeader();
         if (datagram.len < 1) return;
-        const dcid = destinationCid(datagram) orelse return;
+        const dcid = packet_io.destinationCid(datagram) orelse return;
         if (self.connections.get(dcid)) |connection| {
             try connection.handleDatagram(datagram);
             return;
@@ -1976,7 +1931,7 @@ pub const Listener = struct {
             const token = header.token orelse &.{};
             var retry_impl = retry.Retry{ .key = self.retry_key };
             if (token.len == 0) {
-                const fresh = try randomCid();
+                const fresh = try packet_io.randomCid();
                 var token_buf: [retry.max_token_len]u8 = undefined;
                 const made = retry_impl.makeToken(
                     header.dest_conn_id.bytes(),
@@ -2000,15 +1955,11 @@ pub const Listener = struct {
                     self.qlogRetryRejected("retry_build_failed");
                     return;
                 };
-                const sent = posix.system.sendto(
-                    self.socket,
-                    packet.ptr,
-                    @intCast(packet.len),
-                    0,
-                    @ptrCast(&peer),
-                    @sizeOf(posix.sockaddr.in),
-                );
-                if (sent >= 0) self.qlogRetrySent() else self.qlogRetryRejected("send_failed");
+                if (packet_io.sendDatagramTo(self.socket, packet, peer)) {
+                    self.qlogRetrySent();
+                } else {
+                    self.qlogRetryRejected("send_failed");
+                }
                 return;
             }
             const verified = retry_impl.verifyToken(
@@ -2181,134 +2132,13 @@ pub fn connectWithQlog(
         if (connection.isClosed()) return error.ConnectionClosed;
         if (nowNanos() >= deadline) return error.Timeout;
         connection.service() catch {};
-        const timeout_ns = @as(u64, 10 * std.time.ns_per_ms);
-        var fds = [_]posix.pollfd{.{ .fd = connection.socket, .events = posix.POLL.IN, .revents = 0 }};
-        const timeout_ms: i32 = @intCast((timeout_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
-        const ready = posix.poll(&fds, timeout_ms) catch 0;
-        if (ready > 0 and (fds[0].revents & posix.POLL.IN) != 0) {
-            var peer: posix.sockaddr.in = undefined;
-            var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-            const n = std.c.recvfrom(
-                connection.socket,
-                buf[0..].ptr,
-                buf.len,
-                0,
-                @ptrCast(&peer),
-                &peer_len,
-            );
-            if (n > 0) connection.handleDatagram(buf[0..@intCast(n)]) catch {};
+        if (packet_io.pollReadable(connection.socket, 10 * std.time.ns_per_ms)) {
+            if (packet_io.recvDatagram(connection.socket, buf[0..], 0)) |received| {
+                connection.handleDatagram(received.data) catch {};
+            }
         }
     }
     return connection;
-}
-
-fn createSocket() !posix.fd_t {
-    const fd = posix.system.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
-    if (fd < 0) return error.QuicError;
-    const sock: posix.fd_t = @intCast(fd);
-    errdefer closeSocket(sock);
-    const enable: c_int = 1;
-    _ = posix.system.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, @ptrCast(&enable), @sizeOf(c_int));
-    // A 2 MiB response is ~2,100 datagrams; the default macOS/Linux UDP queue
-    // is smaller than that and silently drops the overflow. This stack does not
-    // retransmit STREAM frames yet, so give the kernel queue room to absorb a
-    // burst while the peer drains it.
-    const socket_buffer: c_int = 4 * 1024 * 1024;
-    _ = posix.system.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVBUF, @ptrCast(&socket_buffer), @sizeOf(c_int));
-    _ = posix.system.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDBUF, @ptrCast(&socket_buffer), @sizeOf(c_int));
-    return sock;
-}
-
-fn closeSocket(socket: posix.fd_t) void {
-    _ = posix.system.close(socket);
-}
-
-fn randomCid() ![20]u8 {
-    var out: [20]u8 = @splat(0);
-    qtls.fillRandom(out[0..cid_len]);
-    return out;
-}
-
-fn resolveAddress(host: []const u8, port: u16) !posix.sockaddr.in {
-    const allocator = std.heap.page_allocator;
-    const host_z = try allocator.allocSentinel(u8, host.len, 0);
-    defer allocator.free(host_z);
-    @memcpy(host_z[0..host.len], host);
-
-    var port_buf: [8]u8 = undefined;
-    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
-    const port_z = try allocator.allocSentinel(u8, port_str.len, 0);
-    defer allocator.free(port_z);
-    @memcpy(port_z[0..port_str.len], port_str);
-
-    var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
-    hints.family = posix.AF.INET;
-    hints.socktype = posix.SOCK.DGRAM;
-    hints.protocol = posix.IPPROTO.UDP;
-
-    var result: ?*std.c.addrinfo = null;
-    const rc = std.c.getaddrinfo(host_z.ptr, port_z.ptr, &hints, &result);
-    if (@backingInt(rc) != 0) return error.QuicError;
-    defer std.c.freeaddrinfo(result.?);
-
-    var out: posix.sockaddr.in = undefined;
-    @memcpy(std.mem.asBytes(&out), @as([*]const u8, @ptrCast(result.?.addr.?))[0..@sizeOf(posix.sockaddr.in)]);
-    return out;
-}
-
-fn destinationCid(datagram: []const u8) ?[]const u8 {
-    if (datagram.len < 6) return null;
-    if (datagram[0] & 0x80 != 0) {
-        const dcil = datagram[5];
-        if (6 + dcil > datagram.len) return null;
-        return datagram[6 .. 6 + dcil];
-    }
-    if (datagram.len < 1 + cid_len) return null;
-    return datagram[1 .. 1 + cid_len];
-}
-
-/// Split a datagram into the QUIC packets it coalesces.
-fn nextPacket(datagram: []const u8, start: usize) ?[]const u8 {
-    if (start >= datagram.len) return null;
-    if (datagram[start] & 0x80 == 0) return datagram[start..];
-    if (start + 7 > datagram.len) return null;
-    var pos = start + 5;
-    const dcil = datagram[pos];
-    pos += 1;
-    if (pos + dcil > datagram.len) return null;
-    pos += dcil;
-    if (pos >= datagram.len) return null;
-    const scil = datagram[pos];
-    pos += 1;
-    if (pos + scil > datagram.len) return null;
-    pos += scil;
-
-    const packet_type = (datagram[start] & 0x30) >> 4;
-    // Retry has no Length field: by definition it consumes the rest of the
-    // datagram, and its token and integrity tag are the trailing bytes.
-    if (packet_type == 0x03) return datagram[start..];
-    if (packet_type == 0x00) {
-        const token_len = readVarint(datagram, &pos) orelse return null;
-        if (token_len > datagram.len - pos) return null;
-        pos += @intCast(token_len);
-    }
-    const length = readVarint(datagram, &pos) orelse return null;
-    const end = std.math.add(usize, pos, @intCast(length)) catch return null;
-    if (end > datagram.len) return null;
-    return datagram[start..end];
-}
-
-fn readVarint(data: []const u8, cursor: *usize) ?u64 {
-    if (cursor.* >= data.len) return null;
-    const encoded_len: usize = @as(usize, 1) << @intCast(data[cursor.*] >> 6);
-    if (cursor.* + encoded_len > data.len) return null;
-    var value: u64 = data[cursor.*] & 0x3f;
-    var i: usize = 1;
-    while (i < encoded_len) : (i += 1) {
-        value = (value << 8) | data[cursor.* + i];
-    }
-    cursor.* += encoded_len;
-    return value;
 }
 
 fn levelIndexForPacketType(packet_type: Packet.PacketType) usize {
@@ -2559,8 +2389,8 @@ test "native transport: Retry challenges before allocating a connection" {
     var hook: Hook = .{};
     listener.on_connection = .{ .context = &hook, .callback = Hook.onConnection };
 
-    const client_fd = try createSocket();
-    defer closeSocket(client_fd);
+    const client_fd = try packet_io.createSocket();
+    defer packet_io.closeSocket(client_fd);
     var client_addr = posix.sockaddr.in{ .family = posix.AF.INET, .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001), .zero = @splat(0) };
     if (posix.system.bind(client_fd, @ptrCast(&client_addr), @sizeOf(posix.sockaddr.in)) < 0) return error.QuicError;
     var client_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);

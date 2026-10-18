@@ -449,6 +449,9 @@ pub const Session = struct {
             .encoder = qpack.Encoder.init(allocator),
             .retired = retired,
         };
+        // Field-section timestamps and the encoder timeout both use the
+        // transport's monotonic clock so they cannot drift apart.
+        self.encoder.clock = transport.nowNanos;
         errdefer self.encoder.deinit();
         errdefer self.decoder.deinit();
         conn.handler = .{
@@ -1008,6 +1011,18 @@ pub const Session = struct {
         }
     }
 
+    /// Encoder-side counterpart to expireBlockedStreams. A field section whose
+    /// referenced inserts the peer has not acknowledged for two seconds cannot
+    /// make progress; release its references and fail the connection with
+    /// 0x0203. Without this timer those table entries stay pinned until session
+    /// teardown. The encoder removes each expired section before releasing its
+    /// refs, so a later deinit or cancellation cannot double-release.
+    fn expireEncoderSections(self: *Session) void {
+        if (self.conn.isClosed()) return;
+        if (self.encoder.expireBlockedSections(transport.nowNanos()) == 0) return;
+        self.conn.close(qpack_decoder_stream_error, "QPACK encoder section timeout");
+    }
+
     fn flushPendingSectionAcks(self: *Session) void {
         if (!self.started or self.conn.isClosed()) return;
         var it = self.streams.iterator();
@@ -1289,6 +1304,8 @@ pub const Session = struct {
         if (!self.started and self.conn.isEstablished()) try self.begin();
         try self.flushEncoderInstructions();
         self.expireBlockedStreams();
+        self.expireEncoderSections();
+        if (self.conn.isClosed()) return;
         self.queueInsertCountIncrement();
         self.flushPendingSectionAcks();
         var it = self.streams.iterator();

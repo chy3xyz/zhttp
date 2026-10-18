@@ -8,6 +8,7 @@ test {
     _ = @import("h3/native/crypto_stream_test.zig");
     _ = @import("h3/native/stream_table_test.zig");
     _ = @import("h3/native/flow_control_test.zig");
+    _ = @import("h3/native/packet_io_test.zig");
     _ = @import("h3/native/stats_test.zig");
     _ = @import("h3/native/recovery_observe_test.zig");
     _ = @import("h3/native/recovery_owner_test.zig");

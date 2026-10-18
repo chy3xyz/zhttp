@@ -464,14 +464,52 @@ pub const encoder_blocked_streams_cap: usize = 16;
 /// entry costs 32 bytes of overhead, so short values are cheaper as literals.
 pub const encoder_min_insert_len: usize = 40;
 
-const StreamRefs = struct {
-    /// Absolute indexes referenced by field sections this encoder sent on the
-    /// stream. Released by Section Acknowledgment or Stream Cancellation.
+/// A field section whose referenced inserts the peer has not acknowledged for
+/// this long cannot make progress. http3.Session.service closes the connection
+/// with QPACK_DECODER_STREAM_ERROR (0x0203) once a section expires (RFC 9204
+/// section 3.2.6 uses the same code for an encoder that gives up on a blocked
+/// decoder).
+pub const encoder_blocked_section_timeout_ns: u64 = 2 * std.time.ns_per_s;
+
+/// Clock used for field-section timestamps. http3.Session points this at the
+/// transport's monotonic clock; tests substitute their own.
+fn systemNowNanos() u64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.c.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+/// One encoded field section that referenced at least one dynamic-table entry
+/// and therefore needs a Section Acknowledgment. Sections are held in a
+/// per-stream FIFO: an acknowledgment covers only the oldest outstanding
+/// section on its stream. Request/response trailers can add a second dynamic
+/// section to a stream, so per-stream refs are not enough.
+pub const Section = struct {
+    stream_id: u64,
+    /// Absolute indexes of every dynamic entry this section references, in
+    /// field order. Each occurrence holds one reference in DynamicTable.
     refs: std.ArrayListUnmanaged(u64) = .empty,
-    /// True while at least one reference is to an insert the peer has not
-    /// acknowledged. Such a stream counts against the peer's blocked-stream
-    /// limit until every referenced insert is acknowledged.
+    /// True while at least one referenced insert is not acknowledged by the
+    /// peer. Only such sections count against QPACK_BLOCKED_STREAMS and can
+    /// expire; Insert Count Increment clears the flag.
     blocked: bool = false,
+    /// True when this section used dynamic inserts. Tracked sections always
+    /// have at least one dynamic reference; the flag makes the state explicit.
+    uses_inserts: bool = true,
+    /// Clock value sampled when encodeSection created the section. The blocked
+    /// section timer compares it against the Session's monotonic clock.
+    created_ns: u64 = 0,
+};
+
+const StreamSections = struct {
+    /// FIFO of outstanding field sections that still owe a Section
+    /// Acknowledgment. The oldest section is at index zero.
+    sections: std.ArrayListUnmanaged(Section) = .empty,
+
+    fn deinit(self: *StreamSections, allocator: std.mem.Allocator) void {
+        for (self.sections.items) |*section| section.refs.deinit(allocator);
+        self.sections.deinit(allocator);
+    }
 };
 
 const FieldPlan = union(enum) {
@@ -496,9 +534,15 @@ pub const Encoder = struct {
     blocked_stream_limit: usize = 0,
     /// Highest Insert Count covered by the peer's Insert Count Increments.
     known_received_count: u64 = 0,
-    /// Streams with at least one reference to an unacknowledged insert.
+    /// Number of streams with at least one blocked outstanding section.
+    /// Recomputed whenever sections are attached, acknowledged, cancelled, or
+    /// unblocked by an Insert Count Increment.
     blocked_stream_count: usize = 0,
-    streams: std.AutoHashMapUnmanaged(u64, StreamRefs) = .empty,
+    /// Per-stream FIFO of outstanding field sections and their references.
+    streams: std.AutoHashMapUnmanaged(u64, StreamSections) = .empty,
+    /// Monotonic clock used to timestamp field sections for the blocked-section
+    /// timer. http3.Session overrides it with transport.nowNanos.
+    clock: *const fn () u64 = systemNowNanos,
     /// Encoder-stream instructions waiting to be queued on the local type
     /// 0x02 stream. http3.Session drains this after encoding a section and
     /// from service().
@@ -514,7 +558,7 @@ pub const Encoder = struct {
 
     pub fn deinit(self: *Encoder) void {
         var it = self.streams.iterator();
-        while (it.next()) |entry| entry.value_ptr.refs.deinit(self.allocator);
+        while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
         self.streams.deinit(self.allocator);
         self.pending.deinit(self.allocator);
         self.table.deinit();
@@ -576,6 +620,9 @@ pub const Encoder = struct {
         var refs_attached = false;
         errdefer if (!refs_attached) self.releaseReferences(section_refs.items);
 
+        // Sample the section timestamp before doing any work so the blocked
+        // timer measures the whole encode.
+        const created_ns = self.clock();
         const may_block = self.mayBlockNewSection(stream_id);
         var highest: u64 = 0;
         var has_dynamic = false;
@@ -608,11 +655,17 @@ pub const Encoder = struct {
         }
         for (plans.items) |plan| try writePlan(allocator, &out, plan, base);
 
+        // Materialize the block before attaching the section. A failure in the
+        // final allocation must not leave an outstanding section whose bytes
+        // the caller will never send: the refs are released by the errdefer
+        // above unless attachSection succeeds.
+        const owned = try out.toOwnedSlice(allocator);
+        errdefer allocator.free(owned);
         if (section_refs.items.len > 0) {
-            try self.attachSection(allocator, stream_id, section_refs.items);
+            try self.attachSection(allocator, stream_id, section_refs.items, created_ns);
             refs_attached = true;
         }
-        return out.toOwnedSlice(allocator);
+        return owned;
     }
 
     /// Append a Duplicate instruction for a live entry and mirror it in the
@@ -626,33 +679,97 @@ pub const Encoder = struct {
         try writeEncoderDuplicate(self.allocator, &self.pending, relative);
     }
 
-    /// A Section Acknowledgment releases every dynamic reference the field
-    /// section held on the stream. An acknowledgment for a stream with no
-    /// outstanding reference is a decoder-stream error (RFC 9204 section
-    /// 4.4.1).
+    /// A Section Acknowledgment releases the oldest outstanding field section
+    /// on the stream only. Later sections (for example trailers) stay in the
+    /// FIFO and keep their references pinned. An acknowledgment for a stream
+    /// with no outstanding dynamic section is a decoder-stream error
+    /// (RFC 9204 section 4.4.1).
     pub fn onSectionAcknowledgment(self: *Encoder, stream_id: u64) Error!void {
-        const removed = self.streams.fetchRemove(stream_id) orelse
+        const entry = self.streams.getPtr(stream_id) orelse
             return error.UnexpectedSectionAcknowledgment;
-        var stream = removed.value;
-        defer stream.refs.deinit(self.allocator);
-        if (stream.refs.items.len == 0) return error.UnexpectedSectionAcknowledgment;
-        self.releaseReferences(stream.refs.items);
-        if (stream.blocked and self.blocked_stream_count > 0) {
-            self.blocked_stream_count -= 1;
+        if (entry.sections.items.len == 0) return error.UnexpectedSectionAcknowledgment;
+
+        var section = entry.sections.orderedRemove(0);
+        defer section.refs.deinit(self.allocator);
+        self.releaseReferences(section.refs.items);
+
+        if (entry.sections.items.len == 0) {
+            const removed = self.streams.fetchRemove(stream_id).?;
+            var empty = removed.value;
+            empty.sections.deinit(self.allocator);
         }
+        self.recomputeBlockedStreamCount();
     }
 
-    /// Stream Cancellation drops the stream's references without requiring an
-    /// acknowledgment. Cancelling a stream with nothing outstanding is
-    /// explicitly allowed.
+    /// Stream Cancellation releases every outstanding field section for the
+    /// stream without requiring an acknowledgment. Cancelling a stream with
+    /// nothing outstanding is explicitly allowed.
     pub fn onStreamCancellation(self: *Encoder, stream_id: u64) void {
         const removed = self.streams.fetchRemove(stream_id) orelse return;
         var stream = removed.value;
-        defer stream.refs.deinit(self.allocator);
-        self.releaseReferences(stream.refs.items);
-        if (stream.blocked and self.blocked_stream_count > 0) {
-            self.blocked_stream_count -= 1;
+        defer stream.deinit(self.allocator);
+        for (stream.sections.items) |*section| {
+            self.releaseReferences(section.refs.items);
         }
+        self.recomputeBlockedStreamCount();
+    }
+
+    /// Number of field sections on stream whose Section Acknowledgment is still
+    /// outstanding. Static-only sections are not tracked because RFC 9204 only
+    /// acknowledges sections with a nonzero Required Insert Count.
+    pub fn outstandingSectionCount(self: *const Encoder, stream_id: u64) usize {
+        const stream = self.streams.get(stream_id) orelse return 0;
+        return stream.sections.items.len;
+    }
+
+    /// Release every field section whose inserts have been unacknowledged for
+    /// at least encoder_blocked_section_timeout_ns. A section whose inserts
+    /// became acknowledged is not expired: only its Section Acknowledgment can
+    /// release it. Returns the number of sections released; the caller closes
+    /// the connection with 0x0203. No reference is released twice because an
+    /// expired section is removed from the FIFO before its refs are dropped.
+    pub fn expireBlockedSections(self: *Encoder, now_ns: u64) usize {
+        var expired: usize = 0;
+        // Only blocked sections can expire, and the number of streams with a
+        // blocked section is bounded by encoder_blocked_streams_cap (16). This
+        // buffer therefore always has room for the streams that become empty.
+        var empty_streams: [encoder_blocked_streams_cap]u64 = undefined;
+        var empty_count: usize = 0;
+
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            const stream = entry.value_ptr;
+            var index: usize = 0;
+            while (index < stream.sections.items.len) {
+                const section = &stream.sections.items[index];
+                if (!section.blocked) {
+                    index += 1;
+                    continue;
+                }
+                if (now_ns < section.created_ns or
+                    now_ns - section.created_ns < encoder_blocked_section_timeout_ns)
+                {
+                    index += 1;
+                    continue;
+                }
+                var removed = stream.sections.orderedRemove(index);
+                self.releaseReferences(removed.refs.items);
+                removed.refs.deinit(self.allocator);
+                expired += 1;
+            }
+            if (stream.sections.items.len == 0 and empty_count < empty_streams.len) {
+                empty_streams[empty_count] = entry.key_ptr.*;
+                empty_count += 1;
+            }
+        }
+
+        for (empty_streams[0..empty_count]) |stream_id| {
+            const removed = self.streams.fetchRemove(stream_id) orelse continue;
+            var empty = removed.value;
+            empty.deinit(self.allocator);
+        }
+        if (expired > 0) self.recomputeBlockedStreamCount();
+        return expired;
     }
 
     /// Advance known_received_count. Zero is illegal, and the peer can never
@@ -663,24 +780,24 @@ pub const Encoder = struct {
         if (increment > outstanding) return error.InvalidInsertCountIncrement;
         self.known_received_count += increment;
 
-        // Streams whose every referenced insert is now acknowledged stop
-        // counting against the blocked-stream limit.
+        // Sections whose every referenced insert is now acknowledged stop
+        // counting against the blocked-stream limit. Their references stay
+        // pinned until the peer acknowledges the section itself.
         var it = self.streams.iterator();
         while (it.next()) |entry| {
-            const stream = entry.value_ptr;
-            if (!stream.blocked) continue;
-            var still_blocked = false;
-            for (stream.refs.items) |absolute_index| {
-                if (absolute_index >= self.known_received_count) {
-                    still_blocked = true;
-                    break;
+            for (entry.value_ptr.sections.items) |*section| {
+                if (!section.blocked) continue;
+                var still_blocked = false;
+                for (section.refs.items) |absolute_index| {
+                    if (absolute_index >= self.known_received_count) {
+                        still_blocked = true;
+                        break;
+                    }
                 }
-            }
-            if (!still_blocked) {
-                stream.blocked = false;
-                if (self.blocked_stream_count > 0) self.blocked_stream_count -= 1;
+                section.blocked = still_blocked;
             }
         }
+        self.recomputeBlockedStreamCount();
     }
 
     fn planField(
@@ -780,8 +897,12 @@ pub const Encoder = struct {
 
     fn mayBlockNewSection(self: *const Encoder, stream_id: u64) bool {
         if (self.blocked_stream_limit == 0) return false;
+        // A stream that already counts as blocked can reference more of its
+        // own unacknowledged inserts without consuming another slot.
         if (self.streams.get(stream_id)) |stream| {
-            if (stream.blocked) return true;
+            for (stream.sections.items) |section| {
+                if (section.blocked) return true;
+            }
         }
         return self.blocked_stream_count < self.blocked_stream_limit;
     }
@@ -809,18 +930,52 @@ pub const Encoder = struct {
         allocator: std.mem.Allocator,
         stream_id: u64,
         refs: []const u64,
+        created_ns: u64,
     ) Error!void {
+        if (refs.len == 0) return;
+
+        var blocked = false;
+        for (refs) |absolute_index| {
+            if (absolute_index >= self.known_received_count) {
+                blocked = true;
+                break;
+            }
+        }
+
+        var section = Section{
+            .stream_id = stream_id,
+            .blocked = blocked,
+            .created_ns = created_ns,
+        };
+        errdefer section.refs.deinit(allocator);
+        try section.refs.appendSlice(allocator, refs);
+
         const gop = try self.streams.getOrPut(allocator, stream_id);
         if (!gop.found_existing) gop.value_ptr.* = .{};
-        try gop.value_ptr.refs.appendSlice(allocator, refs);
-        if (gop.value_ptr.blocked) return;
+        errdefer if (!gop.found_existing) {
+            _ = self.streams.fetchRemove(stream_id);
+        };
+        try gop.value_ptr.sections.append(allocator, section);
 
-        for (refs) |absolute_index| {
-            if (absolute_index < self.known_received_count) continue;
-            gop.value_ptr.blocked = true;
-            self.blocked_stream_count += 1;
-            return;
+        // Appending the section is the last fallible step, so ownership of the
+        // refs has transferred and recomputation cannot fail.
+        self.recomputeBlockedStreamCount();
+    }
+
+    fn recomputeBlockedStreamCount(self: *Encoder) void {
+        var count: usize = 0;
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            var blocked = false;
+            for (entry.value_ptr.sections.items) |section| {
+                if (section.blocked) {
+                    blocked = true;
+                    break;
+                }
+            }
+            if (blocked) count += 1;
         }
+        self.blocked_stream_count = count;
     }
 
     fn findNewest(self: *const Encoder, name: []const u8, value: []const u8) ?u64 {
@@ -2214,4 +2369,259 @@ test "QPACK: encoder duplicate instruction mirrors the peer table" {
     encoder.clearPendingInstructions();
     try std.testing.expectEqual(@as(u64, 2), decoder.insertCount());
     try std.testing.expectEqualStrings(field.value, decoder.table.getRelative(0).?.value);
+}
+
+var timeout_test_now_ns: u64 = 0;
+
+fn timeoutTestClock() u64 {
+    return timeout_test_now_ns;
+}
+
+test "QPACK: two sections on one stream acknowledge oldest then newest" {
+    const allocator = std.testing.allocator;
+    var encoder = Encoder.init(allocator);
+    defer encoder.deinit();
+    try encoder.configure(4096, 16);
+    encoder.clearPendingInstructions();
+
+    var value_storage: [40]u8 = undefined;
+    fillValue(7, &value_storage);
+    const field = HeaderField{ .name = "x-two-sections", .value = &value_storage };
+
+    const first = try encoder.encodeSection(allocator, 4, &.{field});
+    defer allocator.free(first);
+    const second = try encoder.encodeSection(allocator, 4, &.{field});
+    defer allocator.free(second);
+
+    // Both sections carry a dynamic reference to the same entry.
+    try std.testing.expect(first[0] != 0);
+    try std.testing.expect(second[0] != 0);
+    try std.testing.expectEqual(@as(u64, 1), encoder.insertCount());
+    try std.testing.expectEqual(@as(u32, 2), encoder.table.referenceCount(0));
+    try std.testing.expectEqual(@as(usize, 2), encoder.outstandingSectionCount(4));
+    try std.testing.expectEqual(@as(usize, 1), encoder.blockedStreamCount());
+
+    // The first acknowledgment releases only the oldest section's reference.
+    try encoder.onSectionAcknowledgment(4);
+    try std.testing.expectEqual(@as(u32, 1), encoder.table.referenceCount(0));
+    try std.testing.expectEqual(@as(usize, 1), encoder.outstandingSectionCount(4));
+    try std.testing.expectEqual(@as(usize, 1), encoder.blockedStreamCount());
+
+    // The second acknowledgment releases the newer (trailer) section.
+    try encoder.onSectionAcknowledgment(4);
+    try std.testing.expectEqual(@as(u32, 0), encoder.table.referenceCount(0));
+    try std.testing.expectEqual(@as(usize, 0), encoder.outstandingSectionCount(4));
+    try std.testing.expectEqual(@as(usize, 0), encoder.blockedStreamCount());
+
+    // With no outstanding section, a third acknowledgment is still 0x0203.
+    try std.testing.expectError(
+        error.UnexpectedSectionAcknowledgment,
+        encoder.onSectionAcknowledgment(4),
+    );
+}
+
+test "QPACK: oldest Section Ack releases only its refs before eviction" {
+    const allocator = std.testing.allocator;
+    var encoder = Encoder.init(allocator);
+    defer encoder.deinit();
+    // Four 82-byte entries fit (328 <= 400) and each is below capacity / 4.
+    try encoder.configure(400, 0);
+    encoder.clearPendingInstructions();
+
+    var names: [5][10]u8 = undefined;
+    var values: [5][40]u8 = undefined;
+    var fields: [5]HeaderField = undefined;
+    for (0..5) |i| {
+        _ = try std.fmt.bufPrint(&names[i], "x-field-{d:0>2}", .{i});
+        _ = try std.fmt.bufPrint(
+            &values[i],
+            "value-{d:0>2}-0123456789abcdef0123456789abc",
+            .{i},
+        );
+        fields[i] = .{ .name = &names[i], .value = &values[i] };
+    }
+
+    // Fill the table without references, then let the peer acknowledge every
+    // insert so later sections may reference them.
+    for (fields[0..4]) |field| {
+        const section = try encoder.encodeSection(allocator, 0, &.{field});
+        allocator.free(section);
+    }
+    try encoder.onInsertCountIncrement(4);
+    encoder.clearPendingInstructions();
+
+    // Two dynamic sections on one stream pin absolute indexes 0 and 1.
+    const oldest = try encoder.encodeSection(allocator, 4, &.{fields[0]});
+    defer allocator.free(oldest);
+    const newer = try encoder.encodeSection(allocator, 4, &.{fields[1]});
+    defer allocator.free(newer);
+    try std.testing.expect(oldest[0] != 0);
+    try std.testing.expect(newer[0] != 0);
+    try std.testing.expectEqual(@as(u32, 1), encoder.table.referenceCount(0));
+    try std.testing.expectEqual(@as(u32, 1), encoder.table.referenceCount(1));
+
+    // A fifth insert would have to evict index 0, still pinned by the oldest
+    // section, so the encoder emits a literal and leaves the table unchanged.
+    const blocked_insert = try encoder.encodeSection(allocator, 8, &.{fields[4]});
+    defer allocator.free(blocked_insert);
+    try std.testing.expectEqual(@as(u8, 0), blocked_insert[0]);
+    try std.testing.expectEqual(@as(u64, 4), encoder.insertCount());
+
+    // Acknowledging only the oldest section unpins index 0; index 1 stays.
+    try encoder.onSectionAcknowledgment(4);
+    try std.testing.expectEqual(@as(u32, 0), encoder.table.referenceCount(0));
+    try std.testing.expectEqual(@as(u32, 1), encoder.table.referenceCount(1));
+    try std.testing.expectEqual(@as(usize, 1), encoder.outstandingSectionCount(4));
+
+    // The insert can now evict index 0, proving the oldest ack released it.
+    const allowed = try encoder.encodeSection(allocator, 12, &.{fields[4]});
+    defer allocator.free(allowed);
+    try std.testing.expectEqual(@as(u64, 5), encoder.insertCount());
+    try std.testing.expect(encoder.table.getAbsolute(0) == null);
+    try std.testing.expectEqual(@as(u32, 1), encoder.table.referenceCount(1));
+
+    try encoder.onSectionAcknowledgment(4);
+    try std.testing.expectEqual(@as(u32, 0), encoder.table.referenceCount(1));
+}
+
+test "QPACK: Stream Cancellation releases every outstanding section" {
+    const allocator = std.testing.allocator;
+    var encoder = Encoder.init(allocator);
+    defer encoder.deinit();
+    try encoder.configure(4096, 16);
+    encoder.clearPendingInstructions();
+
+    var value_storage: [40]u8 = undefined;
+    fillValue(8, &value_storage);
+    const field = HeaderField{ .name = "x-cancel-all", .value = &value_storage };
+
+    const first = try encoder.encodeSection(allocator, 4, &.{field});
+    defer allocator.free(first);
+    const second = try encoder.encodeSection(allocator, 4, &.{field});
+    defer allocator.free(second);
+    try std.testing.expectEqual(@as(u32, 2), encoder.table.referenceCount(0));
+    try std.testing.expectEqual(@as(usize, 2), encoder.outstandingSectionCount(4));
+    try std.testing.expectEqual(@as(usize, 1), encoder.blockedStreamCount());
+
+    encoder.onStreamCancellation(4);
+    try std.testing.expectEqual(@as(u32, 0), encoder.table.referenceCount(0));
+    try std.testing.expectEqual(@as(usize, 0), encoder.outstandingSectionCount(4));
+    try std.testing.expectEqual(@as(usize, 0), encoder.blockedStreamCount());
+
+    // Cancellation is idempotent, and an acknowledgment afterward is invalid.
+    encoder.onStreamCancellation(4);
+    try std.testing.expectError(
+        error.UnexpectedSectionAcknowledgment,
+        encoder.onSectionAcknowledgment(4),
+    );
+
+    // Releasing every ref allows a fresh section on another stream to use the
+    // still-unacknowledged insert again (the blocked-stream slot is free).
+    const third = try encoder.encodeSection(allocator, 8, &.{field});
+    defer allocator.free(third);
+    try std.testing.expect(third[0] != 0);
+    try std.testing.expectEqual(@as(u32, 1), encoder.table.referenceCount(0));
+    try std.testing.expectEqual(@as(usize, 1), encoder.blockedStreamCount());
+}
+
+test "QPACK: blocked section timeout releases refs exactly once" {
+    const allocator = std.testing.allocator;
+    var encoder = Encoder.init(allocator);
+    defer encoder.deinit();
+    encoder.clock = &timeoutTestClock;
+    try encoder.configure(4096, 16);
+    encoder.clearPendingInstructions();
+
+    const created_ns = 10 * std.time.ns_per_s;
+    timeout_test_now_ns = created_ns;
+    var value_storage: [40]u8 = undefined;
+    fillValue(9, &value_storage);
+    const field = HeaderField{ .name = "x-timeout", .value = &value_storage };
+
+    const section = try encoder.encodeSection(allocator, 4, &.{field});
+    defer allocator.free(section);
+    try std.testing.expect(section[0] != 0);
+    try std.testing.expectEqual(@as(usize, 1), encoder.outstandingSectionCount(4));
+    try std.testing.expectEqual(@as(u32, 1), encoder.table.referenceCount(0));
+
+    // Just under two seconds the blocked section stays pinned.
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        encoder.expireBlockedSections(created_ns + encoder_blocked_section_timeout_ns - 1),
+    );
+    try std.testing.expectEqual(@as(usize, 1), encoder.outstandingSectionCount(4));
+    try std.testing.expectEqual(@as(u32, 1), encoder.table.referenceCount(0));
+
+    // At two seconds the timer releases the section and its refs.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        encoder.expireBlockedSections(created_ns + encoder_blocked_section_timeout_ns),
+    );
+    try std.testing.expectEqual(@as(usize, 0), encoder.outstandingSectionCount(4));
+    try std.testing.expectEqual(@as(u32, 0), encoder.table.referenceCount(0));
+    try std.testing.expectEqual(@as(usize, 0), encoder.blockedStreamCount());
+    try std.testing.expectError(
+        error.UnexpectedSectionAcknowledgment,
+        encoder.onSectionAcknowledgment(4),
+    );
+
+    // A section whose inserts were acknowledged is not a blocked section; the
+    // timer leaves it alone and only its Section Ack releases the reference.
+    const second = try encoder.encodeSection(allocator, 8, &.{field});
+    defer allocator.free(second);
+    try encoder.onInsertCountIncrement(1);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        encoder.expireBlockedSections(created_ns + 3 * std.time.ns_per_s),
+    );
+    try std.testing.expectEqual(@as(usize, 1), encoder.outstandingSectionCount(8));
+    try std.testing.expectEqual(@as(u32, 1), encoder.table.referenceCount(0));
+    try encoder.onSectionAcknowledgment(8);
+    try std.testing.expectEqual(@as(u32, 0), encoder.table.referenceCount(0));
+}
+
+test "QPACK: blocked section timeout expires only the old section" {
+    const allocator = std.testing.allocator;
+    var encoder = Encoder.init(allocator);
+    defer encoder.deinit();
+    encoder.clock = &timeoutTestClock;
+    try encoder.configure(4096, 16);
+    encoder.clearPendingInstructions();
+
+    var value_storage: [40]u8 = undefined;
+    fillValue(10, &value_storage);
+    const field = HeaderField{ .name = "x-timeout-two", .value = &value_storage };
+
+    timeout_test_now_ns = 0;
+    const first = try encoder.encodeSection(allocator, 4, &.{field});
+    defer allocator.free(first);
+    timeout_test_now_ns = 1 * std.time.ns_per_s;
+    const second = try encoder.encodeSection(allocator, 4, &.{field});
+    defer allocator.free(second);
+
+    try std.testing.expectEqual(@as(u32, 2), encoder.table.referenceCount(0));
+    try std.testing.expectEqual(@as(usize, 2), encoder.outstandingSectionCount(4));
+
+    // At t=2s only the first section has reached the two-second timeout; the
+    // second (created at t=1s) stays in the FIFO and keeps its reference.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        encoder.expireBlockedSections(2 * std.time.ns_per_s),
+    );
+    try std.testing.expectEqual(@as(u32, 1), encoder.table.referenceCount(0));
+    try std.testing.expectEqual(@as(usize, 1), encoder.outstandingSectionCount(4));
+    try std.testing.expectEqual(@as(usize, 1), encoder.blockedStreamCount());
+
+    // The remaining section expires at t=3s; its reference is released once.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        encoder.expireBlockedSections(3 * std.time.ns_per_s),
+    );
+    try std.testing.expectEqual(@as(u32, 0), encoder.table.referenceCount(0));
+    try std.testing.expectEqual(@as(usize, 0), encoder.outstandingSectionCount(4));
+    try std.testing.expectEqual(@as(usize, 0), encoder.blockedStreamCount());
+    try std.testing.expectError(
+        error.UnexpectedSectionAcknowledgment,
+        encoder.onSectionAcknowledgment(4),
+    );
 }
