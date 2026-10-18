@@ -15,8 +15,15 @@ pub const SSL_CTX = opaque {};
 pub const SSL_METHOD = opaque {};
 pub const BIO = opaque {};
 pub const X509 = opaque {};
+pub const X509_STORE = opaque {};
 pub const X509_STORE_CTX = opaque {};
 pub const EVP_PKEY = opaque {};
+
+/// One entry in OpenSSL's QUIC-TLS callback table (OSSL_DISPATCH).
+pub const OSSL_DISPATCH = extern struct {
+    function_id: c_int,
+    function: ?*const anyopaque,
+};
 
 pub const pem_password_cb = fn (buf: [*c]u8, size: c_int, rwflag: c_int, userdata: ?*anyopaque) callconv(.c) c_int;
 
@@ -37,12 +44,16 @@ pub extern fn TLS_client_method() ?*const SSL_METHOD;
 pub extern fn TLS_server_method() ?*const SSL_METHOD;
 
 pub extern fn SSL_CTX_new(meth: ?*const SSL_METHOD) ?*SSL_CTX;
+pub extern fn SSL_CTX_up_ref(ctx: ?*SSL_CTX) c_int;
 pub extern fn SSL_CTX_free(ctx: ?*SSL_CTX) void;
 pub extern fn SSL_CTX_set_verify(ctx: ?*SSL_CTX, mode: c_int, callback: SSL_verify_cb) void;
 pub extern fn SSL_CTX_set_default_verify_paths(ctx: ?*SSL_CTX) c_int;
 pub extern fn SSL_CTX_use_certificate(ctx: ?*SSL_CTX, x: ?*X509) c_int;
 pub extern fn SSL_CTX_use_PrivateKey(ctx: ?*SSL_CTX, pkey: ?*EVP_PKEY) c_int;
 pub extern fn SSL_CTX_check_private_key(ctx: ?*const SSL_CTX) c_int;
+pub extern fn SSL_CTX_set_ciphersuites(ctx: ?*SSL_CTX, suites: [*c]const u8) c_int;
+pub extern fn SSL_CTX_get_cert_store(ctx: ?*const SSL_CTX) ?*X509_STORE;
+pub extern fn X509_STORE_add_cert(store: ?*X509_STORE, x: ?*X509) c_int;
 pub extern fn SSL_CTX_ctrl(ctx: ?*SSL_CTX, cmd: c_int, larg: c_long, parg: ?*anyopaque) c_long;
 pub extern fn SSL_CTX_callback_ctrl(ctx: ?*SSL_CTX, cmd: c_int, fp: ?*const fn () callconv(.c) void) c_long;
 pub extern fn SSL_CTX_set_alpn_protos(ctx: ?*SSL_CTX, protos: [*c]const u8, protos_len: c_uint) c_int;
@@ -74,6 +85,11 @@ pub extern fn SSL_set_SSL_CTX(ssl: ?*SSL, ctx: ?*SSL_CTX) ?*SSL_CTX;
 pub extern fn SSL_get_SSL_CTX(ssl: ?*const SSL) ?*SSL_CTX;
 pub extern fn SSL_set_accept_state(s: ?*SSL) void;
 pub extern fn SSL_set_connect_state(s: ?*SSL) void;
+pub extern fn SSL_set1_host(ssl: ?*SSL, hostname: [*c]const u8) c_int;
+pub extern fn SSL_do_handshake(ssl: ?*SSL) c_int;
+pub extern fn SSL_is_init_finished(ssl: ?*const SSL) c_int;
+pub extern fn SSL_set_quic_tls_cbs(ssl: ?*SSL, dispatch: [*c]const OSSL_DISPATCH, arg: ?*anyopaque) c_int;
+pub extern fn SSL_set_quic_tls_transport_params(ssl: ?*SSL, params: [*c]const u8, len: usize) c_int;
 pub extern fn SSL_set_alpn_protos(ssl: ?*SSL, protos: [*c]const u8, protos_len: c_uint) c_int;
 pub extern fn SSL_set_ex_data(ssl: ?*SSL, idx: c_int, data: ?*anyopaque) c_int;
 pub extern fn SSL_get_ex_data(ssl: ?*const SSL, idx: c_int) ?*anyopaque;
@@ -81,18 +97,19 @@ pub extern fn SSL_ctrl(ssl: ?*SSL, cmd: c_int, larg: c_long, parg: ?*anyopaque) 
 
 // -- Certificates, keys and BIOs --
 
+pub extern fn RAND_bytes(buf: [*c]u8, num: c_int) c_int;
 pub extern fn BIO_new_mem_buf(buf: ?*const anyopaque, len: c_int) ?*BIO;
 pub extern fn BIO_free(a: ?*BIO) c_int;
 pub extern fn X509_free(a: ?*X509) void;
 pub extern fn EVP_PKEY_free(pkey: ?*EVP_PKEY) void;
 pub extern fn PEM_read_bio_X509(
-    out: ?*BIO,
+    bio: ?*BIO,
     x: [*c]?*X509,
     cb: ?*const pem_password_cb,
     u: ?*anyopaque,
 ) ?*X509;
 pub extern fn PEM_read_bio_PrivateKey(
-    out: ?*BIO,
+    bio: ?*BIO,
     x: [*c]?*EVP_PKEY,
     cb: ?*const pem_password_cb,
     u: ?*anyopaque,
@@ -153,6 +170,7 @@ pub const SSL_ERROR_ZERO_RETURN: c_int = 6;
 
 pub const SSL_VERIFY_NONE: c_int = 0x00;
 pub const SSL_VERIFY_PEER: c_int = 0x01;
+pub const SSL_VERIFY_FAIL_IF_NO_PEER_CERT: c_int = 0x02;
 
 pub const SSL_TLSEXT_ERR_OK: c_int = 0;
 pub const SSL_TLSEXT_ERR_ALERT_WARNING: c_int = 1;

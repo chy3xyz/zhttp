@@ -1,0 +1,500 @@
+//! HTTP/3 response handling
+//!
+//! HTTP response structures and generation for HTTP/3
+
+const std = @import("std");
+const Io = std.Io;
+const Error = @import("../utils/error.zig");
+const HeaderField = @import("qpack.zig").HeaderField;
+const QpackEncoder = @import("qpack.zig").QpackEncoder;
+const Frame = @import("frame.zig");
+
+/// HTTP status codes
+pub const StatusCode = enum(u16) {
+    // 2xx Success
+    ok = 200,
+    created = 201,
+    accepted = 202,
+    no_content = 204,
+    partial_content = 206,
+
+    // 3xx Redirection
+    moved_permanently = 301,
+    found = 302,
+    not_modified = 304,
+    temporary_redirect = 307,
+    permanent_redirect = 308,
+
+    // 4xx Client Error
+    bad_request = 400,
+    unauthorized = 401,
+    forbidden = 403,
+    not_found = 404,
+    method_not_allowed = 405,
+    not_acceptable = 406,
+    conflict = 409,
+    gone = 410,
+    length_required = 411,
+    payload_too_large = 413,
+    uri_too_long = 414,
+    unsupported_media_type = 415,
+    range_not_satisfiable = 416,
+    expectation_failed = 417,
+    unprocessable_entity = 422,
+    too_many_requests = 429,
+
+    // 5xx Server Error
+    internal_server_error = 500,
+    not_implemented = 501,
+    bad_gateway = 502,
+    service_unavailable = 503,
+    gateway_timeout = 504,
+    http_version_not_supported = 505,
+
+    pub fn toString(self: StatusCode) []const u8 {
+        return switch (self) {
+            .ok => "200 OK",
+            .created => "201 Created",
+            .accepted => "202 Accepted",
+            .no_content => "204 No Content",
+            .partial_content => "206 Partial Content",
+            .moved_permanently => "301 Moved Permanently",
+            .found => "302 Found",
+            .not_modified => "304 Not Modified",
+            .temporary_redirect => "307 Temporary Redirect",
+            .permanent_redirect => "308 Permanent Redirect",
+            .bad_request => "400 Bad Request",
+            .unauthorized => "401 Unauthorized",
+            .forbidden => "403 Forbidden",
+            .not_found => "404 Not Found",
+            .method_not_allowed => "405 Method Not Allowed",
+            .not_acceptable => "406 Not Acceptable",
+            .conflict => "409 Conflict",
+            .gone => "410 Gone",
+            .length_required => "411 Length Required",
+            .payload_too_large => "413 Payload Too Large",
+            .uri_too_long => "414 URI Too Long",
+            .unsupported_media_type => "415 Unsupported Media Type",
+            .range_not_satisfiable => "416 Range Not Satisfiable",
+            .expectation_failed => "417 Expectation Failed",
+            .unprocessable_entity => "422 Unprocessable Entity",
+            .too_many_requests => "429 Too Many Requests",
+            .internal_server_error => "500 Internal Server Error",
+            .not_implemented => "501 Not Implemented",
+            .bad_gateway => "502 Bad Gateway",
+            .service_unavailable => "503 Service Unavailable",
+            .gateway_timeout => "504 Gateway Timeout",
+            .http_version_not_supported => "505 HTTP Version Not Supported",
+        };
+    }
+
+    pub fn getCode(self: StatusCode) u16 {
+        return @backingInt(self);
+    }
+
+    pub fn getReasonPhrase(self: StatusCode) []const u8 {
+        const full_str = self.toString();
+        if (std.mem.indexOf(u8, full_str, " ")) |space_pos| {
+            return full_str[space_pos + 1 ..];
+        }
+        return "Unknown";
+    }
+};
+
+/// Response headers management
+pub const ResponseHeaders = struct {
+    fields: std.ArrayListUnmanaged(HeaderField),
+    allocator: std.mem.Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator) Self {
+        return Self{
+            .fields = .empty,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        for (self.fields.items) |*field| {
+            field.deinit();
+        }
+        self.fields.deinit(self.allocator);
+    }
+
+    pub fn add(self: *Self, name: []const u8, value: []const u8) !void {
+        const field = try HeaderField.init(self.allocator, name, value);
+        try self.fields.append(self.allocator, field);
+    }
+
+    pub fn set(self: *Self, name: []const u8, value: []const u8) !void {
+        // Remove existing headers with the same name
+        var i: usize = 0;
+        while (i < self.fields.items.len) {
+            if (std.ascii.eqlIgnoreCase(self.fields.items[i].name, name)) {
+                var field = self.fields.swapRemove(i);
+                field.deinit();
+                continue;
+            }
+            i += 1;
+        }
+        // Add new header
+        try self.add(name, value);
+    }
+
+    pub fn get(self: *const Self, name: []const u8) ?[]const u8 {
+        for (self.fields.items) |field| {
+            if (std.ascii.eqlIgnoreCase(field.name, name)) {
+                return field.value;
+            }
+        }
+        return null;
+    }
+
+    pub fn setContentType(self: *Self, content_type: []const u8) !void {
+        try self.set("content-type", content_type);
+    }
+
+    pub fn setContentLength(self: *Self, length: usize) !void {
+        var buffer: [32]u8 = undefined;
+        const length_str = try std.fmt.bufPrint(&buffer, "{d}", .{length});
+        try self.set("content-length", length_str);
+    }
+
+    pub fn setCacheControl(self: *Self, cache_control: []const u8) !void {
+        try self.set("cache-control", cache_control);
+    }
+
+    pub fn setLocation(self: *Self, location: []const u8) !void {
+        try self.set("location", location);
+    }
+
+    pub fn setCookie(self: *Self, name: []const u8, value: []const u8, options: CookieOptions) !void {
+        var cookie_buffer: [512]u8 = undefined;
+        var writer = Io.Writer.fixed(&cookie_buffer);
+
+        try writer.print("{s}={s}", .{ name, value });
+
+        if (options.max_age) |max_age| {
+            try writer.print("; Max-Age={d}", .{max_age});
+        }
+
+        if (options.domain) |domain| {
+            try writer.print("; Domain={s}", .{domain});
+        }
+
+        if (options.path) |path| {
+            try writer.print("; Path={s}", .{path});
+        }
+
+        if (options.secure) {
+            try writer.writeAll("; Secure");
+        }
+
+        if (options.http_only) {
+            try writer.writeAll("; HttpOnly");
+        }
+
+        if (options.same_site) |same_site| {
+            try writer.print("; SameSite={s}", .{same_site});
+        }
+
+        const cookie_str = Io.Writer.buffered(&writer);
+        try self.add("set-cookie", cookie_str);
+    }
+
+    pub fn addCORS(self: *Self, origin: ?[]const u8) !void {
+        try self.set("access-control-allow-origin", origin orelse "*");
+        try self.set("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS");
+        try self.set("access-control-allow-headers", "Content-Type, Authorization");
+    }
+};
+
+/// Cookie options for Set-Cookie header
+pub const CookieOptions = struct {
+    max_age: ?u32 = null,
+    domain: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    secure: bool = false,
+    http_only: bool = false,
+    same_site: ?[]const u8 = null, // "Strict", "Lax", or "None"
+};
+
+/// HTTP response
+pub const Response = struct {
+    status: StatusCode,
+    headers: ResponseHeaders,
+    body: std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    stream_id: u64,
+    is_sent: bool = false,
+
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator, stream_id: u64) Self {
+        return Self{
+            .status = .ok,
+            .headers = ResponseHeaders.init(allocator),
+            .body = .empty,
+            .allocator = allocator,
+            .stream_id = stream_id,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.headers.deinit();
+        self.body.deinit(self.allocator);
+    }
+
+    /// Set response status
+    pub fn setStatus(self: *Self, status: StatusCode) void {
+        self.status = status;
+    }
+
+    /// Set response header
+    pub fn setHeader(self: *Self, name: []const u8, value: []const u8) !void {
+        try self.headers.set(name, value);
+    }
+
+    /// Add response header (allows multiple headers with same name)
+    pub fn addHeader(self: *Self, name: []const u8, value: []const u8) !void {
+        try self.headers.add(name, value);
+    }
+
+    /// Write data to response body
+    pub fn write(self: *Self, data: []const u8) !void {
+        try self.body.appendSlice(self.allocator, data);
+    }
+
+    /// Write formatted data to response body
+    pub fn writeFormat(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+        const formatted = try std.fmt.allocPrint(self.allocator, fmt, args);
+        defer self.allocator.free(formatted);
+        try self.body.appendSlice(self.allocator, formatted);
+    }
+
+    /// Set JSON content type and write JSON data
+    pub fn json(self: *Self, data: anytype) !void {
+        try self.headers.setContentType("application/json");
+
+        // Serialize the data to JSON using the streaming API
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+
+        var stringify: std.json.Stringify = .{
+            .writer = &out.writer,
+            .options = .{},
+        };
+
+        stringify.write(data) catch |err| {
+            // On serialization error, return error response
+            std.log.err("JSON serialization error: {}", .{err});
+            try self.body.appendSlice(self.allocator, "{\"error\":\"serialization_failed\"}");
+            return;
+        };
+
+        try self.body.appendSlice(self.allocator, out.written());
+    }
+
+    /// Set HTML content type and write HTML
+    pub fn html(self: *Self, html_content: []const u8) !void {
+        try self.headers.setContentType("text/html; charset=utf-8");
+        try self.write(html_content);
+    }
+
+    /// Set plain text content type and write text
+    pub fn text(self: *Self, text_content: []const u8) !void {
+        try self.headers.setContentType("text/plain; charset=utf-8");
+        try self.write(text_content);
+    }
+
+    /// Redirect to another URL
+    pub fn redirect(self: *Self, status: StatusCode, location: []const u8) !void {
+        self.setStatus(status);
+        try self.headers.setLocation(location);
+    }
+
+    /// Send file content (basic implementation)
+    pub fn sendFile(self: *Self, file_path: []const u8) !void {
+        const posix = std.posix;
+
+        // Convert path to null-terminated
+        var path_buf: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
+        const path = std.fmt.bufPrint(path_buf[0..std.Io.Dir.max_path_bytes], "{s}", .{file_path}) catch {
+            self.setStatus(.uri_too_long);
+            try self.text("Path too long");
+            return;
+        };
+        path_buf[path.len] = 0;
+        const path_z: [:0]const u8 = path_buf[0..path.len :0];
+
+        const fd = posix.openat(posix.AT.FDCWD, path_z, .{}, 0) catch |err| switch (err) {
+            error.FileNotFound => {
+                self.setStatus(.not_found);
+                try self.text("File not found");
+                return;
+            },
+            else => return err,
+        };
+        defer _ = posix.system.close(fd);
+
+        // Determine content type from extension
+        const content_type = getContentTypeFromPath(file_path);
+        try self.headers.setContentType(content_type);
+
+        // Get file size from the open descriptor.
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file_stat = (std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).stat(io) catch {
+            return error.AccessDenied;
+        };
+        const file_size: usize = @intCast(file_stat.size);
+
+        // Read file content
+        try self.body.resize(self.allocator, file_size);
+        var total_read: usize = 0;
+        while (total_read < file_size) {
+            const bytes_read = posix.read(fd, self.body.items[total_read..]) catch |err| {
+                return err;
+            };
+            if (bytes_read == 0) break;
+            total_read += bytes_read;
+        }
+        self.body.items.len = total_read;
+    }
+
+    /// Get response body
+    pub fn getBody(self: *const Self) []const u8 {
+        return self.body.items;
+    }
+
+    /// Get response body size
+    pub fn getBodySize(self: *const Self) usize {
+        return self.body.items.len;
+    }
+
+    /// Generate HTTP/3 frames for this response
+    pub fn generateFrames(self: *Self, allocator: std.mem.Allocator) ![]Frame.Frame {
+        var frames: std.ArrayListUnmanaged(Frame.Frame) = .empty;
+
+        // Set content-length if not already set
+        if (self.headers.get("content-length") == null) {
+            try self.headers.setContentLength(self.body.items.len);
+        }
+
+        // Add pseudo-headers for HTTP/3
+        var all_headers: std.ArrayListUnmanaged(HeaderField) = .empty;
+        defer {
+            for (all_headers.items) |*field| {
+                field.deinit();
+            }
+            all_headers.deinit(self.allocator);
+        }
+
+        // Add :status pseudo-header
+        var status_buffer: [8]u8 = undefined;
+        const status_str = try std.fmt.bufPrint(&status_buffer, "{d}", .{self.status.getCode()});
+        try all_headers.append(allocator, try HeaderField.init(allocator, ":status", status_str));
+
+        // Add regular headers
+        for (self.headers.fields.items) |field| {
+            try all_headers.append(allocator, try HeaderField.init(allocator, field.name, field.value));
+        }
+
+        var qpack_encoder = QpackEncoder.init();
+        defer qpack_encoder.deinit();
+        const headers_payload = try qpack_encoder.encode(all_headers.items, allocator);
+
+        const headers_frame = Frame.Frame{
+            .frame_type = .headers,
+            .payload = headers_payload,
+        };
+        try frames.append(allocator, headers_frame);
+
+        // Create DATA frame if body exists
+        if (self.body.items.len > 0) {
+            const data_frame = Frame.Frame{
+                .frame_type = .data,
+                .payload = try allocator.dupe(u8, self.body.items),
+            };
+            try frames.append(allocator, data_frame);
+        }
+
+        return frames.toOwnedSlice(allocator);
+    }
+
+    /// Mark response as sent
+    pub fn markSent(self: *Self) void {
+        self.is_sent = true;
+    }
+
+    /// Check if response has been sent
+    pub fn isSent(self: *const Self) bool {
+        return self.is_sent;
+    }
+};
+
+/// Get content type from file extension
+fn getContentTypeFromPath(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '.')) |dot_index| {
+        const ext = path[dot_index + 1 ..];
+
+        if (std.mem.eql(u8, ext, "html") or std.mem.eql(u8, ext, "htm")) {
+            return "text/html";
+        } else if (std.mem.eql(u8, ext, "css")) {
+            return "text/css";
+        } else if (std.mem.eql(u8, ext, "js")) {
+            return "application/javascript";
+        } else if (std.mem.eql(u8, ext, "json")) {
+            return "application/json";
+        } else if (std.mem.eql(u8, ext, "png")) {
+            return "image/png";
+        } else if (std.mem.eql(u8, ext, "jpg") or std.mem.eql(u8, ext, "jpeg")) {
+            return "image/jpeg";
+        } else if (std.mem.eql(u8, ext, "gif")) {
+            return "image/gif";
+        } else if (std.mem.eql(u8, ext, "svg")) {
+            return "image/svg+xml";
+        } else if (std.mem.eql(u8, ext, "pdf")) {
+            return "application/pdf";
+        }
+    }
+
+    return "application/octet-stream";
+}
+
+test "status code functionality" {
+    try std.testing.expect(StatusCode.ok.getCode() == 200);
+    try std.testing.expect(std.mem.eql(u8, StatusCode.not_found.toString(), "404 Not Found"));
+    try std.testing.expect(std.mem.eql(u8, StatusCode.ok.getReasonPhrase(), "OK"));
+}
+
+test "response headers" {
+    var headers = ResponseHeaders.init(std.testing.allocator);
+    defer headers.deinit();
+
+    try headers.setContentType("application/json");
+    try headers.setContentLength(100);
+
+    try std.testing.expect(std.mem.eql(u8, headers.get("content-type").?, "application/json"));
+    try std.testing.expect(std.mem.eql(u8, headers.get("content-length").?, "100"));
+}
+
+test "response creation and modification" {
+    var response = Response.init(std.testing.allocator, 1);
+    defer response.deinit();
+
+    response.setStatus(.created);
+    try response.setHeader("x-custom", "test-value");
+    try response.write("Hello, World!");
+
+    try std.testing.expect(response.status == .created);
+    try std.testing.expect(std.mem.eql(u8, response.getBody(), "Hello, World!"));
+    try std.testing.expect(response.getBodySize() == 13);
+}
+
+test "content type detection" {
+    try std.testing.expect(std.mem.eql(u8, getContentTypeFromPath("index.html"), "text/html"));
+    try std.testing.expect(std.mem.eql(u8, getContentTypeFromPath("style.css"), "text/css"));
+    try std.testing.expect(std.mem.eql(u8, getContentTypeFromPath("app.js"), "application/javascript"));
+    try std.testing.expect(std.mem.eql(u8, getContentTypeFromPath("unknown.xyz"), "application/octet-stream"));
+}

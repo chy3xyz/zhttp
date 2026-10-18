@@ -32,71 +32,131 @@ Any segment that is not a catch-all may carry a trailing Action suffix (`:verb`)
 
 ## HTTP/3 and QUIC
 
-Everything H3 lives under `src/h3/`, and the API plus the sharp edges of driving
-ngtcp2/nghttp3 by hand are written up in [docs/modules/h3.md](docs/modules/h3.md)
-— read that before touching any of it. The files that matter:
+Everything H3 lives under `src/h3/`. The native stack is
+documented in [docs/modules/h3.md](docs/modules/h3.md); read that before touching
+any of it. The files that matter:
 
-- `src/h3/quic.zig` — QUIC transport: connections, TLS sessions, packet paths, connection-ID routing, the closing period, the server socket.
-- `src/h3/http3.zig` — HTTP/3 framing: nghttp3 sessions, the endpoint's own control and QPACK streams, requests and responses.
-- `src/h3/Server.zig` / `src/h3/Client.zig` — the composed API and the server's event loop.
-- `src/h3/quic_test.zig` — a real client against a real server over loopback; it is the regression net for all of the above.
+- `src/h3/native/transport.zig` — UDP socket, CID routing, zquic
+  connection wrapper, CRYPTO/STREAM dispatch, packet I/O.
+- `src/h3/native/ack.zig` / `reassembly.zig` / `recovery.zig` / `stats.zig` —
+  ACK ranges, STREAM reassembly, retained-packet state, and counters.
+- `src/h3/native/qtls.zig` — OpenSSL's QUIC-TLS callbacks: handshake
+  bytes and traffic secrets in both directions.
+- `src/h3/native/http3.zig` — HTTP/3 framing, control/QPACK streams,
+  requests, responses, and the streaming response reader.
+- `src/h3/native/qpack.zig` — RFC 9204 static table, literals, and
+  Huffman string decoding.
+- `src/h3/Adapter.zig` — Router/middleware `Connection.Handler` bridge.
+- `src/h3/Server.zig` / `src/h3/Client.zig` — the composed API and the
+  server's event loop.
+- `src/h3/native/*_test.zig` / `fuzz_test.zig` — loopback, unit, and fuzz
+  coverage, including the TLS bridge on its own.
+
+### Transport Split
+
+zquic owns packet protection, packet-number spaces, loss timers, stream IDs,
+and frame serialization. `recovery.zig` keeps the plaintext of every
+ack-eliciting packet until its ACK arrives, and the transport resends due
+packets under a new packet number after an SRTT-derived timeout, so
+CRYPTO/STREAM loss does not need zquic to carry a frame-level history. OpenSSL owns the TLS 1.3 handshake. This
+repository owns the seam: coalesced-datagram splitting, per-level CRYPTO
+reassembly, RFC 9001 key installation from OpenSSL's secrets, HTTP/3 framing,
+and QPACK.
+
+### Recovery Ownership
+
+ACK/loss/retransmission is currently split: transport keeps `SentPacket`
+plaintext and resends on a 2xSRTT timer, while zquic records packet spaces and
+runs `pollLossRecovery` (PTO probes). An ACK is applied in both layers. The
+intended direction is zquic-owned recovery: retain ack-eliciting payloads next
+to the PN spaces, expose lost payloads through a callback, and build ACKs from
+received packet numbers. The first safe step is now in place: zquic retains the
+plaintext and `SuperConnection.setLostPacketObserver` reports lost packets
+while the transport still owns retransmission. `pollLossRecovery` now uses
+zquic's wall-clock domain, fixing a mismatch that had made its deadline
+unreachable; zquic's duplicate PTO probes are suppressed until it becomes the
+single sender. Remaining work is switching ACK generation and retransmission to
+that single owner.
 
 ### Closing Period
 
-RFC 9000's closing state: after sending CONNECTION_CLOSE an endpoint keeps the
-connection only to answer whatever the peer still sends with the same frame. The
-server enters it when a connection has been idle for
-`Server.Options.idle_timeout_ns`, keeps the buffered close packet in
-`quic.Connection.close_buf`, and answers from `Server.readDatagram`. The normal
-write path is unusable there — ngtcp2 returns `NGTCP2_ERR_CLOSING`.
+`transport.Connection.close` schedules a CONNECTION_CLOSE at the highest
+level whose keys exist and flushes it. The server does not yet keep a closing
+period alive to answer retransmissions; it drops the connection after the close
+packet is written.
 
 ### Control Stream and QPACK Streams
 
-The three unidirectional streams that every HTTP/3 endpoint opens for itself: one
-control stream and a QPACK encoder/decoder pair. They are opened on the QUIC
-connection and bound to the nghttp3 session (`bindControlStream`,
-`bindQpackStreams`) before any request is submitted. The peer's three are
-recognized by nghttp3 itself from their stream-type prefix.
+Every endpoint opens one control stream and a QPACK encoder/decoder pair when
+the handshake completes. The control stream starts with stream type 0x00 and a
+SETTINGS frame; the QPACK streams start with 0x02 and 0x03. SETTINGS advertises
+a 4096-byte decoder dynamic table and zero blocked streams. Peer SETTINGS are
+parsed (duplicate/reserved IDs -> 0x0109), peer QPACK streams are validated and
+critical-stream FIN -> 0x0104. The decoder applies peer insert/capacity/
+duplicate instructions and resolves pre-/post-base dynamic references; a
+required insert that has not arrived is QPACK_DECOMPRESSION_FAILED (0x0201)
+because blocked streams are not queued. Our encoder remains static-only and
+does not yet emit decoder-stream acknowledgments.
 
 ### Connection ID (CID) Routing
 
-`Listener.connections` maps *every* connection ID a connection owns to it: the
-server's own SCID, the client's original DCID (which the client keeps using until
-it has seen a reply) and each CID ngtcp2 later issues through
-`get_new_connection_id`. Long headers carry the ID length, short (1-RTT) headers
-do not — that is what `quic.cid_length` is for. Tearing a connection down removes
-all of its entries together.
+`Listener.connections` maps the client's original DCID and the
+server's SCID to the connection. Long headers carry the ID length; short (1-RTT)
+headers use the 8-byte CID this stack always chooses. Every accepted connection
+gets both entries together.
 
 ### Initial Keys
 
-The packet protection keys for the Initial packet number space. ngtcp2 requires
-the application to install them from `recv_client_initial` ("generate initial
-keys and IVs for both transmission and reception"), which
-`ngtcp2_crypto_recv_client_initial_cb` does.
-
-### Path Storage
-
-`ngtcp2_path_storage`: the address buffers a network path needs. Every `path`
-argument handed to ngtcp2's write functions must point at buffers of its own, so
-paths are never bare `ngtcp2_path` values here; `quic.initPath` fills one.
+The Initial packet number space is keyed from the client's original DCID:
+`installRfc9001ClientInitialKeys` on the client and
+`installRfc9001ServerInitialKeys` on the server. The client's first Initial
+datagram is padded to at least 1200 bytes.
 
 ### Server Event Loop
 
-`Server.run` is a single-threaded loop: one datagram per turn (read without
-blocking), then every connection is serviced — its own H3 streams, pending
-requests, queued writes and QUIC timers — and idle or finished connections are
-reaped. There is no per-connection thread.
+`Server.run` is a single-threaded loop: poll the socket, drain up to 32
+datagrams, service every connection (TLS progress, queued CRYPTO/STREAM data,
+ACKs, writes), service every HTTP/3 session, reap closed sessions and
+connections, then back off for one millisecond only when the poll was idle.
+There is no per-connection thread.
+
+### Resource Ownership
+
+- Listener owns accepted Connections and their CID map keys.
+- Registry owns the Session for each accepted Connection.
+- Reaping order is Session first, then Connection: Session.deinit clears
+  conn.handler while the Connection is still valid.
+- Session owns StreamState; completed streams are queued, removed outside the
+  stream-map iterator, and remembered in a bitset so late frames cannot
+  recreate them.
+- Connection owns stream_send, stream_flow, sent_packets, and its own
+  closed-stream bitset. FIN removes the send entry; both FINs remove the flow
+  entry.
+- Recovery is still split between this layer and zquic; that ownership is the
+  next architectural cleanup.
 
 ### Transport Parameters
 
-What a QUIC endpoint advertises to its peer. `ngtcp2_transport_params_default`
-zeroes every field, so each limit the peer needs has to be set explicitly —
-notably `initial_max_stream_data_uni`, without which the peer's control and QPACK
-streams (all unidirectional) cannot carry a single byte. The server also echoes
-the client's original DCID back in `original_dcid` (RFC 9000).
+Each endpoint encodes `TransportParameters` from zquic with
+`initial_max_data`/stream limits of 16 MiB and 100 streams. The transport
+enforces the peer's send windows, sends `MAX_DATA`/`MAX_STREAM_DATA` as data
+arrives, and issues `MAX_STREAMS` as peer-initiated streams close. The server
+sets `original_destination_connection_id` and
+`initial_source_connection_id`; the client sets only its own source CID.
+Both sides advertise a zero-capacity QPACK dynamic table.
+
+### Retry and Address Validation
+
+`Server.Options.retry` makes the listener challenge a tokenless Initial with
+an HMAC-authenticated Retry before allocating a Connection or Session. The
+token is bound to the client address, retry SCID, client SCID, and original
+DCID, with a 30-second lifetime. After Retry, Initial keys derive from the
+Retry SCID while the transport parameters carry both
+`original_destination_connection_id` and `retry_source_connection_id`. The
+built-in client answers Retry by replaying the same ClientHello under fresh
+Initial keys, and aioquic interoperates in both directions.
 
 ### 0-RTT
 
-Not implemented. `quic.connect` accepts an `early_data` argument and ignores it,
-so a resumed session is never used.
+Not implemented. `ClientTls` has no resumption/ticket surface yet.
 

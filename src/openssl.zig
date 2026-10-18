@@ -61,31 +61,18 @@ pub const config = struct {
             const file = dir.openFile(io, name, .{}) catch return error.InvalidCertificate;
             defer file.close(io);
 
-            // PEM cert/key files are typically under 8KB
+            // PEM cert/key files are typically under 8KB; cap the read so a
+            // wrong path cannot make the allocator grow without bound.
             const max_pem_size = 32768;
-            const result_buf = allocator.alloc(u8, max_pem_size) catch return error.InvalidCertificate;
-            errdefer allocator.free(result_buf);
-
             var io_buf: [4096]u8 = undefined;
             var rdr = file.reader(io, &io_buf);
-            var total: usize = 0;
-
-            // Read one byte at a time using readSliceAll
-            while (total < max_pem_size) {
-                rdr.interface.readSliceAll(result_buf[total..][0..1]) catch |err| switch (err) {
-                    error.EndOfStream => break,
-                    else => return error.InvalidCertificate,
-                };
-                total += 1;
+            const data = rdr.interface.allocRemaining(allocator, .limited(max_pem_size)) catch
+                return error.InvalidCertificate;
+            if (data.len == 0) {
+                allocator.free(data);
+                return error.InvalidCertificate;
             }
-
-            if (total == 0) return error.InvalidCertificate;
-
-            // Copy to exact-size buffer
-            const exact = allocator.alloc(u8, total) catch return error.InvalidCertificate;
-            @memcpy(exact, result_buf[0..total]);
-            allocator.free(result_buf);
-            return exact;
+            return data;
         }
     };
 
@@ -314,21 +301,24 @@ pub fn client(fd: posix.fd_t, opts: config.Client) !Connection {
     const ssl = c.SSL_new(ctx) orelse return error.TlsHandshakeFailure;
     errdefer c.SSL_free(ssl);
 
-    // Set SNI hostname
+    // SNI and hostname verification share one NUL-terminated buffer. Without
+    // SSL_set1_host OpenSSL verifies the chain but not that the certificate
+    // actually names the host we dialed.
+    if (opts.host.len >= 256) return error.InvalidHostname;
+    var host_buf: [256]u8 = undefined;
+    @memcpy(host_buf[0..opts.host.len], opts.host);
+    host_buf[opts.host.len] = 0;
     if (opts.host.len > 0) {
-        var host_buf: [256]u8 = undefined;
-        if (opts.host.len < host_buf.len) {
-            @memcpy(host_buf[0..opts.host.len], opts.host);
-            host_buf[opts.host.len] = 0;
-            _ = c.SSL_set_tlsext_host_name(ssl, &host_buf);
+        _ = c.SSL_set_tlsext_host_name(ssl, &host_buf);
+        if (!opts.insecure_skip_verify and opts.root_ca != .empty) {
+            if (c.SSL_set1_host(ssl, &host_buf) != 1) return error.TlsHandshakeFailure;
         }
     }
 
     if (c.SSL_set_fd(ssl, fd) != 1) return error.TlsHandshakeFailure;
 
-    if (c.SSL_connect(ssl) != 1) {
-        return mapSslHandshakeError(ssl);
-    }
+    const connect_ret = c.SSL_connect(ssl);
+    if (connect_ret != 1) return mapSslHandshakeError(ssl, connect_ret);
 
     // Check negotiated ALPN
     var alpn_proto: [*c]const u8 = null;
@@ -514,26 +504,24 @@ pub fn server(fd: posix.fd_t, opts: config.Server) !Connection {
     const ctx = if (opts.sni_context) |sni| sni.default_ctx else blk: {
         const new_ctx = c.SSL_CTX_new(c.TLS_server_method()) orelse return error.TlsHandshakeFailure;
         owned_ctx = new_ctx;
-        errdefer c.SSL_CTX_free(new_ctx);
-
-        if (opts.auth) |auth| {
-            try loadCertIntoCtx(new_ctx, auth.cert_pem, auth.key_pem);
-        }
-
-        // ALPN callback
-        c.SSL_CTX_set_alpn_select_cb(new_ctx, alpnSelectCallback, null);
         break :blk new_ctx;
     };
+    // One cleanup point: the block above must not register its own errdefer or
+    // a failed load would free the same SSL_CTX twice.
     errdefer if (owned_ctx) |oc| c.SSL_CTX_free(oc);
+
+    if (opts.sni_context == null) {
+        if (opts.auth) |auth| try loadCertIntoCtx(ctx, auth.cert_pem, auth.key_pem);
+        c.SSL_CTX_set_alpn_select_cb(ctx, alpnSelectCallback, null);
+    }
 
     const ssl = c.SSL_new(ctx) orelse return error.TlsHandshakeFailure;
     errdefer c.SSL_free(ssl);
 
     if (c.SSL_set_fd(ssl, fd) != 1) return error.TlsHandshakeFailure;
 
-    if (c.SSL_accept(ssl) != 1) {
-        return mapSslHandshakeError(ssl);
-    }
+    const accept_ret = c.SSL_accept(ssl);
+    if (accept_ret != 1) return mapSslHandshakeError(ssl, accept_ret);
 
     // Check negotiated ALPN
     var alpn_proto: [*c]const u8 = null;
@@ -578,7 +566,7 @@ fn alpnSelectCallback(
     return c.SSL_TLSEXT_ERR_NOACK;
 }
 
-fn mapSslHandshakeError(ssl: *c.SSL) error{
+fn mapSslHandshakeError(ssl: *c.SSL, ret: c_int) error{
     TlsHandshakeFailure,
     TlsCertificateExpired,
     TlsCertificateRevoked,
@@ -586,7 +574,7 @@ fn mapSslHandshakeError(ssl: *c.SSL) error{
     TlsUnsupportedCertificate,
     TlsCertificateRequired,
 } {
-    const ssl_err = c.SSL_get_error(ssl, -1);
+    const ssl_err = c.SSL_get_error(ssl, ret);
     if (ssl_err == c.SSL_ERROR_SSL) {
         const verify_result = c.SSL_get_verify_result(ssl);
         return switch (verify_result) {

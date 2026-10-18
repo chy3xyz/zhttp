@@ -1,0 +1,535 @@
+//! HTTP/3 frame handling
+//!
+//! Implements HTTP/3 frame parsing and serialization according to RFC 9114
+
+const std = @import("std");
+const Io = std.Io;
+const Error = @import("../utils/error.zig");
+
+/// HTTP/3 frame types
+pub const FrameType = enum(u64) {
+    data = 0x00,
+    headers = 0x01,
+    cancel_push = 0x03,
+    settings = 0x04,
+    push_promise = 0x05,
+    goaway = 0x07,
+    max_push_id = 0x0d,
+};
+
+/// HTTP/3 frame header
+pub const FrameHeader = struct {
+    frame_type: FrameType,
+    length: u64,
+
+    const Self = @This();
+
+    /// Parse frame header from bytes
+    pub fn parse(data: []const u8) Error.ZquicError!struct { header: Self, consumed: usize } {
+        if (data.len < 2) {
+            return Error.ZquicError.Http3Error;
+        }
+
+        var offset: usize = 0;
+
+        // Parse frame type (variable-length integer)
+        const frame_type_result = parseVarintFrom(data, offset) orelse {
+            // Incomplete varint - need more data
+            return Error.ZquicError.WouldBlock;
+        };
+        const frame_type_val = frame_type_result.value;
+        offset += frame_type_result.consumed;
+
+        // Parse length (variable-length integer)
+        const length_result = parseVarintFrom(data, offset) orelse {
+            // Incomplete varint - need more data
+            return Error.ZquicError.WouldBlock;
+        };
+        const length = length_result.value;
+        offset += length_result.consumed;
+
+        const frame_type: FrameType = switch (frame_type_val) {
+            0x00 => .data,
+            0x01 => .headers,
+            0x03 => .cancel_push,
+            0x04 => .settings,
+            0x05 => .push_promise,
+            0x07 => .goaway,
+            0x0d => .max_push_id,
+            else => return Error.ZquicError.Http3Error,
+        };
+
+        return .{
+            .header = Self{
+                .frame_type = frame_type,
+                .length = length,
+            },
+            .consumed = offset,
+        };
+    }
+
+    /// Serialize frame header to bytes
+    pub fn serialize(self: *const Self, writer: anytype) !void {
+        try writeVarint(writer, @backingInt(self.frame_type));
+        try writeVarint(writer, self.length);
+    }
+};
+
+/// HTTP/3 DATA frame
+pub const DataFrame = struct {
+    data: []const u8,
+
+    const Self = @This();
+
+    pub fn init(data: []const u8) Self {
+        return Self{ .data = data };
+    }
+
+    pub fn serialize(self: *const Self, writer: anytype) !void {
+        const header = FrameHeader{
+            .frame_type = .data,
+            .length = self.data.len,
+        };
+
+        try header.serialize(writer);
+        try writer.writeAll(self.data);
+    }
+};
+
+/// HTTP/3 HEADERS frame
+pub const HeadersFrame = struct {
+    encoded_headers: []const u8,
+
+    const Self = @This();
+
+    pub fn init(encoded_headers: []const u8) Self {
+        return Self{ .encoded_headers = encoded_headers };
+    }
+
+    pub fn serialize(self: *const Self, writer: anytype) !void {
+        const header = FrameHeader{
+            .frame_type = .headers,
+            .length = self.encoded_headers.len,
+        };
+
+        try header.serialize(writer);
+        try writer.writeAll(self.encoded_headers);
+    }
+};
+
+/// HTTP/3 SETTINGS frame
+pub const SettingsFrame = struct {
+    settings: std.ArrayListUnmanaged(struct { id: u64, value: u64 }),
+
+    const Self = @This();
+
+    pub fn init(_: std.mem.Allocator) Self {
+        return Self{
+            .settings = .empty,
+        };
+    }
+
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        self.settings.deinit(allocator);
+    }
+
+    pub fn addSetting(self: *Self, allocator: std.mem.Allocator, id: u64, value: u64) !void {
+        try self.settings.append(allocator, .{ .id = id, .value = value });
+    }
+
+    pub fn serialize(self: *const Self, writer: anytype, allocator: std.mem.Allocator) !void {
+        // Calculate total length
+        var total_length: usize = 0;
+        for (self.settings.items) |entry| {
+            total_length += varintLength(entry.id);
+            total_length += varintLength(entry.value);
+        }
+
+        const header = FrameHeader{
+            .frame_type = .settings,
+            .length = total_length,
+        };
+
+        try header.serialize(writer);
+
+        // Write settings
+        for (self.settings.items) |entry| {
+            try writeVarint(writer, entry.id);
+            try writeVarint(writer, entry.value);
+        }
+
+        _ = allocator; // Not used in this simplified implementation
+    }
+
+    pub fn parse(data: []const u8, allocator: std.mem.Allocator) Error.ZquicError!Self {
+        var settings = SettingsFrame.init(allocator);
+        errdefer settings.deinit(allocator);
+        var offset: usize = 0;
+
+        while (offset < data.len) {
+            // Parse setting identifier
+            const id_result = parseVarintFrom(data, offset) orelse {
+                return Error.ZquicError.Http3Error;
+            };
+            offset += id_result.consumed;
+
+            // Parse setting value
+            const value_result = parseVarintFrom(data, offset) orelse {
+                return Error.ZquicError.Http3Error;
+            };
+            offset += value_result.consumed;
+
+            try settings.addSetting(allocator, id_result.value, value_result.value);
+        }
+
+        return settings;
+    }
+};
+
+/// HTTP/3 CANCEL_PUSH frame.
+pub const CancelPushFrame = struct {
+    push_id: u64,
+
+    pub fn init(push_id: u64) CancelPushFrame {
+        return .{ .push_id = push_id };
+    }
+
+    pub fn serialize(self: CancelPushFrame, writer: anytype) !void {
+        const header = FrameHeader{
+            .frame_type = .cancel_push,
+            .length = varintLength(self.push_id),
+        };
+        try header.serialize(writer);
+        try writeVarint(writer, self.push_id);
+    }
+
+    pub fn parse(data: []const u8) Error.ZquicError!CancelPushFrame {
+        const result = parseVarintFrom(data, 0) orelse return Error.ZquicError.Http3Error;
+        if (result.consumed != data.len) return Error.ZquicError.Http3Error;
+        return .{ .push_id = result.value };
+    }
+};
+
+/// HTTP/3 GOAWAY frame.
+pub const GoawayFrame = struct {
+    stream_or_push_id: u64,
+
+    pub fn init(stream_or_push_id: u64) GoawayFrame {
+        return .{ .stream_or_push_id = stream_or_push_id };
+    }
+
+    pub fn serialize(self: GoawayFrame, writer: anytype) !void {
+        const header = FrameHeader{
+            .frame_type = .goaway,
+            .length = varintLength(self.stream_or_push_id),
+        };
+        try header.serialize(writer);
+        try writeVarint(writer, self.stream_or_push_id);
+    }
+
+    pub fn parse(data: []const u8) Error.ZquicError!GoawayFrame {
+        const result = parseVarintFrom(data, 0) orelse return Error.ZquicError.Http3Error;
+        if (result.consumed != data.len) return Error.ZquicError.Http3Error;
+        return .{ .stream_or_push_id = result.value };
+    }
+};
+
+/// HTTP/3 frame parser
+pub const FrameParser = struct {
+    buffer: std.ArrayListUnmanaged(u8),
+    state: ParserState,
+    current_frame_type: ?FrameType,
+    current_frame_length: u64,
+    bytes_remaining: u64,
+
+    const ParserState = enum {
+        waiting_for_header,
+        waiting_for_payload,
+    };
+
+    const Self = @This();
+
+    pub fn init(_: std.mem.Allocator) Self {
+        return Self{
+            .buffer = .empty,
+            .state = .waiting_for_header,
+            .current_frame_type = null,
+            .current_frame_length = 0,
+            .bytes_remaining = 0,
+        };
+    }
+
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        self.buffer.deinit(allocator);
+    }
+
+    /// Process incoming data and extract complete frames
+    pub fn processData(self: *Self, data: []const u8, allocator: std.mem.Allocator) Error.ZquicError![]Frame {
+        try self.buffer.appendSlice(allocator, data);
+
+        var frames: std.ArrayListUnmanaged(Frame) = .empty;
+
+        while (true) {
+            switch (self.state) {
+                .waiting_for_header => {
+                    if (self.buffer.items.len < 2) break; // Need at least 2 bytes for minimal header
+
+                    const parse_result = FrameHeader.parse(self.buffer.items) catch break;
+
+                    self.current_frame_type = parse_result.header.frame_type;
+                    self.current_frame_length = parse_result.header.length;
+                    self.bytes_remaining = parse_result.header.length;
+                    self.state = .waiting_for_payload;
+
+                    // Remove header bytes from buffer
+                    const remaining = self.buffer.items[parse_result.consumed..];
+                    std.mem.copyForwards(u8, self.buffer.items, remaining);
+                    self.buffer.shrinkRetainingCapacity(self.buffer.items.len - parse_result.consumed);
+                },
+                .waiting_for_payload => {
+                    if (self.buffer.items.len < self.bytes_remaining) break; // Not enough data
+
+                    // Extract frame payload
+                    const payload = try allocator.dupe(u8, self.buffer.items[0..self.bytes_remaining]);
+
+                    // Create frame
+                    const frame = Frame{
+                        .frame_type = self.current_frame_type.?,
+                        .payload = payload,
+                    };
+
+                    try frames.append(allocator, frame);
+
+                    // Remove payload bytes from buffer
+                    const remaining = self.buffer.items[self.bytes_remaining..];
+                    std.mem.copyForwards(u8, self.buffer.items, remaining);
+                    const bytes_to_remove: usize = @intCast(self.bytes_remaining);
+                    self.buffer.shrinkRetainingCapacity(self.buffer.items.len - bytes_to_remove);
+
+                    // Reset state
+                    self.state = .waiting_for_header;
+                    self.current_frame_type = null;
+                    self.current_frame_length = 0;
+                    self.bytes_remaining = 0;
+                },
+            }
+        }
+
+        return frames.toOwnedSlice(allocator);
+    }
+};
+
+/// Generic HTTP/3 frame
+pub const Frame = struct {
+    frame_type: FrameType,
+    payload: []const u8,
+
+    const Self = @This();
+
+    pub fn deinit(self: *const Self, allocator: std.mem.Allocator) void {
+        allocator.free(self.payload);
+    }
+};
+
+/// Variable-length integer parsing result.
+/// Returns null if data is incomplete (need more bytes).
+/// Returns value and consumed count on success.
+const VarintResult = struct {
+    value: u64,
+    consumed: usize,
+};
+
+/// Variable-length integer parsing per RFC 9000.
+/// Returns null if insufficient data is available (incomplete varint).
+/// Callers should buffer data and retry when more arrives.
+fn parseVarintFrom(data: []const u8, offset: usize) ?VarintResult {
+    if (offset >= data.len) return null; // Need more data
+
+    const first_byte = data[offset];
+    const length: usize = switch (first_byte >> 6) {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        else => unreachable,
+    };
+
+    // Check if we have enough data for the full varint
+    if (offset + length > data.len) return null; // Incomplete - need more data
+
+    var value: u64 = first_byte & 0x3f; // Remove length prefix bits
+
+    var i: usize = 1;
+    while (i < length) : (i += 1) {
+        value = (value << 8) | data[offset + i];
+    }
+
+    return .{ .value = value, .consumed = length };
+}
+
+/// Write variable-length integer
+fn writeVarint(writer: anytype, value: u64) !void {
+    if (value < 64) {
+        try writer.writeByte(@intCast(value));
+    } else if (value < 16384) {
+        try writer.writeByte(@intCast(0x40 | (value >> 8)));
+        try writer.writeByte(@intCast(value & 0xff));
+    } else if (value < 1073741824) {
+        try writer.writeByte(@intCast(0x80 | (value >> 24)));
+        try writer.writeByte(@intCast((value >> 16) & 0xff));
+        try writer.writeByte(@intCast((value >> 8) & 0xff));
+        try writer.writeByte(@intCast(value & 0xff));
+    } else {
+        try writer.writeByte(@intCast(0xc0 | (value >> 56)));
+        try writer.writeByte(@intCast((value >> 48) & 0xff));
+        try writer.writeByte(@intCast((value >> 40) & 0xff));
+        try writer.writeByte(@intCast((value >> 32) & 0xff));
+        try writer.writeByte(@intCast((value >> 24) & 0xff));
+        try writer.writeByte(@intCast((value >> 16) & 0xff));
+        try writer.writeByte(@intCast((value >> 8) & 0xff));
+        try writer.writeByte(@intCast(value & 0xff));
+    }
+}
+
+/// Calculate variable-length integer encoding length
+fn varintLength(value: u64) usize {
+    if (value < 64) return 1;
+    if (value < 16384) return 2;
+    if (value < 1073741824) return 4;
+    return 8;
+}
+
+test "frame header parsing and serialization" {
+    var buffer: [16]u8 = undefined;
+    var writer = Io.Writer.fixed(&buffer);
+
+    const header = FrameHeader{
+        .frame_type = .data,
+        .length = 100,
+    };
+
+    try header.serialize(&writer);
+
+    const written = Io.Writer.buffered(&writer);
+    const parse_result = try FrameHeader.parse(written);
+    try std.testing.expect(parse_result.header.frame_type == .data);
+    try std.testing.expect(parse_result.header.length == 100);
+}
+
+test "settings frame" {
+    var settings = SettingsFrame.init(std.testing.allocator);
+    defer settings.deinit(std.testing.allocator);
+
+    try settings.addSetting(std.testing.allocator, 1, 1000);
+    try settings.addSetting(std.testing.allocator, 6, 4096);
+
+    var buffer: [256]u8 = undefined;
+    var writer = Io.Writer.fixed(&buffer);
+
+    try settings.serialize(&writer, std.testing.allocator);
+    try std.testing.expect(Io.Writer.buffered(&writer).len > 0);
+}
+
+test "settings frame parse roundtrip" {
+    var settings = SettingsFrame.init(std.testing.allocator);
+    defer settings.deinit(std.testing.allocator);
+
+    try settings.addSetting(std.testing.allocator, 1, 1234);
+    try settings.addSetting(std.testing.allocator, 6, 4096);
+
+    var buf: [256]u8 = undefined;
+    var writer = Io.Writer.fixed(&buf);
+    try settings.serialize(&writer, std.testing.allocator);
+
+    const written = Io.Writer.buffered(&writer);
+    const header_parse = try FrameHeader.parse(written);
+    try std.testing.expect(header_parse.header.frame_type == .settings);
+
+    const payload_start = header_parse.consumed;
+    const payload_len: usize = @intCast(header_parse.header.length);
+    const payload_end = payload_start + payload_len;
+    const payload = written[payload_start..payload_end];
+
+    var parsed = try SettingsFrame.parse(payload, std.testing.allocator);
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(parsed.settings.items.len == 2);
+    try std.testing.expect(parsed.settings.items[0].id == 1);
+    try std.testing.expect(parsed.settings.items[0].value == 1234);
+    try std.testing.expect(parsed.settings.items[1].id == 6);
+    try std.testing.expect(parsed.settings.items[1].value == 4096);
+}
+
+test "settings frame rejects truncated setting value" {
+    try std.testing.expectError(error.Http3Error, SettingsFrame.parse(&[_]u8{ 0x01, 0x40 }, std.testing.allocator));
+}
+
+test "goaway frame parse roundtrip" {
+    const goaway = GoawayFrame.init(64);
+
+    var buf: [16]u8 = undefined;
+    var writer = Io.Writer.fixed(&buf);
+    try goaway.serialize(&writer);
+
+    const written = Io.Writer.buffered(&writer);
+    const header_parse = try FrameHeader.parse(written);
+    try std.testing.expectEqual(FrameType.goaway, header_parse.header.frame_type);
+
+    const payload_start = header_parse.consumed;
+    const payload_end = payload_start + @as(usize, @intCast(header_parse.header.length));
+    const parsed = try GoawayFrame.parse(written[payload_start..payload_end]);
+    try std.testing.expectEqual(@as(u64, 64), parsed.stream_or_push_id);
+}
+
+test "cancel push frame parse roundtrip and malformed rejection" {
+    const cancel = CancelPushFrame.init(7);
+
+    var buf: [16]u8 = undefined;
+    var writer = Io.Writer.fixed(&buf);
+    try cancel.serialize(&writer);
+
+    const written = Io.Writer.buffered(&writer);
+    const header_parse = try FrameHeader.parse(written);
+    try std.testing.expectEqual(FrameType.cancel_push, header_parse.header.frame_type);
+
+    const payload_start = header_parse.consumed;
+    const payload_end = payload_start + @as(usize, @intCast(header_parse.header.length));
+    const parsed = try CancelPushFrame.parse(written[payload_start..payload_end]);
+    try std.testing.expectEqual(@as(u64, 7), parsed.push_id);
+
+    try std.testing.expectError(error.Http3Error, CancelPushFrame.parse(&[_]u8{ 0x07, 0x00 }));
+}
+
+test "frame parser incremental data frame" {
+    var parser = FrameParser.init(std.testing.allocator);
+    defer parser.deinit(std.testing.allocator);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    const payload = "hello";
+    const frame = DataFrame.init(payload);
+    try frame.serialize(&out.writer);
+
+    const bytes = std.Io.Writer.buffered(&out.writer);
+    const split = bytes.len / 2;
+
+    const first = bytes[0..split];
+    const second = bytes[split..];
+
+    const frames_chunk1 = try parser.processData(first, std.testing.allocator);
+    defer {
+        for (frames_chunk1) |f| f.deinit(std.testing.allocator);
+        std.testing.allocator.free(frames_chunk1);
+    }
+    try std.testing.expect(frames_chunk1.len == 0);
+
+    const frames_chunk2 = try parser.processData(second, std.testing.allocator);
+    defer {
+        for (frames_chunk2) |f| f.deinit(std.testing.allocator);
+        std.testing.allocator.free(frames_chunk2);
+    }
+    try std.testing.expect(frames_chunk2.len == 1);
+    try std.testing.expect(frames_chunk2[0].frame_type == .data);
+    try std.testing.expect(std.mem.eql(u8, frames_chunk2[0].payload, payload));
+}

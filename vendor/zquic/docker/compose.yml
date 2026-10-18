@@ -1,0 +1,27 @@
+services:
+  zquic-verify:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      network: host
+    network_mode: host
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    working_dir: /workspace
+    volumes:
+      - ..:/workspace
+      - ${HOST_ZIG_PATH:-/opt/zig-dev}:/opt/zig:ro
+    tty: true
+    stdin_open: true
+  zquic-interop:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.interop
+      network: host
+    network_mode: host
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    working_dir: /workspace
+    volumes:
+      - ..:/workspace
+      - ${HOST_ZIG_PATH:-/opt/zig-dev}:/opt/zig:ro
+    tty: true
+    stdin_open: true

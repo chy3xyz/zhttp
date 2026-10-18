@@ -1,0 +1,173 @@
+//! Post-Quantum QUIC Demo
+//!
+//! Demonstrates experimental ZQUIC post-quantum hooks through zcrypto.
+
+const std = @import("std");
+const zquic = @import("zquic");
+
+pub fn main() !void {
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = debug_allocator.deinit();
+    const allocator = debug_allocator.allocator();
+
+    std.debug.print("=== Post-Quantum QUIC Demo ===\n\n", .{});
+
+    // Initialize ZQUIC
+    try zquic.init(allocator);
+    defer zquic.deinit();
+
+    // Demonstrate post-quantum cipher suites
+    std.debug.print("Available Post-Quantum Cipher Suites:\n", .{});
+    std.debug.print("  - ML-KEM-768 + X25519 (hybrid, recommended)\n", .{});
+    std.debug.print("  - ML-KEM-1024 + X25519 (hybrid, higher PQ security)\n", .{});
+    std.debug.print("  - ML-KEM-768 (pure post-quantum)\n", .{});
+    std.debug.print("  - ML-DSA-65 (post-quantum signatures)\n\n", .{});
+
+    // Create enhanced TLS context
+    var tls_ctx = try zquic.EnhancedCrypto.EnhancedTlsContext.init(
+        allocator,
+        false, // client
+        .aes_256_gcm_sha384,
+    );
+    defer tls_ctx.deinit();
+
+    // Create post-quantum context
+    var pq_ctx = try zquic.PQQuicContext.init(
+        allocator,
+        &tls_ctx,
+        .ml_kem_768_x25519_sha256,
+    );
+    defer pq_ctx.deinit();
+
+    std.debug.print("Initializing Post-Quantum Key Exchange...\n", .{});
+    try pq_ctx.initKeyExchange();
+
+    const public_keys = pq_ctx.key_exchange.?.getPublicKeys();
+    std.debug.print("Generated ML-KEM-768 public key: {} bytes\n", .{public_keys.kem_public_key.?.len});
+    std.debug.print("Generated X25519 public key: {} bytes\n", .{public_keys.classical_public_key.?.len});
+
+    // Demonstrate FFI crypto functions
+    std.debug.print("\nTesting FFI Crypto Functions:\n", .{});
+    std.debug.print("⚠️  FFI functions disabled in this build\n", .{});
+
+    // Test hashing
+    std.debug.print("\nTesting Hash Functions:\n", .{});
+    std.debug.print("⚠️  Hash functions disabled (FFI)\n", .{});
+
+    // var blake3_hash: [64]u8 = undefined;
+    // const blake3_result = zquic.zcrypto_blake3_hash(
+    //     message.ptr,
+    //     message.len,
+    //     &blake3_hash,
+    // );
+    // if (blake3_result == 0) {
+    //     std.debug.print("✓ Blake3 hash computed: ", .{});
+    //     for (blake3_hash[0..8]) |byte| {
+    //         std.debug.print("{x:0>2}", .{byte});
+    //     }
+    //     std.debug.print("...\n", .{});
+    // }
+
+    // var sha256_hash: [32]u8 = undefined;
+    // const sha256_result = zquic.zcrypto_sha256_hash(
+    //     message.ptr,
+    //     message.len,
+    //     &sha256_hash,
+    // );
+    // if (sha256_result == 0) {
+    //     std.debug.print("✓ SHA-256 hash computed: ", .{});
+    //     for (sha256_hash[0..8]) |byte| {
+    //         std.debug.print("{x:0>2}", .{byte});
+    //     }
+    //     std.debug.print("...\n", .{});
+    // }
+
+    // Demonstrate secure random generation
+    std.debug.print("\nGenerating Secure Random Data:\n", .{});
+    std.debug.print("⚠️  Random functions disabled (FFI)\n", .{});
+
+    // var random_bytes: [32]u8 = undefined;
+    // const random_result = zquic.zcrypto_random_bytes(&random_bytes, 32);
+    // if (random_result == 0) {
+    //     std.debug.print("✓ Generated 32 random bytes: ", .{});
+    //     for (random_bytes[0..8]) |byte| {
+    //         std.debug.print("{x:0>2}", .{byte});
+    //     }
+    //     std.debug.print("...\n", .{});
+    // }
+
+    std.debug.print("\nRelease posture:\n", .{});
+    std.debug.print("  - Experimental PQ path; disabled in default builds\n", .{});
+    std.debug.print("  - Requires -Dpost-quantum=true -Dexperimental-crypto=true\n", .{});
+    std.debug.print("  - See docs/features/crypto-maturity.md before deployment\n", .{});
+
+    std.debug.print("\n✓ Experimental Post-Quantum QUIC initialized successfully.\n", .{});
+    std.debug.print("  Use only with explicit post-quantum and experimental crypto flags.\n", .{});
+
+    // Demonstrate server creation
+    std.debug.print("\nDemonstrating experimental PQ HTTP/3 server configuration...\n", .{});
+    try createExperimentalPqServer(allocator);
+}
+
+// Example: Creating an HTTP/3 server while the experimental PQ feature is enabled.
+pub fn createExperimentalPqServer(allocator: std.mem.Allocator) !void {
+    // Server configuration
+    const config = zquic.Http3.ServerConfig{
+        .max_connections = 1000,
+        .max_streams_per_connection = 100,
+        .request_timeout_ms = 30000,
+        .keep_alive_timeout_ms = 60000,
+        .max_request_body_size = 1024 * 1024,
+        .enable_compression = true,
+        .enable_cors = true,
+    };
+
+    // Create HTTP/3 server
+    var server = try zquic.Http3.Http3Server.init(allocator, config);
+    defer server.deinit();
+
+    // Create router
+    var router = zquic.Http3.Router.init(allocator);
+    defer router.deinit();
+
+    // Add routes
+    try router.get("/", indexHandler);
+    try router.get("/api/quantum-status", quantumStatusHandler);
+
+    std.debug.print("✓ Experimental PQ HTTP/3 server configured successfully\n", .{});
+
+    std.debug.print("\nExperimental PQ QUIC server configured with {} max connections\n", .{
+        config.max_connections,
+    });
+}
+
+fn indexHandler(_: *zquic.Http3.Request, res: *zquic.Http3.Response) !void {
+    res.setStatus(.ok);
+    try res.setHeader("Content-Type", "text/html");
+    try res.write(
+        \\<!DOCTYPE html>
+        \\<html>
+        \\<head><title>Experimental PQ QUIC</title></head>
+        \\<body>
+        \\<h1>Welcome to Post-Quantum QUIC!</h1>
+        \\<p>This demo uses explicit experimental PQ feature flags.</p>
+        \\<p>Cipher Suite: ML-KEM-768 + X25519 + AES-256-GCM</p>
+        \\</body>
+        \\</html>
+    );
+}
+
+fn quantumStatusHandler(_: *zquic.Http3.Request, res: *zquic.Http3.Response) !void {
+    try res.json(.{
+        .experimental_pq = true,
+        .algorithms = .{
+            .kem = "ML-KEM-768",
+            .classical = "X25519",
+            .hybrid = true,
+            .signature = "Ed25519",
+            .hash = "SHA-256",
+            .aead = "AES-256-GCM",
+        },
+        .release_posture = "experimental",
+    });
+}

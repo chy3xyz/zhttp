@@ -12,6 +12,8 @@ const large_body_size: usize = 2 * 1024 * 1024;
 const small_iterations: usize = 500;
 const large_iterations: usize = 3;
 const port: u16 = 14881;
+const concurrent_connections: usize = 4;
+const concurrent_iterations: usize = 100;
 
 /// Bodies are filled once at startup. The handler hands the server a fresh copy
 /// of one of them because the server takes ownership of the body it is given
@@ -59,6 +61,8 @@ const Phase = struct {
     wall_ns: u64 = 0,
     fastest_ns: u64 = std.math.maxInt(u64),
     slowest_ns: u64 = 0,
+    latencies_ns: [512]u64 = undefined,
+    latency_count: usize = 0,
     /// Where the first request that did not come back as expected sits, and how
     /// long the client spent on it before giving up.
     failed_at: ?usize = null,
@@ -111,6 +115,10 @@ fn measure(client: *h3.Client, path: []const u8, expected_len: usize, phase: *Ph
     phase.service_ns += req_ns;
     phase.fastest_ns = @min(phase.fastest_ns, req_ns);
     phase.slowest_ns = @max(phase.slowest_ns, req_ns);
+    if (phase.latency_count < phase.latencies_ns.len) {
+        phase.latencies_ns[phase.latency_count] = req_ns;
+        phase.latency_count += 1;
+    }
 }
 
 /// One connection carries every request; a connection that refuses another
@@ -129,6 +137,99 @@ fn benchPhase(client: *h3.Client, path: []const u8, expected_len: usize, iterati
     }
     phase.wall_ns = @max(1, nowNs() - wall_start);
     if (phase.completed == iterations) phase.last_connection_requests = phase.completed;
+}
+
+/// Shared start gate for the concurrent phase. The clients are connected and
+/// the worker threads are spawned before the gate opens, so neither connect
+/// nor thread startup time lands inside the measured window.
+const ConcurrentGate = struct {
+    ready: std.atomic.Value(u32) = .init(0),
+    go: std.atomic.Value(bool) = .init(false),
+    abort: std.atomic.Value(bool) = .init(false),
+};
+
+const ConcurrentWorker = struct {
+    client: *h3.Client,
+    phase: *Phase,
+    gate: *ConcurrentGate,
+    end_ns: std.atomic.Value(u64) = .init(0),
+
+    fn run(self: *ConcurrentWorker) void {
+        _ = self.gate.ready.fetchAdd(1, .release);
+        while (!self.gate.go.load(.acquire)) std.atomic.spinLoopHint();
+        if (self.gate.abort.load(.acquire)) return;
+        for (0..concurrent_iterations) |_| {
+            const carried = self.phase.completed;
+            measure(self.client, "/", small_body_size, self.phase) catch {
+                self.phase.last_connection_requests = carried;
+                break;
+            };
+        }
+        self.end_ns.store(nowNs(), .release);
+    }
+};
+
+const ConcurrentPhase = struct {
+    workers: [concurrent_connections]Phase = .{ .{}, .{}, .{}, .{} },
+    connected: usize = 0,
+    window_ns: u64 = 0,
+    setup_error: ?[]const u8 = null,
+    spawn_error: ?[]const u8 = null,
+
+    fn completedCount(self: *const ConcurrentPhase) usize {
+        var completed: usize = 0;
+        for (&self.workers) |*worker| completed += worker.completed;
+        return completed;
+    }
+
+    fn ok(self: *const ConcurrentPhase) bool {
+        if (self.setup_error != null or self.spawn_error != null) return false;
+        for (&self.workers) |*worker| {
+            if (!worker.ok()) return false;
+        }
+        return true;
+    }
+};
+
+/// One worker per connection, all parked at the gate until every thread is
+/// ready. A worker that fails a request exits and leaves its partial progress
+/// in its own Phase; the others keep running.
+fn benchConcurrent(clients: *[concurrent_connections]h3.Client, result: *ConcurrentPhase) void {
+    var gate = ConcurrentGate{};
+    var workers: [concurrent_connections]ConcurrentWorker = undefined;
+    var threads: [concurrent_connections]std.Thread = undefined;
+    var spawned: usize = 0;
+
+    for (clients, 0..) |*client, i| {
+        workers[i] = .{
+            .client = client,
+            .phase = &result.workers[i],
+            .gate = &gate,
+        };
+        threads[i] = std.Thread.spawn(.{}, ConcurrentWorker.run, .{&workers[i]}) catch |err| {
+            result.spawn_error = @errorName(err);
+            break;
+        };
+        spawned += 1;
+    }
+
+    // If a thread could not be started, release the ones that did start
+    // without running requests rather than waiting on a gate that never opens.
+    if (spawned < concurrent_connections) gate.abort.store(true, .release);
+
+    while (gate.ready.load(.acquire) < spawned) std.atomic.spinLoopHint();
+    const wall_start = nowNs();
+    gate.go.store(true, .release);
+
+    for (threads[0..spawned]) |thread| thread.join();
+
+    // The throughput window ends when the last worker finishes, not when the
+    // join calls return, so join overhead is not charged to throughput.
+    var wall_end = wall_start;
+    for (workers[0..spawned]) |*worker| {
+        wall_end = @max(wall_end, worker.end_ns.load(.acquire));
+    }
+    result.window_ns = @max(1, wall_end - wall_start);
 }
 
 fn printMs(ns: u64) void {
@@ -152,6 +253,24 @@ fn printLatency(phase: Phase) void {
     std.debug.print(", max ", .{});
     printMs(phase.slowest_ns);
     std.debug.print(")\n", .{});
+    if (phase.latency_count > 0) {
+        var sorted = phase;
+        std.mem.sort(u64, sorted.latencies_ns[0..sorted.latency_count], {}, std.sort.asc(u64));
+        std.debug.print("   Percentiles: p50 ", .{});
+        printMs(percentile(sorted, 50));
+        std.debug.print(", p95 ", .{});
+        printMs(percentile(sorted, 95));
+        std.debug.print(", p99 ", .{});
+        printMs(percentile(sorted, 99));
+        std.debug.print("\n", .{});
+    }
+}
+
+fn percentile(sorted: Phase, pct: usize) u64 {
+    const count = sorted.latency_count;
+    if (count == 0) return 0;
+    const rank = (count * pct + 99) / 100;
+    return sorted.latencies_ns[@min(rank, count) - 1];
 }
 
 fn printFailure(phase: Phase) void {
@@ -185,7 +304,60 @@ fn printLargePhase(phase: Phase) void {
     std.debug.print("\n", .{});
 }
 
-fn printSummary(small: Phase, large: Phase) void {
+fn printConcurrentPhase(result: *const ConcurrentPhase) void {
+    var total = Phase{
+        .requests = concurrent_connections * concurrent_iterations,
+        .connections = result.connected,
+        .wall_ns = result.window_ns,
+    };
+    for (&result.workers) |*worker| {
+        total.completed += worker.completed;
+        total.bytes += worker.bytes;
+        total.service_ns += worker.service_ns;
+        total.fastest_ns = @min(total.fastest_ns, worker.fastest_ns);
+        total.slowest_ns = @max(total.slowest_ns, worker.slowest_ns);
+        const room = total.latencies_ns.len - total.latency_count;
+        const take = @min(room, worker.latency_count);
+        @memcpy(total.latencies_ns[total.latency_count..][0..take], worker.latencies_ns[0..take]);
+        total.latency_count += take;
+    }
+
+    const seconds = @as(f64, @floatFromInt(total.wall_ns)) / 1_000_000_000.0;
+    const req_per_sec = @as(f64, @floatFromInt(total.completed)) / @max(seconds, 1e-9);
+
+    std.debug.print("3. Concurrent x4 (4 connections, 100 GET / each):\n", .{});
+    printCommon(total);
+    printLatency(total);
+    std.debug.print("   Throughput:  {d:.0} req/sec (aggregate, wall-clock)\n", .{req_per_sec});
+    std.debug.print("   Per-connection:", .{});
+    for (&result.workers, 0..) |*worker, i| {
+        std.debug.print("  c{d} {d}/{d}", .{ i + 1, worker.completed, worker.requests });
+        if (!worker.ok()) std.debug.print(" ({s})", .{worker.err_name orelse "failed"});
+    }
+    std.debug.print("\n", .{});
+
+    if (result.setup_error) |err| {
+        std.debug.print("   FAILED:      connection setup failed: {s}\n", .{err});
+    }
+    if (result.spawn_error) |err| {
+        std.debug.print("   FAILED:      could not start every client thread: {s}\n", .{err});
+    }
+    for (&result.workers, 0..) |*worker, i| {
+        if (worker.err_name) |err| {
+            std.debug.print("   FAILED:      c{d} stopped after {d} request(s): {s} at request {d} after ", .{
+                i + 1,
+                worker.completed,
+                err,
+                (worker.failed_at orelse worker.completed) + 1,
+            });
+            printMs(worker.failed_after_ns);
+            std.debug.print("\n", .{});
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
+fn printSummary(small: Phase, large: Phase, concurrent: *const ConcurrentPhase) void {
     std.debug.print("=== Summary ===\n", .{});
     std.debug.print("{s:<26}{s:>11}{s:>12}{s:>16}   {s}\n", .{ "benchmark", "done/requests", "time", "throughput", "status" });
 
@@ -206,8 +378,21 @@ fn printSummary(small: Phase, large: Phase) void {
         if (large.ok()) "ok" else "FAILED",
     });
 
+    const concurrent_completed = concurrent.completedCount();
+    const concurrent_requests = concurrent_connections * concurrent_iterations;
+    const concurrent_seconds = @as(f64, @floatFromInt(concurrent.window_ns)) / 1_000_000_000.0;
+    std.debug.print("{s:<26}{d:>6}/{d:<4}{d:>12.2}{d:>16.0}   {s}\n", .{
+        "h3 concurrent x4 (100)",
+        concurrent_completed,
+        concurrent_requests,
+        concurrent_seconds,
+        @as(f64, @floatFromInt(concurrent_completed)) / @max(concurrent_seconds, 1e-9),
+        if (concurrent.ok()) "ok" else "FAILED",
+    });
+
     std.debug.print("\nthroughput: req/s for the small responses, MB/s (10^6 bytes/s) for the large body,\n", .{});
-    std.debug.print("both derived from the time the completed requests took.\n", .{});
+    std.debug.print("both derived from the time the completed requests took. The concurrent row uses\n", .{});
+    std.debug.print("wall-clock time from the shared start gate to the last completed request.\n", .{});
     if (!small.ok()) {
         std.debug.print("small responses failed: {s} after {d} requests\n", .{
             small.err_name orelse "unknown",
@@ -309,11 +494,34 @@ pub fn main(init: std.process.Init) !void {
         benchPhase(&client, "/large", large_body_size, large_iterations, &large);
     }
 
+    // Concurrent phase: connect four clients up front (connection setup is not
+    // part of the measured window), then let one thread per connection issue
+    // 100 GET / requests after a shared atomic gate opens.
+    var concurrent = ConcurrentPhase{};
+    for (&concurrent.workers) |*worker| {
+        worker.requests = concurrent_iterations;
+        worker.connections = 1;
+    }
+    var clients: [concurrent_connections]h3.Client = undefined;
+    var initialized: usize = 0;
+    for (&clients, 0..) |*client, i| {
+        client.* = h3.Client.init(allocator, "127.0.0.1", port, .{ .insecure_skip_verify = true }) catch |err| {
+            concurrent.setup_error = @errorName(err);
+            std.debug.print("concurrent x4: connection {d} failed to start: {s}\n", .{ i + 1, @errorName(err) });
+            break;
+        };
+        initialized += 1;
+    }
+    concurrent.connected = initialized;
+    if (concurrent.setup_error == null) benchConcurrent(&clients, &concurrent);
+    for (clients[0..initialized]) |*client| client.deinit();
+
     printSmallPhase(small);
     printLargePhase(large);
-    printSummary(small, large);
+    printConcurrentPhase(&concurrent);
+    printSummary(small, large, &concurrent);
 
-    if (!small.ok() or !large.ok()) {
+    if (!small.ok() or !large.ok() or !concurrent.ok()) {
         std.debug.print("\nBenchmark run completed with failures.\n", .{});
         return error.H3BenchmarkFailed;
     }

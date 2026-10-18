@@ -1,0 +1,466 @@
+//! DNS-over-QUIC Server Implementation (RFC 9250)
+//!
+//! Post-quantum secure DoQ server without external dependencies
+
+const std = @import("std");
+const zquic_core = @import("zquic_core");
+const message = @import("message.zig");
+const Error = @import("../utils/error.zig");
+const Time = @import("../utils/time.zig");
+const PrometheusMetrics = @import("../monitoring/prometheus_exporter.zig").PrometheusMetrics;
+
+// Type aliases for cleaner code
+const DnsMessage = message.DnsMessage;
+const DnsHeader = message.DnsHeader;
+const DnsQuestion = message.DnsQuestion;
+const DnsResourceRecord = message.DnsResourceRecord;
+
+const Connection = zquic_core.Connection.Connection;
+const Stream = zquic_core.Stream.Stream;
+const Crypto = zquic_core.Crypto;
+
+pub fn queryTimedOut(timestamp_seconds: i64, current_time_seconds: i64, timeout_ms: u32) bool {
+    const timeout_seconds: i64 = @max(1, @as(i64, @intCast((timeout_ms + 999) / 1000)));
+    return current_time_seconds - timestamp_seconds > timeout_seconds;
+}
+
+/// DoQ server configuration
+pub const DoQServerConfig = struct {
+    /// Listen address
+    address: []const u8 = "0.0.0.0",
+    /// Listen port (standard DoQ port)
+    port: u16 = 853,
+    /// Maximum concurrent connections
+    max_connections: u32 = 5000,
+    /// Query timeout in milliseconds
+    query_timeout_ms: u32 = 5000,
+    /// Enable post-quantum crypto
+    enable_post_quantum: bool = false, // Experimental: requires -Dpost-quantum=true -Dexperimental-crypto=true
+    /// Certificate path for TLS
+    cert_path: []const u8,
+    /// Private key path for TLS
+    key_path: []const u8,
+    /// DNS handler function
+    handler: ?*const fn (query: *DnsMessage, allocator: std.mem.Allocator) anyerror!DnsMessage = null,
+};
+
+/// DoQ server statistics
+pub const DoQServerStats = struct {
+    queries_received: u64 = 0,
+    queries_processed: u64 = 0,
+    queries_failed: u64 = 0,
+    active_connections: u32 = 0,
+    total_connections: u64 = 0,
+    bytes_received: u64 = 0,
+    bytes_sent: u64 = 0,
+    uptime_seconds: u64 = 0,
+
+    pub fn toJson(self: *const DoQServerStats, allocator: std.mem.Allocator) ![]u8 {
+        return std.json.stringifyAlloc(allocator, self, .{});
+    }
+};
+
+/// DNS handler function type
+pub const DnsHandlerFn = *const fn (query: *DnsMessage, allocator: std.mem.Allocator) anyerror!DnsMessage;
+
+/// DoQ server context for connection handling
+const DoQConnection = struct {
+    connection: *Connection,
+    server: *DoQServer,
+    allocator: std.mem.Allocator,
+    query_count: u32 = 0,
+    connected_at: i64,
+
+    pub fn init(connection: *Connection, server: *DoQServer, allocator: std.mem.Allocator) DoQConnection {
+        return DoQConnection{
+            .connection = connection,
+            .server = server,
+            .allocator = allocator,
+            .connected_at = Time.nowSeconds(),
+        };
+    }
+
+    pub fn handleStream(self: *DoQConnection, stream: *Stream) !void {
+        self.server.stats.active_connections += 1;
+        if (self.server.metrics) |metrics| {
+            metrics.recordDoqConnectionOpened();
+        }
+        defer {
+            self.server.stats.active_connections -= 1;
+            if (self.server.metrics) |metrics| {
+                metrics.recordDoqConnectionClosed();
+            }
+        }
+
+        // RFC 9250: DNS queries can use any stream ID
+        // Each query-response pair uses a separate stream
+        std.log.debug("DoQ: Handling query on stream {}", .{stream.id});
+
+        // Read DNS query from stream
+        var buffer: [4096]u8 = undefined;
+        const bytes_read = try stream.read(buffer[0..]);
+
+        if (bytes_read == 0) return;
+
+        self.server.stats.bytes_received += bytes_read;
+        self.server.stats.queries_received += 1;
+        self.query_count += 1;
+        const request_bytes = bytes_read;
+        var response_bytes: usize = 0;
+        var query_success = false;
+        defer {
+            if (self.server.metrics) |metrics| {
+                metrics.recordDoqQuery(request_bytes, response_bytes, query_success);
+            }
+        }
+
+        // Parse DNS message
+        var query = DnsMessage.parseFromStream(self.allocator, buffer[0..bytes_read]) catch |err| {
+            std.log.err("DoQ: Failed to parse DNS query: {}", .{err});
+            self.server.stats.queries_failed += 1;
+            return;
+        };
+        defer query.deinit();
+
+        // Process query through handler
+        var response = if (self.server.config.handler) |handler|
+            handler(&query, self.allocator) catch |err| blk: {
+                std.log.err("DoQ: Handler failed: {}", .{err});
+                self.server.stats.queries_failed += 1;
+                query_success = false;
+                break :blk try self.createErrorResponse(&query, message.DnsResponseCode.ServFail);
+            }
+        else
+            try self.createEchoResponse(&query);
+
+        defer response.deinit();
+
+        // Serialize response
+        const response_data = try response.serializeToStream(self.allocator);
+        defer self.allocator.free(response_data);
+
+        // Send response on stream 0
+        _ = try stream.write(response_data, false);
+
+        self.server.stats.bytes_sent += response_data.len;
+        self.server.stats.queries_processed += 1;
+        response_bytes = response_data.len;
+        query_success = true;
+
+        std.log.info("DoQ: Processed query for '{s}' (type: {}) - {} bytes response", .{
+            if (query.questions.len > 0) query.questions[0].name else "unknown",
+            if (query.questions.len > 0) query.questions[0].qtype else 0,
+            response_data.len,
+        });
+    }
+
+    fn createErrorResponse(self: *DoQConnection, query: *const DnsMessage, rcode: message.DnsResponseCode) !DnsMessage {
+        return try message.createResponseForQuery(self.allocator, query, rcode);
+    }
+
+    fn createEchoResponse(self: *DoQConnection, query: *const DnsMessage) !DnsMessage {
+        var response = DnsMessage.init(self.allocator);
+
+        response.header = message.DnsHeader{
+            .id = query.header.id,
+            .flags = 0x8180, // QR=1, RD=1, RA=1
+            .qdcount = query.header.qdcount,
+            .ancount = if (query.questions.len > 0) 1 else 0,
+            .nscount = 0,
+            .arcount = 0,
+        };
+
+        // Copy questions
+        if (query.questions.len > 0) {
+            response.questions = try self.allocator.alloc(message.DnsQuestion, query.questions.len);
+            for (query.questions, 0..) |question, i| {
+                response.questions[i] = message.DnsQuestion{
+                    .name = try self.allocator.dupe(u8, question.name),
+                    .qtype = question.qtype,
+                    .qclass = question.qclass,
+                };
+            }
+
+            // Create dummy answer (A record pointing to 127.0.0.1)
+            response.answers = try self.allocator.alloc(message.DnsResourceRecord, 1);
+            const ip_data = [_]u8{ 127, 0, 0, 1 };
+            response.answers[0] = message.DnsResourceRecord{
+                .name = try self.allocator.dupe(u8, query.questions[0].name),
+                .rtype = @backingInt(message.DnsRecordType.A),
+                .rclass = 1, // IN
+                .ttl = 300,
+                .rdlength = 4,
+                .rdata = try self.allocator.dupe(u8, &ip_data),
+            };
+        }
+
+        return response;
+    }
+};
+
+/// Pending query for async processing
+const PendingQuery = struct {
+    query_id: u16,
+    query_data: []u8,
+    response_callback: *const fn ([]u8) void,
+    timestamp: i64,
+};
+
+/// DNS-over-QUIC Server
+pub const DoQServer = struct {
+    config: DoQServerConfig,
+    stats: DoQServerStats,
+    allocator: std.mem.Allocator,
+
+    // Query handling queue
+    pending_queries: std.ArrayListUnmanaged(PendingQuery),
+    is_running: bool = false,
+    start_time: i64,
+    metrics: ?*PrometheusMetrics = null,
+
+    pub fn init(allocator: std.mem.Allocator, config: DoQServerConfig) !DoQServer {
+        if (config.cert_path.len == 0 or config.key_path.len == 0) {
+            return Error.ZquicError.InvalidArgument;
+        }
+
+        return DoQServer{
+            .config = config,
+            .stats = DoQServerStats{},
+            .allocator = allocator,
+            .pending_queries = .empty,
+            .start_time = Time.nowSeconds(),
+            .metrics = null,
+        };
+    }
+
+    pub fn deinit(self: *DoQServer) void {
+        self.stop();
+
+        // Clean up pending queries
+        for (self.pending_queries.items) |query| {
+            self.allocator.free(query.query_data);
+        }
+        self.pending_queries.deinit(self.allocator);
+    }
+
+    /// Start the DoQ server
+    pub fn start(self: *DoQServer) !void {
+        if (self.is_running) return;
+
+        std.log.info("Starting DNS-over-QUIC server on {s}:{}", .{ self.config.address, self.config.port });
+
+        // Load TLS certificates
+        try self.loadCertificates();
+
+        self.is_running = true;
+
+        // Main server loop
+        while (self.is_running) {
+            try self.acceptConnections();
+            Time.sleep(std.time.ns_per_ms); // 1ms sleep
+        }
+    }
+
+    /// Stop the DoQ server
+    pub fn stop(self: *DoQServer) void {
+        if (!self.is_running) return;
+
+        self.is_running = false;
+        std.log.info("DNS-over-QUIC server stopped", .{});
+    }
+
+    /// Set custom DNS handler
+    pub fn setHandler(self: *DoQServer, handler: DnsHandlerFn) void {
+        self.config.handler = handler;
+    }
+
+    /// Attach Prometheus metrics exporter for observability
+    pub fn attachPrometheus(self: *DoQServer, metrics: *PrometheusMetrics) void {
+        self.metrics = metrics;
+    }
+
+    /// Get server statistics
+    pub fn getStats(self: *DoQServer) DoQServerStats {
+        var stats = self.stats;
+        stats.uptime_seconds = @intCast(Time.nowSeconds() - self.start_time);
+        return stats;
+    }
+
+    pub fn queuePendingQuery(self: *DoQServer, query_id: u16, query_data: []const u8, response_callback: *const fn ([]u8) void, timestamp: i64) !void {
+        try self.pending_queries.append(self.allocator, .{
+            .query_id = query_id,
+            .query_data = try self.allocator.dupe(u8, query_data),
+            .response_callback = response_callback,
+            .timestamp = timestamp,
+        });
+    }
+
+    pub fn cancelPendingQuery(self: *DoQServer, query_id: u16) bool {
+        var i: usize = 0;
+        while (i < self.pending_queries.items.len) : (i += 1) {
+            if (self.pending_queries.items[i].query_id == query_id) {
+                const removed = self.pending_queries.orderedRemove(i);
+                self.allocator.free(removed.query_data);
+                self.stats.queries_failed += 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn cleanupTimedOutQueries(self: *DoQServer, current_time_seconds: i64) void {
+        var i: usize = 0;
+        while (i < self.pending_queries.items.len) {
+            const query = self.pending_queries.items[i];
+            if (queryTimedOut(query.timestamp, current_time_seconds, self.config.query_timeout_ms)) {
+                const expired_query = self.pending_queries.orderedRemove(i);
+                self.allocator.free(expired_query.query_data);
+                self.stats.queries_failed += 1;
+                std.log.debug("DoQ: Query {} timed out", .{expired_query.query_id});
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn loadCertificates(self: *DoQServer) !void {
+        // Load TLS certificates for post-quantum crypto
+        // Use posix to check if certificate files exist
+        const posix = std.posix;
+
+        var cert_path_buf: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
+        const cert_path = std.fmt.bufPrint(cert_path_buf[0..std.Io.Dir.max_path_bytes], "{s}", .{self.config.cert_path}) catch {
+            std.log.err("DoQ: Certificate path too long: {s}", .{self.config.cert_path});
+            return error.InvalidArgument;
+        };
+        cert_path_buf[cert_path.len] = 0;
+        const cert_path_z: [:0]const u8 = cert_path_buf[0..cert_path.len :0];
+
+        const cert_fd = posix.openat(posix.AT.FDCWD, cert_path_z, .{}, 0) catch |err| {
+            std.log.err("DoQ: Failed to load certificate {s}: {}", .{ self.config.cert_path, err });
+            return err;
+        };
+        _ = posix.system.close(cert_fd);
+
+        var key_path_buf: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
+        const key_path = std.fmt.bufPrint(key_path_buf[0..std.Io.Dir.max_path_bytes], "{s}", .{self.config.key_path}) catch {
+            std.log.err("DoQ: Key path too long: {s}", .{self.config.key_path});
+            return error.InvalidArgument;
+        };
+        key_path_buf[key_path.len] = 0;
+        const key_path_z: [:0]const u8 = key_path_buf[0..key_path.len :0];
+
+        const key_fd = posix.openat(posix.AT.FDCWD, key_path_z, .{}, 0) catch |err| {
+            std.log.err("DoQ: Failed to load private key {s}: {}", .{ self.config.key_path, err });
+            return err;
+        };
+        _ = posix.system.close(key_fd);
+
+        std.log.info("DoQ: Loaded certificates with post-quantum crypto support", .{});
+    }
+
+    fn acceptConnections(self: *DoQServer) !void {
+        if (self.stats.active_connections < self.config.max_connections) {
+            // Process pending queries
+            try self.processQueries();
+        }
+    }
+
+    fn processQueries(self: *DoQServer) !void {
+        self.cleanupTimedOutQueries(Time.nowSeconds());
+    }
+};
+
+/// Create DoQ server with ghostdns integration example
+pub fn createGhostDnsServer(allocator: std.mem.Allocator, ghost_rpc_endpoint: []const u8) !DoQServer {
+    const config = DoQServerConfig{
+        .address = "0.0.0.0",
+        .port = 853,
+        .max_connections = 10000,
+        .query_timeout_ms = 5000,
+        .enable_post_quantum = true,
+        .cert_path = "/etc/ssl/certs/ghostplane.crt",
+        .key_path = "/etc/ssl/private/ghostplane.key",
+        .handler = ghostDnsHandler,
+    };
+
+    const server = try DoQServer.init(allocator, config);
+
+    std.log.info("DoQ: GhostDNS integration enabled with endpoint: {s}", .{ghost_rpc_endpoint});
+    return server;
+}
+
+/// Example DNS handler for GhostChain integration
+fn ghostDnsHandler(query: *DnsMessage, allocator: std.mem.Allocator) !DnsMessage {
+    if (query.questions.len == 0) {
+        return try createEmptyResponse(query, allocator);
+    }
+
+    const domain = query.questions[0].name;
+    const qtype = query.questions[0].qtype;
+
+    std.log.info("DoQ: Resolving {s} (type: {})", .{ domain, qtype });
+
+    var response = DnsMessage.init(allocator);
+
+    response.header = message.DnsHeader{
+        .id = query.header.id,
+        .flags = 0x8180, // QR=1, RD=1, RA=1
+        .qdcount = 1,
+        .ancount = 1,
+        .nscount = 0,
+        .arcount = 0,
+    };
+
+    // Copy question
+    response.questions = try allocator.alloc(message.DnsQuestion, 1);
+    response.questions[0] = message.DnsQuestion{
+        .name = try allocator.dupe(u8, domain),
+        .qtype = qtype,
+        .qclass = query.questions[0].qclass,
+    };
+
+    // Create answer
+    response.answers = try allocator.alloc(message.DnsResourceRecord, 1);
+    const ip_data = [_]u8{ 10, 0, 0, 1 }; // Placeholder IP
+    response.answers[0] = message.DnsResourceRecord{
+        .name = try allocator.dupe(u8, domain),
+        .rtype = @backingInt(message.DnsRecordType.A),
+        .rclass = 1, // IN
+        .ttl = 300,
+        .rdlength = 4,
+        .rdata = try allocator.dupe(u8, &ip_data),
+    };
+
+    return response;
+}
+
+fn createEmptyResponse(query: *const DnsMessage, allocator: std.mem.Allocator) !DnsMessage {
+    var response = DnsMessage.init(allocator);
+    response.header = message.DnsHeader{
+        .id = query.header.id,
+        .flags = 0x8180, // QR=1, RD=1, RA=1
+        .qdcount = 0,
+        .ancount = 0,
+        .nscount = 0,
+        .arcount = 0,
+    };
+    return response;
+}
+
+test "DoQ server initialization" {
+    const allocator = std.testing.allocator;
+    const unused_cert_path = "doq-test-cert.pem";
+    const unused_key_path = "doq-test-key.pem";
+
+    const config = DoQServerConfig{
+        .cert_path = unused_cert_path,
+        .key_path = unused_key_path,
+    };
+
+    // This will succeed with initialization
+    var server = try DoQServer.init(allocator, config);
+    defer server.deinit();
+
+    try std.testing.expect(!server.is_running);
+}

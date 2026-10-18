@@ -7,7 +7,7 @@ An HTTP/1.1, HTTP/2, and HTTP/3 library for Zig 0.17, built on the `std.Io` asyn
 - **HTTP Server** — HTTP/1.1, HTTP/2, and HTTP/3, keep-alive, chunked transfer encoding, connection limits, slowloris protection
 - **HTTP Client** — HTTP/1.1, HTTP/2, and HTTP/3, configurable timeouts, response size limits
 - **HTTP/2** — ALPN negotiation, h2c (cleartext), HPACK compression, stream multiplexing, flow control, server push, trailers
-- **HTTP/3** — opt-in via `-Dh3=true`: QUIC via ngtcp2, HTTP/3 framing via nghttp3, connection ID rotation, Alt-Svc advertisement
+- **HTTP/3** — opt-in via `-Dh3=true`: native Zig QUIC via zquic, HTTP/3 framing and QPACK in Zig, OpenSSL only for the TLS 1.3 handshake
 - **Router** — path parameters (`:id`), catch-all segments (`*rest`), AIP-136 custom methods (`:archive`), comptime dispatch, custom 404 handlers
 - **WebSocket** — RFC 6455 upgrade, text/binary frames, fragmentation reassembly, per-route handlers
 - **Streaming Responses** — chunked encoding, Server-Sent Events, zero-copy file serving
@@ -595,7 +595,7 @@ HTTP/3 runs over QUIC (UDP) instead of TCP. It is opt-in — build with `-Dh3=tr
 zig build -Dh3=true
 ```
 
-Building it requires the system libraries `libngtcp2` and `libnghttp3`; they are neither translated nor linked otherwise.
+The QUIC transport is zquic (vendored at `vendor/zquic`) and HTTP/3 framing/QPACK is the native code in `src/h3/native/`. OpenSSL supplies the TLS 1.3 handshake through its `SSL_set_quic_tls_cbs` QUIC-TLS callbacks, so no `libngtcp2` or `libnghttp3` is built, translated, or linked.
 
 ### Server
 
@@ -690,10 +690,8 @@ try h3.quic.setServerCert(cert_pem, key_pem);
 
 ### QLog Debugging
 
-```zig
-try h3.quic.enableQLog("trace.qlog"); // Wireshark-compatible
-defer h3.quic.disableQLog();
-```
+The `h3.quic.enableQLog`/`disableQLog` entry points remain for callers, but the
+native transport does not emit qlog yet; they are no-ops.
 
 ### Alt-Svc Advertisement (HTTP/3 Discovery)
 
@@ -709,26 +707,43 @@ var server = httpz.Server.init(.{
 
 ### Protocol Details
 
-- QUIC transport via ngtcp2 (UDP, TLS 1.3, stream multiplexing)
-- HTTP/3 framing via nghttp3 (QPACK header compression)
-- Connection ID rotation and path-validation callbacks
-- Automatic `Alt-Svc` header advertisement on HTTPS responses
-- QLog output for Wireshark/qvis analysis (`h3.quic.enableQLog`)
+- QUIC transport via zquic (UDP, packet protection, loss timers, stream IDs)
+- TLS 1.3 via OpenSSL's QUIC-TLS callback interface
+- HTTP/3 framing and QPACK in Zig (`src/h3/native/`), static table + Huffman decoding
+- `h3.Adapter` bridges an existing `Router`/middleware `Connection.Handler`
+  into the native H3 server, with lowercased headers and arena-owned response
+  slices
+- Peer SETTINGS, QPACK stream validation, and a 4096-byte decoder dynamic table,
+  with RFC 9204 0x0201-0x0203 errors
+- `Server.stats()` / `Client.stats()` snapshots for packets, bytes, retransmits,
+  streams, flow-control updates, and ACKs
+- Frame-level retransmission: ack-eliciting packets are retained until ACKed
+  and resent under a new packet number after an RTT-derived timeout
+  (2×SRTT, clamped to 200 ms–1 s)
+- Connection- and stream-level flow control, including MAX_DATA,
+  MAX_STREAM_DATA, and MAX_STREAMS updates
+- Optional RFC 9000 Retry/address validation with stateless HMAC tokens
+- A single-threaded UDP event loop, no per-connection thread
 
-Not implemented: 0-RTT early data (`connect` accepts the argument but ignores it,
-so a resumed session is not used) and connection migration beyond the callbacks
-above.
+Not implemented yet: 0-RTT, connection migration, connection-ID rotation, and
+qlog. Retry/address validation is available opt-in and works in both
+directions. QPACK dynamic-table instructions are rejected
+rather than mis-decoded (SETTINGS advertises a zero-capacity table, which
+conforming peers honor).
 
 ### Dependencies
 
-Only needed when building with `-Dh3=true`.
+Only needed when building with `-Dh3=true`:
+
+- **zquic**, vendored at `vendor/zquic` (refresh it from a sibling `../zquic` checkout when its transport changes)
+- **OpenSSL 3.6+**, which is where `SSL_set_quic_tls_cbs` lives
 
 ```sh
 # macOS
-brew install libngtcp2 libnghttp3
+brew install openssl@3
 
 # Ubuntu/Debian
-sudo apt install libngtcp2-dev libnghttp3-dev
+sudo apt install libssl-dev
 ```
 
 ## HTTP Client
@@ -788,17 +803,17 @@ Requires **Zig 0.17.0** — the released compiler, which is what CI and
 `build.zig.zon`'s `minimum_zig_version` both name — and **OpenSSL 3** (for TLS
 support).
 
-`libngtcp2` and `libnghttp3` are only needed for HTTP/3 (`-Dh3=true`), which is off by default.
+HTTP/3 (`-Dh3=true`) additionally needs **OpenSSL 3.6+** (for `SSL_set_quic_tls_cbs`) and uses the **zquic** snapshot vendored at `vendor/zquic`. No `libngtcp2`/`libnghttp3` is needed.
 
 ```sh
 # macOS
-brew install openssl@3 libngtcp2 libnghttp3
+brew install openssl@3
 
 # Ubuntu/Debian
-sudo apt install libssl-dev libngtcp2-dev libnghttp3-dev
+sudo apt install libssl-dev
 
 # Fedora
-sudo dnf install openssl-devel libngtcp2-devel libnghttp3-devel
+sudo dnf install openssl-devel
 ```
 
 ```sh
@@ -831,6 +846,11 @@ zig build example_server_streaming
 zig build example_server_websocket
 zig build example_client_http
 zig build example_client_https
+
+# HTTP/3 examples need -Dh3=true and examples/cert
+zig build example_server_h3 -Dh3=true
+zig build example_server_h3_router -Dh3=true
+zig build example_client_h3 -Dh3=true
 ```
 
 ## License

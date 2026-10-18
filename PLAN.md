@@ -210,36 +210,49 @@ src/
 
 # HTTP/3 Development Record (RFC 9114)
 
-> **Status: Complete** — QUIC transport, H3 session layer, client request/response, and server dispatch fully implemented.
+> **Status: Native replacement complete.** The C ngtcp2/nghttp3 binding was
+> replaced by a Zig QUIC/HTTP3 stack. See docs/modules/h3.md.
 
 ## Approach
 
-Bound to ngtcp2 (QUIC) and nghttp3 (HTTP/3) via translate-C, same pattern as OpenSSL. Reuses existing httpz Request/Response/Handler types.
+zquic (vendored at vendor/zquic) owns packet protection, packet-number spaces,
+loss timers, stream IDs, and frame serialization. OpenSSL 3.6 supplies the TLS
+1.3 handshake through SSL_set_quic_tls_cbs. This repository owns the seam:
+coalesced-datagram splitting, per-level CRYPTO reassembly, RFC 9001 key
+installation, HTTP/3 framing, QPACK, and the server/client state machines.
 
 ## Dependencies
-- `libngtcp2` ≥ 1.23 — QUIC transport
-- `libnghttp3` ≥ 1.16 — HTTP/3 framing + QPACK
-- `openssl@3` — TLS 1.3 (QUIC crypto)
+- zquic (vendored) — QUIC transport
+- `openssl@3.6+` — TLS 1.3 with the QUIC-TLS callback API
+- No libngtcp2 or libnghttp3
 
 ## Implemented
 
-- [x] **Build Integration** — translate-C headers + linkSystemLibrary for ngtcp2/nghttp3
-- [x] **QUIC Layer** (`src/h3/quic.zig`) — Connection, Listener, connect(), packet I/O, timer expiry, CID routing
-- [x] **H3 Session** (`src/h3/http3.zig`) — nghttp3 connection lifecycle, error types
-- [x] **Client Stub** (`src/h3/Client.zig`) — QUIC connect + H3 session init
-- [x] **Server Stub** (`src/h3/Server.zig`) — UDP listener + CID routing table
-- [x] **Module Exports** — `httpz.h3.quic`, `httpz.h3.http3`, `httpz.h3.Client`, `httpz.h3.Server`
+- [x] **Build Integration** — zquic module import, vendored dependency, no C QUIC translation
+- [x] **QUIC Layer** (`src/h3/native/transport.zig`) — UDP socket, CID routing, packet I/O, zquic wrapper
+- [x] **TLS Bridge** (`src/h3/native/qtls.zig`) — OpenSSL QUIC-TLS callbacks, secrets, transport params
+- [x] **H3 Session** (`src/h3/native/http3.zig`) — control/QPACK streams, frames, request/response
+- [x] **QPACK** (`src/h3/native/qpack.zig`) — static table, literals, Huffman decoding
+- [x] **QPACK peer SETTINGS/stream validation (P1)** — duplicate/reserved settings,
+  critical QPACK streams, 0x0201/0x0202/0x0203 error mapping
+- [x] **QPACK decoder dynamic table (P2)** — 4096-byte table, peer encoder
+  instructions, pre-/post-base dynamic refs; blocked-stream resume and our
+  encoder-side dynamic inserts/acks remain pending
+- [x] **Client** (`src/h3/Client.zig`) — connect, request/response, headers, body
+- [x] **Server** (`src/h3/Server.zig`) — accept loop, handler dispatch, streaming responses, idle close
 
 ## Remaining
 
-- [x] **Client request/response** — nghttp3 submit_request + recv_data callbacks → httpz.Response
-- [x] **Server dispatch** — CID routing + accept loop + nghttp3 recv_header → httpz.Request → handler
-- [x] **QPACK integration** — nghttp3 encoder/decoder stream binding
 - [ ] **0-RTT** — early data support
-- [ ] **Connection migration** — path validation
-- [x] **QLog / debugging** — ngtcp2 QLog integration for Wireshark
+- [x] **Retry / address validation** — HMAC token + Retry packet; server and client
+- [ ] **Connection migration and CID rotation**
+- [x] **Frame-level retransmission** — ack-eliciting payloads retained and resent after an SRTT-derived timeout
+- [ ] **QLog**
 
 ## File Structure
+
+The current layout is documented in docs/modules/h3.md. The block below is the
+original C-backed layout, kept only for history.
 
 ```
 src/h3/

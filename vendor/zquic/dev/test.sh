@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Run ZQUIC tests
+# Run from project root: ./dev/test.sh
+
+set -euo pipefail
+ZIG="${ZIG:-/opt/zig-dev/zig}"
+
+echo "=== ZQUIC Test Suite ==="
+echo ""
+
+run_step() {
+    local label="$1"
+    shift
+    echo "$label"
+    if "$@"; then
+        echo "  Done."
+    else
+        echo "  Failed. See output above."
+        exit 1
+    fi
+    echo ""
+}
+
+run_step "[1/3] Running unit tests (zig build test)..." "$ZIG" build test
+run_step "[2/3] Running integration tests..." "$ZIG" build integration-tests
+
+if [ -n "${CI:-}" ]; then
+    echo "CI detected; skipping fuzz harness to avoid long runtimes." && echo ""
+else
+    run_step "[3/3] Running fuzz harness..." "$ZIG" build fuzz-tests
+fi
+
+echo "=== Test Complete ==="

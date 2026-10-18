@@ -29,6 +29,9 @@ pub fn main(init: std.process.Init) !void {
 
     try httpz.h3.quic.setServerCert(auth.cert_pem, auth.key_pem);
 
+    // H3_RETRY=1 exercises RFC 9000 Retry; both the built-in H3 client and
+    // aioquic answer it.
+    const retry = init.environ_map.get("H3_RETRY") != null;
     var server = try httpz.h3.Server.init(allocator, 8443, struct {
         fn handle(alloc: std.mem.Allocator, req: *const httpz.h3.Request) httpz.h3.Response {
             _ = alloc;
@@ -39,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
             }
             return .{ .body = "Hello from httpz HTTP/3 Server!\n" };
         }
-    }.handle, .{});
+    }.handle, .{ .retry = retry });
     defer server.deinit();
 
     std.debug.print("httpz HTTP/3 Server running on UDP 127.0.0.1:8443...\n", .{});

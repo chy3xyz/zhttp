@@ -3,6 +3,7 @@ pub const http3 = @import("http3.zig");
 pub const Client = @import("Client.zig").Client;
 pub const Server = @import("Server.zig").Server;
 pub const ServerHandler = @import("Server.zig").Handler;
+pub const ServerContextHandler = @import("Server.zig").ContextHandler;
 /// The request a server handler is given, and what it answers with.
 pub const Request = @import("Server.zig").Request;
 pub const Response = @import("Server.zig").Response;
@@ -10,8 +11,11 @@ pub const Response = @import("Server.zig").Response;
 /// for HTTP/1.1 or HTTP/2 needs nothing new to read these.
 pub const Method = @import("Server.zig").Method;
 pub const StatusCode = @import("Server.zig").StatusCode;
+pub const Header = @import("Server.zig").Header;
+pub const Adapter = @import("Adapter.zig").Adapter;
 
 test {
+    _ = @import("Adapter_test.zig");
     _ = @import("quic.zig");
     _ = @import("http3.zig");
     _ = @import("Client.zig");

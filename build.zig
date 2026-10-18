@@ -4,21 +4,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const h3 = b.option(bool, "h3", "Enable HTTP/3 support (requires nghttp3 and ngtcp2)") orelse false;
+    const h3 = b.option(bool, "h3", "Enable HTTP/3 support (native zquic transport + OpenSSL QUIC-TLS)") orelse false;
 
-    // Include and library paths — configurable via -D flags for cross-platform
-    // support. Defaults work for macOS Homebrew. Override for Linux/pkg-config
-    // paths: the libraries are found on the system's own search path unless a
-    // directory is named here, which is how CI builds its own copies.
-    const openssl_include = b.option([]const u8, "openssl-include", "Path to OpenSSL include directory") orelse "/opt/homebrew/opt/openssl@3/include";
+    // Library path for OpenSSL, when it is not on the system search path.
     const openssl_lib = b.option([]const u8, "openssl-lib", "Path to the OpenSSL library directory");
-    const ngtcp2_lib = b.option([]const u8, "ngtcp2-lib", "Path to the libngtcp2 library directory");
-    const nghttp3_lib = b.option([]const u8, "nghttp3-lib", "Path to the libnghttp3 library directory");
-    const lib_paths: LibPaths = .{
-        .openssl = openssl_lib,
-        .ngtcp2 = ngtcp2_lib,
-        .nghttp3 = nghttp3_lib,
-    };
+    const lib_paths: LibPaths = .{ .openssl = openssl_lib };
 
     // Hand-written OpenSSL bindings (see src/openssl_c.zig) — no C translation,
     // so no OpenSSL headers are needed to build.
@@ -36,30 +26,21 @@ pub fn build(b: *std.Build) void {
     imports.append(b.allocator, .{ .name = "openssl_c", .module = openssl_c_mod }) catch @panic("OOM");
     imports.append(b.allocator, .{ .name = "httpz_options", .module = options.createModule() }) catch @panic("OOM");
 
-    // Translate C headers for HTTP/3 (ngtcp2 + nghttp3)
+    // The native HTTP/3 stack is built on zquic's Zig QUIC transport.
+    var zquic_mod: ?*std.Build.Module = null;
+
+    // HTTP/3 is the native stack: zquic owns the QUIC transport and OpenSSL's
+    // QUIC-TLS callbacks own the handshake. No ngtcp2/nghttp3 translation.
     if (h3) {
-        const ngtcp2_include = b.option([]const u8, "ngtcp2-include", "Path to ngtcp2 include directory") orelse "/opt/homebrew/opt/libngtcp2/include";
-        const nghttp3_include = b.option([]const u8, "nghttp3-include", "Path to nghttp3 include directory") orelse "/opt/homebrew/opt/libnghttp3/include";
-
-        const ngtcp2_h = b.addTranslateC(.{
-            .root_source_file = b.path("src/h3/ngtcp2.h"),
+        const zquic_dep = b.dependency("zquic", .{
             .target = target,
             .optimize = optimize,
+            .http3 = true,
+            .doq = false,
+            .examples = false,
         });
-        ngtcp2_h.addIncludePath(.{ .cwd_relative = ngtcp2_include });
-        ngtcp2_h.addIncludePath(.{ .cwd_relative = openssl_include });
-        const ngtcp2_mod = ngtcp2_h.createModule();
-
-        const nghttp3_h = b.addTranslateC(.{
-            .root_source_file = b.path("src/h3/nghttp3.h"),
-            .target = target,
-            .optimize = optimize,
-        });
-        nghttp3_h.addIncludePath(.{ .cwd_relative = nghttp3_include });
-        const nghttp3_mod = nghttp3_h.createModule();
-
-        imports.append(b.allocator, .{ .name = "ngtcp2_c", .module = ngtcp2_mod }) catch @panic("OOM");
-        imports.append(b.allocator, .{ .name = "nghttp3_c", .module = nghttp3_mod }) catch @panic("OOM");
+        zquic_mod = zquic_dep.module("zquic");
+        imports.append(b.allocator, .{ .name = "zquic", .module = zquic_mod.? }) catch @panic("OOM");
     }
 
     // Library module
@@ -86,6 +67,7 @@ pub fn build(b: *std.Build) void {
     // These import `httpz.h3`, which is only wired up with -Dh3=true.
     const h3_examples = [_][]const u8{
         "server_h3",
+        "server_h3_router",
         "client_h3",
     };
 
@@ -104,6 +86,30 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_mod_tests = b.addRunArtifact(mod_tests);
+
+    // Native HTTP/3 layer tests. Compiled against zquic and OpenSSL directly so
+    // the transport can be exercised without the rest of the library.
+    var native_test_step: ?*std.Build.Step = null;
+    if (h3) {
+        const native_mod = b.createModule(.{
+            .root_source_file = b.path("src/native_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zquic", .module = zquic_mod.? },
+                .{ .name = "openssl_c", .module = openssl_c_mod },
+            },
+        });
+        native_mod.linkSystemLibrary("ssl", .{});
+        native_mod.linkSystemLibrary("crypto", .{});
+        native_mod.link_libc = true;
+        if (lib_paths.openssl) |path| native_mod.addLibraryPath(.{ .cwd_relative = path });
+        const native_tests = b.addTest(.{ .root_module = native_mod });
+        const run_native_tests = b.addRunArtifact(native_tests);
+        const native_step = b.step("test-native", "Run native HTTP/3 layer tests");
+        native_step.dependOn(&run_native_tests.step);
+        native_test_step = &run_native_tests.step;
+    }
 
     // Integration tests
     const integration_tests = b.addTest(.{
@@ -127,6 +133,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+    if (native_test_step) |step| test_step.dependOn(step);
 
     // Benchmark step
     //
@@ -197,27 +204,20 @@ pub fn build(b: *std.Build) void {
     coverage_step.dependOn(&kcov_mod.step);
 }
 
-/// Everything the library needs from the system: OpenSSL always, and the QUIC
-/// and HTTP/3 libraries when the h3 layer is built in.
+/// Everything the library needs from the system: OpenSSL always. The QUIC and
+/// HTTP/3 layers are Zig code now (zquic + OpenSSL's QUIC-TLS callbacks), so no
+/// ngtcp2/nghttp3 library is linked even when h3 is enabled.
 /// Where the libraries linked below live, when they are not on the system's own
 /// search path. A null field means "look it up the usual way".
 const LibPaths = struct {
     openssl: ?[]const u8 = null,
-    ngtcp2: ?[]const u8 = null,
-    nghttp3: ?[]const u8 = null,
 };
 
 fn linkSystemLibraries(mod: *std.Build.Module, libs: LibPaths, h3: bool) void {
+    _ = h3;
     if (libs.openssl) |path| mod.addLibraryPath(.{ .cwd_relative = path });
     mod.linkSystemLibrary("ssl", .{});
     mod.linkSystemLibrary("crypto", .{});
-    if (h3) {
-        if (libs.ngtcp2) |path| mod.addLibraryPath(.{ .cwd_relative = path });
-        if (libs.nghttp3) |path| mod.addLibraryPath(.{ .cwd_relative = path });
-        mod.linkSystemLibrary("ngtcp2", .{});
-        mod.linkSystemLibrary("ngtcp2_crypto_ossl", .{});
-        mod.linkSystemLibrary("nghttp3", .{});
-    }
     mod.link_libc = true;
 }
 

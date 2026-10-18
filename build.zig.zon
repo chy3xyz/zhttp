@@ -31,7 +31,13 @@
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
-    .dependencies = .{},
+    .dependencies = .{
+        // Vendored snapshot of the zquic working tree. Refresh from ../zquic
+        // when its QUIC transport changes:
+        //   rsync -a --exclude .git --exclude .zig-cache --exclude zig-out \
+        //     ../zquic/ vendor/zquic/
+        .zquic = .{ .path = "vendor/zquic" },
+    },
     // Specifies the set of files and directories that are included in this package.
     // Only files and directories listed here are included in the `hash` that
     // is computed for this package. Only files listed here will remain on disk
@@ -44,6 +50,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "vendor",
         // For example...
         //"LICENSE",
         //"README.md",
