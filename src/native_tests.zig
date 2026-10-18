@@ -16,6 +16,7 @@ test {
     _ = @import("h3/native/fuzz_test.zig");
     _ = @import("h3/native/batch_test.zig");
     _ = @import("h3/native/batch_p23_test.zig");
+    _ = @import("h3/native/batch_p3_test.zig");
     _ = @import("h3/native/qlog_test.zig");
 }
 

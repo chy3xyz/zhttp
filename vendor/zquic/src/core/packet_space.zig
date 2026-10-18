@@ -262,6 +262,45 @@ pub const PacketSpace = struct {
             packet_number;
     }
 
+    /// Record a sent packet whose retained plaintext allocation is already
+    /// owned by the caller.
+    ///
+    /// Ownership transfers unconditionally: the slice is stored in the
+    /// SentPacket, or freed before this function returns an error. This avoids
+    /// the copy made by onPacketSentWithPayload for ack-eliciting sends.
+    pub fn onPacketSentWithOwnedPayload(
+        self: *Self,
+        packet_number: PacketNumber,
+        time_sent: u64,
+        ack_eliciting: bool,
+        in_flight: bool,
+        sent_bytes: usize,
+        retained_payload: ?[]u8,
+    ) !void {
+        var sent_packet = SentPacket{
+            .packet_number = packet_number,
+            .time_sent = time_sent,
+            .ack_eliciting = ack_eliciting,
+            .in_flight = in_flight,
+            .sent_bytes = sent_bytes,
+            .payload = retained_payload,
+        };
+        errdefer sent_packet.deinit(self.allocator);
+
+        const entry = try self.sent_packets.getOrPut(self.allocator, packet_number);
+        if (entry.found_existing) entry.value_ptr.deinit(self.allocator);
+        entry.value_ptr.* = sent_packet;
+
+        if (ack_eliciting) {
+            self.time_of_last_ack_eliciting_packet = time_sent;
+        }
+
+        self.largest_sent_packet = if (self.largest_sent_packet) |largest|
+            @max(largest, packet_number)
+        else
+            packet_number;
+    }
+
     /// Process acknowledgment of packets.
     ///
     /// ACK ranges that reference packet numbers never sent in this packet

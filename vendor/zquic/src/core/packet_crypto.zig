@@ -408,15 +408,21 @@ pub const PacketCrypto = struct {
         const header = try self.buildRawPacketHeader(packet_type, dest_conn_id, src_conn_id, packet_number, packet_number_len, payload.len);
         defer self.allocator.free(header);
 
-        const ciphertext = try self.encryptPacket(level, packet_number, header, payload);
-        defer self.allocator.free(ciphertext);
+        const tag_len = self.cipher_suite.tagLength();
+        // Header protection needs a full 16-byte sample starting four bytes
+        // into the packet number, so reject short payloads before allocating.
+        if (payload.len + tag_len < 20) return Error.ZquicError.PacketTooShort;
 
-        if (ciphertext.len < 20) return Error.ZquicError.PacketTooShort;
-
-        const packet = try self.allocator.alloc(u8, header.len + ciphertext.len);
+        const packet = try self.allocator.alloc(u8, header.len + payload.len + tag_len);
         errdefer self.allocator.free(packet);
-        @memcpy(packet[0..header.len], header);
-        @memcpy(packet[header.len..], ciphertext);
+
+        // Encrypt straight into the final packet allocation. The core AEAD
+        // writes the header followed by the ciphertext, so this path no longer
+        // allocates and copies an intermediate protected buffer.
+        const core_level = self.mapCoreEncryptionLevel(level);
+        const written = self.core_crypto.encryptPacket(core_level, packet_number, header, payload, packet) catch
+            return Error.ZquicError.CryptoError;
+        if (written != packet.len) return Error.ZquicError.CryptoError;
 
         const pn_offset = header.len - packet_number_len;
         const sample_offset = pn_offset + 4;

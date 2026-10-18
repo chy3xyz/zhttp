@@ -1159,6 +1159,17 @@ pub const SuperConnection = struct {
         self.outgoing_raw_packets.append(self.allocator, packet) catch return Error.ZquicError.OutOfMemory;
     }
 
+    /// Queue an already protected packet and take ownership of its allocation.
+    ///
+    /// Unlike `queueOutgoingRawPacket`, this does not copy `bytes`: the slice
+    /// must come from this connection's allocator and is freed by
+    /// `drainOutgoingRawPackets`, `OwnedRawPacket.deinit`, or connection
+    /// teardown. Ownership transfers even when this function returns an error.
+    pub fn queueOutgoingRawPacketOwned(self: *Self, bytes: []u8) Error.ZquicError!void {
+        errdefer self.allocator.free(bytes);
+        self.outgoing_raw_packets.append(self.allocator, .{ .data = bytes }) catch return Error.ZquicError.OutOfMemory;
+    }
+
     pub fn drainOutgoingRawPackets(self: *Self, allocator: std.mem.Allocator) Error.ZquicError![]OwnedRawPacket {
         const result = allocator.alloc(OwnedRawPacket, self.outgoing_raw_packets.items.len) catch return Error.ZquicError.OutOfMemory;
         errdefer allocator.free(result);
@@ -1179,8 +1190,9 @@ pub const SuperConnection = struct {
         const packet_number = packet_crypto.nextPacketNumberForLevel(level);
         const ack_eliciting = try self.payloadIsAckEliciting(plaintext_payload);
         const raw = packet_crypto.createProtectedRawPacket(level, packet_type, dest_conn_id, src_conn_id, plaintext_payload) catch return Error.ZquicError.CryptoError;
-        defer self.allocator.free(raw);
-        try self.queueOutgoingRawPacket(raw);
+        // The queue owns the protected allocation. Copy-on-queue is only kept
+        // for callers that hold a borrowed slice.
+        try self.queueOutgoingRawPacketOwned(raw);
         // Only ack-eliciting packets need their plaintext for loss recovery.
         // ACK-only packets keep the previous no-retention behavior.
         try self.recordRawPacketSent(
@@ -1195,6 +1207,61 @@ pub const SuperConnection = struct {
         self.stats.crypto_operations += 1;
     }
 
+    /// Send a protected packet whose plaintext is already allocator-owned.
+    ///
+    /// Ownership of `plaintext_owned` always transfers, including on error. An
+    /// ack-eliciting packet stores exactly this allocation in its `SentPacket`
+    /// and frees it on ACK, loss, discard, or space teardown; a packet that is
+    /// not ack-eliciting frees it immediately. `plaintext_owned` must come from
+    /// this connection's allocator.
+    ///
+    /// Unlike `sendProtectedRawPacket`, this does not copy the plaintext when
+    /// retaining it for loss recovery.
+    pub fn sendProtectedRawPacketOwnedPlaintext(
+        self: *Self,
+        packet_crypto: *PacketCryptoMod.PacketCrypto,
+        level: PacketCryptoMod.EncryptionLevel,
+        packet_type: Packet.PacketType,
+        dest_conn_id: []const u8,
+        src_conn_id: []const u8,
+        plaintext_owned: []u8,
+    ) Error.ZquicError!void {
+        const plaintext_len = plaintext_owned.len;
+        const packet_number = packet_crypto.nextPacketNumberForLevel(level);
+        const ack_eliciting = self.payloadIsAckEliciting(plaintext_owned) catch |err| {
+            self.allocator.free(plaintext_owned);
+            return err;
+        };
+        const raw = packet_crypto.createProtectedRawPacket(level, packet_type, dest_conn_id, src_conn_id, plaintext_owned) catch {
+            self.allocator.free(plaintext_owned);
+            return Error.ZquicError.CryptoError;
+        };
+        // Queue first so the only remaining failure (recording the send) cannot
+        // strand the protected bytes. queueOutgoingRawPacketOwned frees `raw`
+        // on failure; the plaintext is freed exactly once below.
+        self.queueOutgoingRawPacketOwned(raw) catch |err| {
+            self.allocator.free(plaintext_owned);
+            return err;
+        };
+        if (ack_eliciting) {
+            // Consumes the payload unconditionally: stored in SentPacket on
+            // success, freed on failure.
+            try self.recordRawPacketSentOwnedPayload(
+                level,
+                packet_number,
+                plaintext_len,
+                true,
+                plaintext_owned,
+            );
+        } else {
+            defer self.allocator.free(plaintext_owned);
+            try self.recordRawPacketSentOwnedPayload(level, packet_number, plaintext_len, false, null);
+        }
+        self.stats.bytes_sent += plaintext_len;
+        self.stats.packets_sent += 1;
+        self.stats.crypto_operations += 1;
+    }
+
     pub fn scheduleFramesAsProtectedRawPacket(
         self: *Self,
         packet_crypto: *PacketCryptoMod.PacketCrypto,
@@ -1205,8 +1272,9 @@ pub const SuperConnection = struct {
         frames: []const QuicFrames.Frame,
     ) Error.ZquicError!void {
         const payload = try self.serializeFrames(frames);
-        defer self.allocator.free(payload);
-        try self.sendProtectedRawPacket(packet_crypto, level, packet_type, dest_conn_id, src_conn_id, payload);
+        // Hand the serialized frames to loss recovery as-is instead of copying
+        // them when SentPacket retains an ack-eliciting payload.
+        try self.sendProtectedRawPacketOwnedPlaintext(packet_crypto, level, packet_type, dest_conn_id, src_conn_id, payload);
     }
 
     pub fn schedulePendingCryptoAsProtectedRawPacket(
@@ -1619,6 +1687,34 @@ pub const SuperConnection = struct {
         if (packet_number > PacketSpace.MAX_PACKET_NUMBER) return Error.ZquicError.InvalidPacket;
         const now = nowMicrosU64();
         self.packetSpaceForLevel(level).onPacketSentWithPayload(
+            @intCast(packet_number),
+            now,
+            ack_eliciting,
+            ack_eliciting,
+            sent_bytes,
+            retained_payload,
+        ) catch return Error.ZquicError.OutOfMemory;
+        var spaces = self.packetSpacePointers();
+        self.loss_recovery.setLossDetectionTimer(&spaces, now);
+    }
+
+    /// Record a sent packet whose retained plaintext is already an owned
+    /// allocation. The payload is consumed unconditionally: stored in the
+    /// packet space or freed before an error is returned.
+    fn recordRawPacketSentOwnedPayload(
+        self: *Self,
+        level: PacketCryptoMod.EncryptionLevel,
+        packet_number: u64,
+        sent_bytes: usize,
+        ack_eliciting: bool,
+        retained_payload: ?[]u8,
+    ) Error.ZquicError!void {
+        if (packet_number > PacketSpace.MAX_PACKET_NUMBER) {
+            if (retained_payload) |bytes| self.allocator.free(bytes);
+            return Error.ZquicError.InvalidPacket;
+        }
+        const now = nowMicrosU64();
+        self.packetSpaceForLevel(level).onPacketSentWithOwnedPayload(
             @intCast(packet_number),
             now,
             ack_eliciting,

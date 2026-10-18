@@ -1,12 +1,17 @@
 //! QPACK (RFC 9204) for the native HTTP/3 stack.
 //!
-//! The encoder is static-only. The decoder owns a dynamic table (SETTINGS
-//! advertises QPACK_MAX_TABLE_CAPACITY = 4096) and applies the peer's encoder
-//! stream instructions. This module also serializes the three decoder-stream
-//! instructions (Insert Count Increment, Section Acknowledgment, and Stream
-//! Cancellation) into fixed-size bytes. http3.Session owns the decoder stream,
-//! queues those bytes, parks field sections whose Required Insert Count is not
-//! yet satisfied, and retries them as inserts arrive.
+//! The decoder owns a dynamic table (SETTINGS advertises
+//! QPACK_MAX_TABLE_CAPACITY = 4096) and applies the peer's encoder stream
+//! instructions. The encoder owns a second dynamic table bounded by the peer's
+//! SETTINGS_QPACK_MAX_TABLE_CAPACITY: it inserts field values that are likely
+//! to repeat, serializes the matching encoder-stream instructions, and
+//! references entries from field sections only when the peer can resolve them
+//! (acknowledged inserts, or within the peer's blocked-stream limit). This
+//! module also serializes the three decoder-stream instructions (Insert Count
+//! Increment, Section Acknowledgment, and Stream Cancellation) into fixed-size
+//! bytes. http3.Session owns both QPACK streams, queues those bytes, parks
+//! field sections whose Required Insert Count is not yet satisfied, and
+//! retries them as inserts arrive.
 
 const std = @import("std");
 const huffman = @import("../../h2/huffman.zig");
@@ -28,6 +33,15 @@ pub const Error = error{
     CapacityExceeded,
     /// An insert's name + value + 32 exceeds the current table capacity.
     EntryTooLarge,
+    /// An encoder insert would have to evict an entry that an outstanding
+    /// field section still references.
+    WouldEvictReferenced,
+    /// The peer's decoder stream sent an Insert Count Increment of zero or
+    /// larger than the number of inserts it has not acknowledged yet.
+    InvalidInsertCountIncrement,
+    /// The peer's decoder stream acknowledged a stream with no outstanding
+    /// dynamic reference.
+    UnexpectedSectionAcknowledgment,
     OutOfMemory,
 };
 
@@ -93,6 +107,11 @@ pub const EncoderApply = union(enum) {
 const TableEntry = struct {
     name: []const u8,
     value: []const u8,
+    /// Outstanding field sections that reference this entry. Only the
+    /// encoder's table uses it: an entry with a nonzero count must not be
+    /// evicted until the peer acknowledges or cancels the section. The
+    /// decoder leaves it at zero.
+    refs: u32 = 0,
 };
 
 /// RFC 9204 Appendix A. Index is the array position.
@@ -309,6 +328,75 @@ pub const DynamicTable = struct {
         self.insert_count += 1;
     }
 
+    /// Insert like insert, but never evict an entry that an outstanding field
+    /// section references. The encoder uses this after canEvictFor succeeds;
+    /// an entry referenced by a section whose Section Acknowledgment is still
+    /// outstanding must stay resolvable for the peer.
+    pub fn insertAvoidingReferenced(self: *DynamicTable, name: []const u8, value: []const u8) Error!void {
+        const entry_size = entrySize(name, value);
+        if (entry_size > self.capacity) return error.EntryTooLarge;
+        if (!self.canEvictFor(entry_size)) return error.WouldEvictReferenced;
+
+        // Duplicate the input before eviction: name/value may borrow from an
+        // entry this insert is about to evict.
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        const owned_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned_value);
+
+        while (self.size + entry_size > self.capacity) self.evictOldest();
+
+        try self.entries.append(self.allocator, .{
+            .name = owned_name,
+            .value = owned_value,
+        });
+        self.size += entry_size;
+        self.insert_count += 1;
+    }
+
+    /// True when inserting an entry of entry_size bytes only evicts entries
+    /// that no outstanding field section references.
+    pub fn canEvictFor(self: *const DynamicTable, entry_size: usize) bool {
+        if (entry_size > self.capacity) return false;
+        var projected = self.size;
+        var index: usize = 0;
+        while (projected + entry_size > self.capacity) {
+            if (index >= self.entries.items.len) return false;
+            if (self.entries.items[index].refs != 0) return false;
+            projected -= entrySize(
+                self.entries.items[index].name,
+                self.entries.items[index].value,
+            );
+            index += 1;
+        }
+        return true;
+    }
+
+    /// Record one outstanding reference to a live entry. Returns false when
+    /// the absolute index is no longer in the table.
+    pub fn addReference(self: *DynamicTable, absolute_index: u64) bool {
+        const index = self.entryIndex(absolute_index) orelse return false;
+        const entry = &self.entries.items[index];
+        if (entry.refs < std.math.maxInt(u32)) entry.refs += 1;
+        return true;
+    }
+
+    /// Drop one outstanding reference. Returns false when the entry has
+    /// already been evicted (which an encoder must never let happen while
+    /// refs is nonzero).
+    pub fn releaseReference(self: *DynamicTable, absolute_index: u64) bool {
+        const index = self.entryIndex(absolute_index) orelse return false;
+        const entry = &self.entries.items[index];
+        if (entry.refs > 0) entry.refs -= 1;
+        return true;
+    }
+
+    /// Number of outstanding references to an entry, zero once it is evicted.
+    pub fn referenceCount(self: *const DynamicTable, absolute_index: u64) u32 {
+        const index = self.entryIndex(absolute_index) orelse return 0;
+        return self.entries.items[index].refs;
+    }
+
     /// Apply an insertion whose name comes from the static table or a relative
     /// dynamic-table index (0 is the most recently inserted entry).
     pub fn insertWithNameReference(
@@ -344,10 +432,16 @@ pub const DynamicTable = struct {
     /// Resolve an absolute insert index. Evicted entries are no longer
     /// resolvable even though their index is below insert_count.
     pub fn getAbsolute(self: *const DynamicTable, absolute_index: u64) ?TableEntry {
+        const index = self.entryIndex(absolute_index) orelse return null;
+        return self.entries.items[index];
+    }
+
+    /// Array position of an absolute insert index, or null once evicted.
+    fn entryIndex(self: *const DynamicTable, absolute_index: u64) ?usize {
         if (absolute_index >= self.insert_count) return null;
         const newest_offset = self.insert_count - 1 - absolute_index;
         if (newest_offset >= self.entries.items.len) return null;
-        return self.entries.items[self.entries.items.len - 1 - @as(usize, @intCast(newest_offset))];
+        return self.entries.items.len - 1 - @as(usize, @intCast(newest_offset));
     }
 
     fn evictOldest(self: *DynamicTable) void {
@@ -360,6 +454,495 @@ pub const DynamicTable = struct {
 
 fn entrySize(name: []const u8, value: []const u8) usize {
     return name.len + value.len + 32;
+}
+
+/// SETTINGS_QPACK_BLOCKED_STREAMS cap applied to our encoder. The peer sets
+/// the actual limit; capping keeps the number of streams it can park bounded.
+pub const encoder_blocked_streams_cap: usize = 16;
+
+/// Only field name + value pairs at least this long are inserted. Every table
+/// entry costs 32 bytes of overhead, so short values are cheaper as literals.
+pub const encoder_min_insert_len: usize = 40;
+
+const StreamRefs = struct {
+    /// Absolute indexes referenced by field sections this encoder sent on the
+    /// stream. Released by Section Acknowledgment or Stream Cancellation.
+    refs: std.ArrayListUnmanaged(u64) = .empty,
+    /// True while at least one reference is to an insert the peer has not
+    /// acknowledged. Such a stream counts against the peer's blocked-stream
+    /// limit until every referenced insert is acknowledged.
+    blocked: bool = false,
+};
+
+const FieldPlan = union(enum) {
+    static_indexed: u64,
+    static_name: struct { index: u64, value: []const u8 },
+    literal_name: struct { name: []const u8, value: []const u8 },
+    dynamic_indexed: u64,
+    dynamic_name: struct { absolute_index: u64, value: []const u8 },
+};
+
+/// Encoder-side QPACK state: the dynamic table, the peer's limits, and the
+/// per-stream references that keep entries alive until the peer acknowledges
+/// them. One instance lives in each HTTP/3 Session.
+pub const Encoder = struct {
+    allocator: std.mem.Allocator,
+    table: DynamicTable,
+    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY from the peer. Required Insert Count
+    /// wraparound uses this, not the current capacity (RFC 9204 section
+    /// 4.5.1.1).
+    peer_max_capacity: usize = 0,
+    /// min(peer SETTINGS_QPACK_BLOCKED_STREAMS, encoder_blocked_streams_cap).
+    blocked_stream_limit: usize = 0,
+    /// Highest Insert Count covered by the peer's Insert Count Increments.
+    known_received_count: u64 = 0,
+    /// Streams with at least one reference to an unacknowledged insert.
+    blocked_stream_count: usize = 0,
+    streams: std.AutoHashMapUnmanaged(u64, StreamRefs) = .empty,
+    /// Encoder-stream instructions waiting to be queued on the local type
+    /// 0x02 stream. http3.Session drains this after encoding a section and
+    /// from service().
+    pending: std.ArrayListUnmanaged(u8) = .empty,
+    configured: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator) Encoder {
+        return .{
+            .allocator = allocator,
+            .table = DynamicTable.init(allocator, 0),
+        };
+    }
+
+    pub fn deinit(self: *Encoder) void {
+        var it = self.streams.iterator();
+        while (it.next()) |entry| entry.value_ptr.refs.deinit(self.allocator);
+        self.streams.deinit(self.allocator);
+        self.pending.deinit(self.allocator);
+        self.table.deinit();
+        self.* = undefined;
+    }
+
+    /// Apply the peer's SETTINGS. The first call sizes the table and stages
+    /// exactly one Set Dynamic Table Capacity instruction; a second call is
+    /// ignored because a peer sends SETTINGS once.
+    pub fn configure(self: *Encoder, max_capacity: u64, blocked_streams: u64) Error!void {
+        if (self.configured) return;
+        const capacity = std.math.cast(usize, max_capacity) orelse std.math.maxInt(usize);
+        if (capacity > 0) {
+            // Stage the instruction before mutating the table so an
+            // allocation failure leaves the encoder unconfigured instead of
+            // desynchronized.
+            try writeEncoderCapacity(self.allocator, &self.pending, capacity);
+        }
+        self.table.max_capacity = capacity;
+        try self.table.setCapacity(capacity);
+        self.peer_max_capacity = capacity;
+        self.blocked_stream_limit = @intCast(@min(blocked_streams, encoder_blocked_streams_cap));
+        self.configured = true;
+    }
+
+    pub fn insertCount(self: *const Encoder) u64 {
+        return self.table.insert_count;
+    }
+
+    pub fn knownReceivedCount(self: *const Encoder) u64 {
+        return self.known_received_count;
+    }
+
+    pub fn blockedStreamCount(self: *const Encoder) usize {
+        return self.blocked_stream_count;
+    }
+
+    pub fn pendingInstructions(self: *const Encoder) []const u8 {
+        return self.pending.items;
+    }
+
+    pub fn clearPendingInstructions(self: *Encoder) void {
+        self.pending.clearRetainingCapacity();
+    }
+
+    /// Encode one field section, staging any needed encoder-stream
+    /// instructions in pending. The caller must flush pending on the local
+    /// encoder stream before sending the returned block.
+    pub fn encodeSection(
+        self: *Encoder,
+        allocator: std.mem.Allocator,
+        stream_id: u64,
+        fields: []const HeaderField,
+    ) Error![]u8 {
+        var plans: std.ArrayListUnmanaged(FieldPlan) = .empty;
+        defer plans.deinit(allocator);
+        var section_refs: std.ArrayListUnmanaged(u64) = .empty;
+        defer section_refs.deinit(allocator);
+        var refs_attached = false;
+        errdefer if (!refs_attached) self.releaseReferences(section_refs.items);
+
+        const may_block = self.mayBlockNewSection(stream_id);
+        var highest: u64 = 0;
+        var has_dynamic = false;
+
+        try plans.ensureTotalCapacity(allocator, fields.len);
+        for (fields) |field| {
+            try validateName(field.name);
+            plans.appendAssumeCapacity(try self.planField(
+                allocator,
+                field,
+                may_block,
+                &section_refs,
+                &highest,
+                &has_dynamic,
+            ));
+        }
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        const base: u64 = if (has_dynamic) highest + 1 else 0;
+        if (has_dynamic) {
+            const encoded = try encodeRequiredInsertCount(base, self.peer_max_capacity);
+            try writePrefixedInt(allocator, &out, 0x00, 8, encoded);
+            // Delta Base 0 with Base == Required Insert Count: every dynamic
+            // reference is a pre-base reference.
+            try writePrefixedInt(allocator, &out, 0x00, 7, 0);
+        } else {
+            try out.append(allocator, 0);
+            try out.append(allocator, 0);
+        }
+        for (plans.items) |plan| try writePlan(allocator, &out, plan, base);
+
+        if (section_refs.items.len > 0) {
+            try self.attachSection(allocator, stream_id, section_refs.items);
+            refs_attached = true;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Append a Duplicate instruction for a live entry and mirror it in the
+    /// encoder table. The default field policy references an exact match
+    /// instead, but the encoder supports the form and tests exercise it.
+    pub fn duplicateEntry(self: *Encoder, absolute_index: u64) Error!void {
+        const entry = self.table.getAbsolute(absolute_index) orelse return error.InvalidIndex;
+        const relative = self.table.insert_count - 1 - absolute_index;
+        try self.pending.ensureUnusedCapacity(self.allocator, 11);
+        try self.table.insertAvoidingReferenced(entry.name, entry.value);
+        try writeEncoderDuplicate(self.allocator, &self.pending, relative);
+    }
+
+    /// A Section Acknowledgment releases every dynamic reference the field
+    /// section held on the stream. An acknowledgment for a stream with no
+    /// outstanding reference is a decoder-stream error (RFC 9204 section
+    /// 4.4.1).
+    pub fn onSectionAcknowledgment(self: *Encoder, stream_id: u64) Error!void {
+        const removed = self.streams.fetchRemove(stream_id) orelse
+            return error.UnexpectedSectionAcknowledgment;
+        var stream = removed.value;
+        defer stream.refs.deinit(self.allocator);
+        if (stream.refs.items.len == 0) return error.UnexpectedSectionAcknowledgment;
+        self.releaseReferences(stream.refs.items);
+        if (stream.blocked and self.blocked_stream_count > 0) {
+            self.blocked_stream_count -= 1;
+        }
+    }
+
+    /// Stream Cancellation drops the stream's references without requiring an
+    /// acknowledgment. Cancelling a stream with nothing outstanding is
+    /// explicitly allowed.
+    pub fn onStreamCancellation(self: *Encoder, stream_id: u64) void {
+        const removed = self.streams.fetchRemove(stream_id) orelse return;
+        var stream = removed.value;
+        defer stream.refs.deinit(self.allocator);
+        self.releaseReferences(stream.refs.items);
+        if (stream.blocked and self.blocked_stream_count > 0) {
+            self.blocked_stream_count -= 1;
+        }
+    }
+
+    /// Advance known_received_count. Zero is illegal, and the peer can never
+    /// acknowledge more inserts than have been sent but not acknowledged yet.
+    pub fn onInsertCountIncrement(self: *Encoder, increment: u64) Error!void {
+        if (increment == 0) return error.InvalidInsertCountIncrement;
+        const outstanding = self.table.insert_count - self.known_received_count;
+        if (increment > outstanding) return error.InvalidInsertCountIncrement;
+        self.known_received_count += increment;
+
+        // Streams whose every referenced insert is now acknowledged stop
+        // counting against the blocked-stream limit.
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            const stream = entry.value_ptr;
+            if (!stream.blocked) continue;
+            var still_blocked = false;
+            for (stream.refs.items) |absolute_index| {
+                if (absolute_index >= self.known_received_count) {
+                    still_blocked = true;
+                    break;
+                }
+            }
+            if (!still_blocked) {
+                stream.blocked = false;
+                if (self.blocked_stream_count > 0) self.blocked_stream_count -= 1;
+            }
+        }
+    }
+
+    fn planField(
+        self: *Encoder,
+        allocator: std.mem.Allocator,
+        field: HeaderField,
+        may_block: bool,
+        refs: *std.ArrayListUnmanaged(u64),
+        highest: *u64,
+        has_dynamic: *bool,
+    ) Error!FieldPlan {
+        if (findStaticExact(field)) |index| return .{ .static_indexed = index };
+
+        if (self.findNewest(field.name, field.value)) |absolute_index| {
+            if (self.canReference(absolute_index, may_block)) {
+                try self.recordReference(allocator, refs, absolute_index, highest, has_dynamic);
+                return .{ .dynamic_indexed = absolute_index };
+            }
+        }
+
+        // A value that is already in the table but not yet safe to reference
+        // is not inserted again: the copy would be just as unsafe.
+        const already_present = self.findNewest(field.name, field.value) != null;
+        if (!already_present and self.shouldInsert(field)) {
+            if (try self.insertField(allocator, field)) |absolute_index| {
+                if (self.canReference(absolute_index, may_block)) {
+                    try self.recordReference(allocator, refs, absolute_index, highest, has_dynamic);
+                    return .{ .dynamic_indexed = absolute_index };
+                }
+            }
+        }
+
+        if (findStaticName(field.name)) |index| {
+            return .{ .static_name = .{ .index = index, .value = field.value } };
+        }
+        if (self.findNewestName(field.name)) |absolute_index| {
+            if (self.canReference(absolute_index, may_block)) {
+                try self.recordReference(allocator, refs, absolute_index, highest, has_dynamic);
+                return .{ .dynamic_name = .{
+                    .absolute_index = absolute_index,
+                    .value = field.value,
+                } };
+            }
+        }
+        return .{ .literal_name = .{ .name = field.name, .value = field.value } };
+    }
+
+    fn shouldInsert(self: *const Encoder, field: HeaderField) bool {
+        if (self.table.capacity == 0) return false;
+        if (field.name.len + field.value.len < encoder_min_insert_len) return false;
+        if (!insertableName(field.name)) return false;
+        const entry_size = entrySize(field.name, field.value);
+        // One entry may use at most a quarter of the table, so a single large
+        // header cannot flush everything the peer has learned.
+        if (entry_size > self.table.capacity / 4) return false;
+        return self.table.canEvictFor(entry_size);
+    }
+
+    fn insertField(
+        self: *Encoder,
+        allocator: std.mem.Allocator,
+        field: HeaderField,
+    ) Error!?u64 {
+        // Reserve room for the longest encoding before mutating the table:
+        // the name and value strings plus a worst-case integer or two.
+        try self.pending.ensureUnusedCapacity(
+            allocator,
+            field.name.len + field.value.len + 24,
+        );
+        const dynamic_name_relative: ?u64 = if (self.findNewestName(field.name)) |absolute_index|
+            self.table.insert_count - 1 - absolute_index
+        else
+            null;
+
+        self.table.insertAvoidingReferenced(field.name, field.value) catch |err| switch (err) {
+            error.WouldEvictReferenced, error.EntryTooLarge => return null,
+            else => return err,
+        };
+
+        if (findStaticName(field.name)) |index| {
+            try writeEncoderInsertNameRef(allocator, &self.pending, true, index, field.value);
+        } else if (dynamic_name_relative) |relative| {
+            // The peer already has this name: the insert that created it is
+            // earlier on the same encoder stream.
+            try writeEncoderInsertNameRef(allocator, &self.pending, false, relative, field.value);
+        } else {
+            try writeEncoderInsertLiteral(allocator, &self.pending, field.name, field.value);
+        }
+        return self.table.insert_count - 1;
+    }
+
+    fn canReference(self: *const Encoder, absolute_index: u64, may_block: bool) bool {
+        if (self.table.getAbsolute(absolute_index) == null) return false;
+        if (absolute_index < self.known_received_count) return true;
+        return may_block;
+    }
+
+    fn mayBlockNewSection(self: *const Encoder, stream_id: u64) bool {
+        if (self.blocked_stream_limit == 0) return false;
+        if (self.streams.get(stream_id)) |stream| {
+            if (stream.blocked) return true;
+        }
+        return self.blocked_stream_count < self.blocked_stream_limit;
+    }
+
+    fn recordReference(
+        self: *Encoder,
+        allocator: std.mem.Allocator,
+        refs: *std.ArrayListUnmanaged(u64),
+        absolute_index: u64,
+        highest: *u64,
+        has_dynamic: *bool,
+    ) Error!void {
+        try refs.append(allocator, absolute_index);
+        if (!self.table.addReference(absolute_index)) return error.InvalidDynamicReference;
+        if (!has_dynamic.* or absolute_index > highest.*) highest.* = absolute_index;
+        has_dynamic.* = true;
+    }
+
+    fn releaseReferences(self: *Encoder, refs: []const u64) void {
+        for (refs) |absolute_index| _ = self.table.releaseReference(absolute_index);
+    }
+
+    fn attachSection(
+        self: *Encoder,
+        allocator: std.mem.Allocator,
+        stream_id: u64,
+        refs: []const u64,
+    ) Error!void {
+        const gop = try self.streams.getOrPut(allocator, stream_id);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        try gop.value_ptr.refs.appendSlice(allocator, refs);
+        if (gop.value_ptr.blocked) return;
+
+        for (refs) |absolute_index| {
+            if (absolute_index < self.known_received_count) continue;
+            gop.value_ptr.blocked = true;
+            self.blocked_stream_count += 1;
+            return;
+        }
+    }
+
+    fn findNewest(self: *const Encoder, name: []const u8, value: []const u8) ?u64 {
+        return self.findNewestMatch(name, value, true);
+    }
+
+    fn findNewestName(self: *const Encoder, name: []const u8) ?u64 {
+        return self.findNewestMatch(name, null, false);
+    }
+
+    fn findNewestMatch(
+        self: *const Encoder,
+        name: []const u8,
+        value: ?[]const u8,
+        match_value: bool,
+    ) ?u64 {
+        const entries = self.table.entries.items;
+        if (entries.len == 0) return null;
+        var index = entries.len;
+        while (index > 0) {
+            index -= 1;
+            const entry = entries[index];
+            if (!std.mem.eql(u8, entry.name, name)) continue;
+            if (match_value and !std.mem.eql(u8, entry.value, value.?)) continue;
+            return self.table.insert_count - entries.len + index;
+        }
+        return null;
+    }
+};
+
+/// Header names that are never worth inserting. Pseudo-headers change every
+/// request, and cookie/date/set-cookie values are unique or short-lived
+/// (RFC 9204 section 4.1.2 advises encoders to avoid them).
+fn insertableName(name: []const u8) bool {
+    if (name.len == 0 or name[0] == ':') return false;
+    const excluded = [_][]const u8{ "cookie", "date", "set-cookie" };
+    for (excluded) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return false;
+    }
+    return true;
+}
+
+/// Required Insert Count encoding (RFC 9204 section 4.5.1.1). MaxEntries is
+/// floor(peer SETTINGS_QPACK_MAX_TABLE_CAPACITY / 32).
+fn encodeRequiredInsertCount(required_insert_count: u64, max_capacity: usize) Error!u64 {
+    if (required_insert_count == 0) return 0;
+    const max_entries: u64 = @intCast(max_capacity / 32);
+    if (max_entries == 0) return error.CapacityExceeded;
+    const full_range = max_entries * 2;
+    return (required_insert_count % full_range) + 1;
+}
+
+fn writePlan(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    plan: FieldPlan,
+    base: u64,
+) Error!void {
+    switch (plan) {
+        .static_indexed => |index| try writePrefixedInt(allocator, out, 0xc0, 6, index),
+        .static_name => |field| {
+            try writePrefixedInt(allocator, out, 0x50, 4, field.index);
+            try writeString(allocator, out, field.value);
+        },
+        .literal_name => |field| {
+            try writePrefixedInt(allocator, out, 0x20, 3, field.name.len);
+            try out.appendSlice(allocator, field.name);
+            try writeString(allocator, out, field.value);
+        },
+        .dynamic_indexed => |absolute_index| {
+            const index = base - 1 - absolute_index;
+            try writePrefixedInt(allocator, out, 0x80, 6, index);
+        },
+        .dynamic_name => |field| {
+            const index = base - 1 - field.absolute_index;
+            try writePrefixedInt(allocator, out, 0x40, 4, index);
+            try writeString(allocator, out, field.value);
+        },
+    }
+}
+
+fn writeEncoderCapacity(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    capacity: usize,
+) Error!void {
+    // Set Dynamic Table Capacity: 001 + 5-bit capacity.
+    try writePrefixedInt(allocator, out, 0x20, 5, capacity);
+}
+
+fn writeEncoderInsertNameRef(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    is_static: bool,
+    index: u64,
+    value: []const u8,
+) Error!void {
+    // Insert With Name Reference: 1 T + 6-bit name index, then value.
+    const first: u8 = if (is_static) 0xc0 else 0x80;
+    try writePrefixedInt(allocator, out, first, 6, index);
+    try writeString(allocator, out, value);
+}
+
+fn writeEncoderInsertLiteral(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    name: []const u8,
+    value: []const u8,
+) Error!void {
+    // Insert With Literal Name: 01 H + 5-bit name length (H = 0).
+    try writePrefixedInt(allocator, out, 0x40, 5, name.len);
+    try out.appendSlice(allocator, name);
+    try writeString(allocator, out, value);
+}
+
+fn writeEncoderDuplicate(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    relative_index: u64,
+) Error!void {
+    // Duplicate: 000 + 5-bit relative index.
+    try writePrefixedInt(allocator, out, 0x00, 5, relative_index);
 }
 
 /// Decoder-side QPACK state: the dynamic table and the maximum capacity this
@@ -1349,4 +1932,286 @@ test "QPACK: Required Insert Count can be peeked before decoding" {
         error.InvalidHeaderBlock,
         peekRequiredInsertCount(&.{}, 0, 4096),
     );
+}
+
+/// Apply every complete instruction in bytes to a decoder table. The encoder
+/// only stages complete instructions.
+fn applyEncoderInstructions(decoder: *Decoder, bytes: []const u8) !void {
+    var cursor: usize = 0;
+    while (cursor < bytes.len) {
+        switch (try applyEncoderInstruction(decoder, bytes, cursor)) {
+            .incomplete => return error.IncompleteEncoderInstruction,
+            .invalid => return error.InvalidEncoderInstruction,
+            .applied => |done| cursor = done.end,
+        }
+    }
+}
+
+fn fillValue(comptime seed: u8, out: []u8) void {
+    for (out, 0..) |*ch, i| {
+        ch.* = 'a' + @as(u8, @intCast((@as(usize, seed) + i) % 26));
+    }
+}
+
+test "QPACK: encoder insert, ack, and later dynamic reference" {
+    const allocator = std.testing.allocator;
+    var encoder = Encoder.init(allocator);
+    defer encoder.deinit();
+    try encoder.configure(4096, 0);
+
+    try std.testing.expectEqual(@as(u64, 0), encoder.insertCount());
+    try std.testing.expect(encoder.pendingInstructions().len > 0);
+
+    var decoder = Decoder.init(allocator, 4096);
+    defer decoder.deinit();
+    try applyEncoderInstructions(&decoder, encoder.pendingInstructions());
+    encoder.clearPendingInstructions();
+
+    var value_storage: [40]u8 = undefined;
+    fillValue(1, &value_storage);
+    const field = HeaderField{ .name = "x-request-id", .value = &value_storage };
+
+    // With the peer's blocked-stream limit at zero the fresh insert cannot be
+    // referenced yet, but it is still inserted for later sections.
+    const first = try encoder.encodeSection(allocator, 4, &.{field});
+    defer allocator.free(first);
+    try std.testing.expectEqual(@as(u8, 0), first[0]);
+    try std.testing.expectEqual(@as(u64, 1), encoder.insertCount());
+    try std.testing.expect(encoder.pendingInstructions().len > 0);
+    try applyEncoderInstructions(&decoder, encoder.pendingInstructions());
+    encoder.clearPendingInstructions();
+
+    var decoded_first = try decoder.decodeBlock(first);
+    defer decoded_first.deinit();
+    try std.testing.expectEqual(@as(u64, 0), decoded_first.required_insert_count);
+    try std.testing.expectEqualStrings(field.name, decoded_first.fields[0].name);
+    try std.testing.expectEqualStrings(field.value, decoded_first.fields[0].value);
+
+    // The peer acknowledges the insert, so a later section can reference it
+    // without blocking.
+    try encoder.onInsertCountIncrement(1);
+    try std.testing.expectEqual(@as(u64, 1), encoder.knownReceivedCount());
+    const second = try encoder.encodeSection(allocator, 8, &.{field});
+    defer allocator.free(second);
+    try std.testing.expectEqual(@as(u8, 2), second[0]);
+    try std.testing.expectEqual(@as(usize, 0), encoder.pendingInstructions().len);
+    try std.testing.expectEqual(@as(u32, 1), encoder.table.referenceCount(0));
+    try std.testing.expectEqual(@as(usize, 0), encoder.blockedStreamCount());
+
+    var decoded_second = try decoder.decodeBlock(second);
+    defer decoded_second.deinit();
+    try std.testing.expectEqual(@as(u64, 1), decoded_second.required_insert_count);
+    try std.testing.expectEqualStrings(field.value, decoded_second.fields[0].value);
+
+    // An unknown stream is a decoder-stream error; the real Section Ack
+    // releases the reference.
+    try std.testing.expectError(
+        error.UnexpectedSectionAcknowledgment,
+        encoder.onSectionAcknowledgment(12),
+    );
+    try encoder.onSectionAcknowledgment(8);
+    try std.testing.expectEqual(@as(u32, 0), encoder.table.referenceCount(0));
+    try std.testing.expectEqual(@as(usize, 0), encoder.blockedStreamCount());
+}
+
+test "QPACK: encoder with zero peer capacity never inserts" {
+    const allocator = std.testing.allocator;
+    var encoder = Encoder.init(allocator);
+    defer encoder.deinit();
+    try encoder.configure(0, 16);
+    try std.testing.expectEqual(@as(usize, 0), encoder.pendingInstructions().len);
+
+    var value_storage: [40]u8 = undefined;
+    fillValue(2, &value_storage);
+    const fields = [_]HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = "x-custom", .value = &value_storage },
+    };
+    const block = try encoder.encodeSection(allocator, 0, &fields);
+    defer allocator.free(block);
+    try std.testing.expectEqual(@as(u8, 0), block[0]);
+    try std.testing.expectEqual(@as(u8, 0), block[1]);
+    try std.testing.expectEqual(@as(u64, 0), encoder.insertCount());
+    try std.testing.expectEqual(@as(usize, 0), encoder.pendingInstructions().len);
+
+    // Without any insert there is nothing to acknowledge.
+    try std.testing.expectError(
+        error.InvalidInsertCountIncrement,
+        encoder.onInsertCountIncrement(1),
+    );
+}
+
+test "QPACK: encoder rejects zero and over-count Insert Count Increments" {
+    const allocator = std.testing.allocator;
+    var encoder = Encoder.init(allocator);
+    defer encoder.deinit();
+    try encoder.configure(4096, 16);
+    encoder.clearPendingInstructions();
+
+    try std.testing.expectError(
+        error.InvalidInsertCountIncrement,
+        encoder.onInsertCountIncrement(0),
+    );
+    try std.testing.expectError(
+        error.InvalidInsertCountIncrement,
+        encoder.onInsertCountIncrement(1),
+    );
+
+    var value_storage: [40]u8 = undefined;
+    fillValue(3, &value_storage);
+    const block = try encoder.encodeSection(allocator, 0, &.{
+        .{ .name = "x-count", .value = &value_storage },
+    });
+    defer allocator.free(block);
+    try std.testing.expectEqual(@as(u64, 1), encoder.insertCount());
+    try std.testing.expectError(
+        error.InvalidInsertCountIncrement,
+        encoder.onInsertCountIncrement(2),
+    );
+    try encoder.onInsertCountIncrement(1);
+    try std.testing.expectError(
+        error.InvalidInsertCountIncrement,
+        encoder.onInsertCountIncrement(1),
+    );
+}
+
+test "QPACK: encoder refuses to evict referenced entries" {
+    const allocator = std.testing.allocator;
+    var encoder = Encoder.init(allocator);
+    defer encoder.deinit();
+    // Four 82-byte entries fit (328 <= 400) and each is below capacity / 4.
+    try encoder.configure(400, 0);
+    encoder.clearPendingInstructions();
+
+    var names: [5][10]u8 = undefined;
+    var values: [5][40]u8 = undefined;
+    var fields: [5]HeaderField = undefined;
+    for (0..5) |i| {
+        _ = try std.fmt.bufPrint(&names[i], "x-field-{d:0>2}", .{i});
+        _ = try std.fmt.bufPrint(
+            &values[i],
+            "value-{d:0>2}-0123456789abcdef0123456789abc",
+            .{i},
+        );
+        fields[i] = .{ .name = &names[i], .value = &values[i] };
+    }
+    try std.testing.expectEqual(@as(usize, 10), fields[0].name.len);
+    try std.testing.expectEqual(@as(usize, 40), fields[0].value.len);
+
+    for (fields[0..4]) |field| {
+        const section = try encoder.encodeSection(allocator, 0, &.{field});
+        allocator.free(section);
+    }
+    try std.testing.expectEqual(@as(u64, 4), encoder.insertCount());
+    encoder.clearPendingInstructions();
+
+    // Ack every insert, then reference the oldest entry from a new section.
+    try encoder.onInsertCountIncrement(4);
+    const referenced = try encoder.encodeSection(allocator, 4, &.{fields[0]});
+    defer allocator.free(referenced);
+    try std.testing.expect(referenced[0] != 0);
+    try std.testing.expectEqual(@as(u32, 1), encoder.table.referenceCount(0));
+
+    // A fifth entry would have to evict absolute index 0, which the section
+    // above still references: the encoder emits a literal instead.
+    const blocked_insert = try encoder.encodeSection(allocator, 0, &.{fields[4]});
+    defer allocator.free(blocked_insert);
+    try std.testing.expectEqual(@as(u8, 0), blocked_insert[0]);
+    try std.testing.expectEqual(@as(u64, 4), encoder.insertCount());
+    try std.testing.expectEqual(@as(usize, 0), encoder.pendingInstructions().len);
+
+    // Releasing the reference lets the insert proceed and evict entry 0.
+    try encoder.onSectionAcknowledgment(4);
+    try std.testing.expectEqual(@as(u32, 0), encoder.table.referenceCount(0));
+    const allowed = try encoder.encodeSection(allocator, 8, &.{fields[4]});
+    defer allocator.free(allowed);
+    try std.testing.expectEqual(@as(u64, 5), encoder.insertCount());
+    try std.testing.expect(encoder.pendingInstructions().len > 0);
+    try std.testing.expect(encoder.table.getAbsolute(0) == null);
+}
+
+test "QPACK: encoder respects the peer blocked-stream limit" {
+    const allocator = std.testing.allocator;
+    var encoder = Encoder.init(allocator);
+    defer encoder.deinit();
+    try encoder.configure(4096, 1);
+    encoder.clearPendingInstructions();
+
+    var value_storage: [40]u8 = undefined;
+    fillValue(4, &value_storage);
+    const field = HeaderField{ .name = "x-blocked", .value = &value_storage };
+
+    // The first stream consumes the single blocked-stream slot.
+    const first = try encoder.encodeSection(allocator, 4, &.{field});
+    defer allocator.free(first);
+    try std.testing.expect(first[0] != 0);
+    try std.testing.expectEqual(@as(usize, 1), encoder.blockedStreamCount());
+
+    // A second stream must not reference the unacknowledged entry.
+    const second = try encoder.encodeSection(allocator, 8, &.{field});
+    defer allocator.free(second);
+    try std.testing.expectEqual(@as(u8, 0), second[0]);
+    try std.testing.expectEqual(@as(usize, 1), encoder.blockedStreamCount());
+
+    // Stream cancellation releases the slot and the references.
+    encoder.onStreamCancellation(4);
+    try std.testing.expectEqual(@as(usize, 0), encoder.blockedStreamCount());
+    try std.testing.expectEqual(@as(u32, 0), encoder.table.referenceCount(0));
+
+    const third = try encoder.encodeSection(allocator, 12, &.{field});
+    defer allocator.free(third);
+    try std.testing.expect(third[0] != 0);
+    try std.testing.expectEqual(@as(usize, 1), encoder.blockedStreamCount());
+    try encoder.onSectionAcknowledgment(12);
+    try std.testing.expectEqual(@as(usize, 0), encoder.blockedStreamCount());
+}
+
+test "QPACK: Insert Count Increment unblocks acked streams" {
+    const allocator = std.testing.allocator;
+    var encoder = Encoder.init(allocator);
+    defer encoder.deinit();
+    try encoder.configure(4096, 1);
+    encoder.clearPendingInstructions();
+
+    var value_storage: [40]u8 = undefined;
+    fillValue(5, &value_storage);
+    const field = HeaderField{ .name = "x-unblock", .value = &value_storage };
+    const section = try encoder.encodeSection(allocator, 4, &.{field});
+    defer allocator.free(section);
+    try std.testing.expectEqual(@as(usize, 1), encoder.blockedStreamCount());
+
+    // The insert is acknowledged, so the stream no longer blocks even though
+    // its Section Acknowledgment has not arrived yet.
+    try encoder.onInsertCountIncrement(1);
+    try std.testing.expectEqual(@as(usize, 0), encoder.blockedStreamCount());
+    try std.testing.expectEqual(@as(u32, 1), encoder.table.referenceCount(0));
+    try encoder.onSectionAcknowledgment(4);
+    try std.testing.expectEqual(@as(u32, 0), encoder.table.referenceCount(0));
+}
+
+test "QPACK: encoder duplicate instruction mirrors the peer table" {
+    const allocator = std.testing.allocator;
+    var encoder = Encoder.init(allocator);
+    defer encoder.deinit();
+    try encoder.configure(4096, 0);
+
+    var decoder = Decoder.init(allocator, 4096);
+    defer decoder.deinit();
+    try applyEncoderInstructions(&decoder, encoder.pendingInstructions());
+    encoder.clearPendingInstructions();
+
+    var value_storage: [40]u8 = undefined;
+    fillValue(6, &value_storage);
+    const field = HeaderField{ .name = "x-duplicate", .value = &value_storage };
+    const section = try encoder.encodeSection(allocator, 0, &.{field});
+    defer allocator.free(section);
+    try applyEncoderInstructions(&decoder, encoder.pendingInstructions());
+    encoder.clearPendingInstructions();
+
+    try encoder.duplicateEntry(0);
+    try std.testing.expectEqual(@as(u64, 2), encoder.insertCount());
+    try applyEncoderInstructions(&decoder, encoder.pendingInstructions());
+    encoder.clearPendingInstructions();
+    try std.testing.expectEqual(@as(u64, 2), decoder.insertCount());
+    try std.testing.expectEqualStrings(field.value, decoder.table.getRelative(0).?.value);
 }

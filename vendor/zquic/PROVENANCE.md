@@ -42,11 +42,22 @@ In `src/core/packet_crypto.zig`:
   server packets and pre-Retry clients.
 - New `PacketCrypto.resetInitialPacketNumberState` restarts the Initial
   packet number space when a client accepts a Retry.
+- `createProtectedRawPacket` encrypts directly into the final packet
+  allocation instead of building intermediate protected-packet and ciphertext
+  buffers. The header bytes and wire format are unchanged.
 
 In `src/core/packet_space.zig` / `src/core/connection.zig`:
 
 - Ack-eliciting plaintext is optionally retained in `SentPacket` and freed on
   ACK, loss, discard, or space teardown.
+- `PacketSpace.onPacketSentWithOwnedPayload` stores a caller-owned plaintext
+  allocation directly in `SentPacket` (no duplicate); the ownership contract
+  is unconditional, so the slice is stored or freed before an error returns.
+- `SuperConnection.queueOutgoingRawPacketOwned` and
+  `sendProtectedRawPacketOwnedPlaintext` transfer ownership of the protected
+  packet and plaintext buffers. The older `queueOutgoingRawPacket` and
+  `sendProtectedRawPacket` copies remain for callers that only have borrowed
+  slices.
 - `SuperConnection.setLostPacketObserver` forwards time- and packet-threshold
   losses to a callback before the retained payload is freed. zhttp installs
   this observer with `context = self`; the callback copies

@@ -351,6 +351,13 @@ pub var test_standalone_ack_packets: u64 = 0;
 pub var test_standalone_ack_plaintext_len: usize = 0;
 /// Plaintext length of the most recent successfully scheduled packet.
 pub var test_last_scheduled_plaintext_len: usize = 0;
+/// Test-visible accounting for the owned-plaintext handoff in schedule(). The
+/// pointer is only valid while zquic still retains the scheduled packet; tests
+/// compare addresses and never dereference it.
+pub var test_owned_plaintext_schedules: u64 = 0;
+pub var test_owned_ack_eliciting_schedules: u64 = 0;
+pub var test_last_owned_plaintext_ptr: ?[*]u8 = null;
+pub var test_last_owned_plaintext_len: usize = 0;
 
 /// Receive-side observations: which frame mixtures arrived and how many
 /// duplicate control frames a single protected packet carried.
@@ -1836,8 +1843,8 @@ pub const Connection = struct {
         while (pad < min_payload) : (pad += 1) {
             payload.writer.writeByte(0) catch return error.OutOfMemory;
         }
-        const bytes = payload.written();
-        if (bytes.len == 0) return error.QuicError;
+        const plaintext_len = payload.written().len;
+        if (plaintext_len == 0) return error.QuicError;
 
         const src: []const u8 = if (ptype == .one_rtt) &.{} else self.local_cid[0..self.local_cid_len];
         const log_packet = self.qlog != null and self.qlog_pending != null;
@@ -1850,7 +1857,13 @@ pub const Connection = struct {
             2 => .handshake,
             else => .application,
         });
-        self.quic.super_connection.sendProtectedRawPacket(
+        // Transfer the serialized plaintext to zquic. It becomes the exact
+        // allocation SentPacket retains for loss recovery instead of being
+        // freed here and copied by sendProtectedRawPacket. toOwnedSlice resets
+        // the writer, so the deferred deinit stays a no-op on the success path.
+        const plaintext = payload.toOwnedSlice() catch return error.OutOfMemory;
+        const plaintext_ptr = plaintext.ptr;
+        self.quic.super_connection.sendProtectedRawPacketOwnedPlaintext(
             &self.packet_crypto,
             switch (level) {
                 0 => .initial,
@@ -1860,19 +1873,25 @@ pub const Connection = struct {
             ptype,
             dest,
             src,
-            bytes,
+            plaintext,
         ) catch return error.QuicError;
+        test_owned_plaintext_schedules +|= 1;
+        if (ack_eliciting) {
+            test_owned_ack_eliciting_schedules +|= 1;
+            test_last_owned_plaintext_ptr = plaintext_ptr;
+            test_last_owned_plaintext_len = plaintext_len;
+        }
 
         if (log_packet) self.qlog_pending.?.push(.{
             .packet_number = packet_number,
             .level = @intCast(level),
             .ptype = qlogPacketType(ptype),
             .ack_eliciting = ack_eliciting,
-            .plaintext_len = @intCast(bytes.len),
+            .plaintext_len = @intCast(plaintext_len),
             .frames = frame_summary,
         });
 
-        test_last_scheduled_plaintext_len = bytes.len;
+        test_last_scheduled_plaintext_len = plaintext_len;
     }
 
     /// Copy one lost packet out of zquic's callback. The payload is only valid

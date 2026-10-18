@@ -367,6 +367,36 @@ const Capture = struct {
         return null;
     }
 
+    /// Contiguous bytes of the first server-initiated stream whose type byte
+    /// is the QPACK encoder stream (0x02), including that type byte.
+    fn encoderStream(self: *Capture) ?[]const u8 {
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            const stream = entry.value_ptr.*;
+            const data = stream.reasm.buf.items[0..stream.reasm.contiguous];
+            if (data.len > 0 and data[0] == 0x02) return data;
+        }
+        return null;
+    }
+
+    /// True once the peer has FINed a stream and every byte has arrived.
+    fn responseComplete(self: *Capture, stream_id: u64) bool {
+        const stream = self.streams.get(stream_id) orelse return false;
+        return stream.fin and stream.reasm.complete();
+    }
+
+    /// First HEADERS frame payload on a stream. The returned slice points into
+    /// the capture buffer and stays valid until the Capture is deinitialized.
+    fn responseHeadersBlock(self: *Capture, stream_id: u64) ?[]const u8 {
+        const stream = self.streams.get(stream_id) orelse return null;
+        const data = stream.reasm.buf.items[0..stream.reasm.contiguous];
+        var cursor: usize = 0;
+        while (http3.readFrame(data, &cursor)) |frame| {
+            if (frame.frame_type == 0x01) return frame.payload;
+        }
+        return null;
+    }
+
     fn takeResponse(self: *Capture, stream_id: u64) !?CapturedResponse {
         const stream = self.streams.get(stream_id) orelse return null;
         if (!stream.fin or !stream.reasm.complete()) return null;
@@ -950,6 +980,8 @@ const QpackFault = enum {
     encoder_capacity_too_large,
     encoder_entry_too_large,
     decoder_byte,
+    decoder_over_count,
+    section_ack_unknown,
     second_encoder,
     encoder_fin,
     dynamic_reference,
@@ -985,6 +1017,18 @@ fn injectQpackFault(conn: *transport.Connection, fault: QpackFault) !void {
             const id = try conn.createUniStream();
             // Decoder stream type 0x03, then Insert Count Increment 0.
             try conn.queueStreamData(id, &.{ 0x03, 0x00 }, false);
+        },
+        .decoder_over_count => {
+            const id = try conn.createUniStream();
+            // Decoder stream type 0x03, then Insert Count Increment 1 with no
+            // outstanding insert to acknowledge.
+            try conn.queueStreamData(id, &.{ 0x03, 0x01 }, false);
+        },
+        .section_ack_unknown => {
+            const id = try conn.createUniStream();
+            // Decoder stream type 0x03, then Section Acknowledgment for
+            // stream 0, which has no outstanding dynamic section.
+            try conn.queueStreamData(id, &.{ 0x03, 0x80 }, false);
         },
         .second_encoder => {
             const first = try conn.createUniStream();
@@ -1662,4 +1706,235 @@ test "native HTTP/3: extended CONNECT is rejected, not treated as plain CONNECT"
         .{ .name = ":protocol", .value = "websocket" },
     };
     try expectRawStatus(allocator, &extended, handleConnect, 400);
+}
+
+const dynamic_response_value = "0123456789abcdef0123456789abcdef01234567";
+
+fn handleDynamicResponse(_: std.mem.Allocator, _: *const http3.Request) http3.Response {
+    return .{
+        .body = "ok",
+        .headers = &.{.{ .name = "x-long-token", .value = dynamic_response_value }},
+    };
+}
+
+/// True once the captured encoder stream contains at least one complete
+/// insert or duplicate instruction.
+fn encoderHasInsert(bytes: []const u8) bool {
+    var cursor: usize = 1; // stream type 0x02
+    var inserts: usize = 0;
+    while (cursor < bytes.len) {
+        switch (qpack.scanEncoderInstruction(bytes, cursor)) {
+            .incomplete, .invalid => return false,
+            .complete => |done| {
+                if (done.instruction != .set_dynamic_table_capacity) inserts += 1;
+                cursor = done.end;
+            },
+        }
+    }
+    return inserts > 0;
+}
+
+test "native HTTP/3: repeated response header inserts and later references" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    try qtls.setServerCert(@embedFile("../test_cert.pem"), @embedFile("../test_key.pem"));
+    defer qtls.deinitServer();
+
+    var listener = try transport.Listener.init(allocator, 0);
+    defer listener.deinit();
+    var context: Context = .{ .allocator = allocator, .handler = handleDynamicResponse };
+    defer context.deinit();
+    listener.on_connection = .{ .context = &context, .callback = Context.onConnection };
+
+    const port = std.mem.bigToNative(u16, listener.local_addr.port);
+    const client_conn = try transport.Connection.initClient(allocator, "127.0.0.1", port, .{
+        .insecure_skip_verify = true,
+    });
+    defer client_conn.deinit();
+
+    var capture: Capture = .{ .allocator = allocator };
+    defer capture.deinit();
+    client_conn.handler = .{
+        .context = &capture,
+        .on_stream_frame = Capture.onStream,
+        .on_established = Capture.onEstablished,
+        .on_closed = Capture.onClosed,
+    };
+    defer client_conn.handler = null;
+
+    const request_fields = [_]http3.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = ":path", .value = "/dyn" },
+    };
+
+    var buf: [transport.max_datagram_size]u8 = undefined;
+    const deadline = transport.nowNanos() + 12 * std.time.ns_per_s;
+    var settings_sent = false;
+    var increment_sent = false;
+    var first_request: ?u64 = null;
+    var second_request: ?u64 = null;
+    var first_block: ?[]const u8 = null;
+    var second_block: ?[]const u8 = null;
+
+    while (transport.nowNanos() < deadline) {
+        client_conn.service() catch {};
+        _ = listener.readAndDispatch(&buf, 8);
+        listener.serviceAll();
+        for (context.sessions.items) |session| session.service() catch {};
+
+        var peer: std.posix.sockaddr.in = undefined;
+        var peer_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+        const n = std.c.recvfrom(
+            client_conn.socket,
+            buf[0..].ptr,
+            buf.len,
+            std.c.MSG.DONTWAIT,
+            @ptrCast(&peer),
+            &peer_len,
+        );
+        if (n > 0) client_conn.handleDatagram(buf[0..@intCast(n)]) catch {};
+
+        if (client_conn.isEstablished() and !settings_sent) {
+            const id = try client_conn.createUniStream();
+            // Control stream 0x00 + SETTINGS: QPACK max table capacity 4096
+            // and QPACK blocked streams 0.
+            try client_conn.queueStreamData(id, &.{
+                0x00, 0x04, 0x05, 0x01, 0x50, 0x00, 0x07, 0x00,
+            }, false);
+            settings_sent = true;
+        }
+
+        // Wait until the server has applied the peer SETTINGS (capacity 4096,
+        // blocked streams 0) before sending the request; otherwise an early
+        // response would be encoded while the encoder still has capacity zero.
+        if (settings_sent and first_request == null and
+            context.sessions.items.len > 0 and
+            context.sessions.items[0].peerSettingsReceived())
+        {
+            const id = try client_conn.createBidiStream();
+            try queueRequestHeaders(allocator, client_conn, id, &request_fields);
+            first_request = id;
+        }
+
+        if (first_request) |id| {
+            if (first_block == null and capture.responseComplete(id)) {
+                first_block = capture.responseHeadersBlock(id);
+            }
+        }
+
+        // Acknowledge the server's insert as soon as the encoder stream
+        // carries it. The increment is one, not zero.
+        if (first_block != null and !increment_sent) {
+            if (capture.encoderStream()) |bytes| {
+                if (encoderHasInsert(bytes)) {
+                    const id = try client_conn.createUniStream();
+                    try client_conn.queueStreamData(id, &.{ 0x03, 0x01 }, false);
+                    increment_sent = true;
+                }
+            }
+        }
+
+        // Only start the second request once the server has applied the
+        // increment; otherwise response 2 could be encoded before the insert
+        // is safe to reference.
+        if (increment_sent and second_request == null and context.sessions.items.len > 0) {
+            if (context.sessions.items[0].encoder.knownReceivedCount() >= 1) {
+                const id = try client_conn.createBidiStream();
+                try queueRequestHeaders(allocator, client_conn, id, &request_fields);
+                second_request = id;
+            }
+        }
+
+        if (second_request) |id| {
+            if (capture.responseComplete(id)) {
+                second_block = capture.responseHeadersBlock(id);
+                if (second_block != null) break;
+            }
+        }
+
+        if (capture.closed_code != null) return error.ConnectionClosed;
+        transport.sleepNs(std.time.ns_per_ms);
+    }
+
+    const first_payload = first_block orelse return error.NoFirstResponse;
+    const second_payload = second_block orelse return error.NoSecondResponse;
+    const encoder_bytes = capture.encoderStream() orelse return error.NoEncoderStream;
+
+    // Mirror the peer decoder: apply the server's Set Dynamic Table Capacity
+    // and insert instructions. The capacity is announced exactly once.
+    var decoder = qpack.Decoder.init(allocator, 4096);
+    defer decoder.deinit();
+    var cursor: usize = 1;
+    var capacity_updates: usize = 0;
+    while (cursor < encoder_bytes.len) {
+        const done = switch (qpack.scanEncoderInstruction(encoder_bytes, cursor)) {
+            .complete => |value| value,
+            else => return error.InvalidEncoderStream,
+        };
+        if (done.instruction == .set_dynamic_table_capacity) {
+            capacity_updates += 1;
+            try std.testing.expectEqual(@as(?u64, 4096), done.value);
+        }
+        switch (try qpack.applyEncoderInstruction(&decoder, encoder_bytes, cursor)) {
+            .applied => |applied| cursor = applied.end,
+            else => return error.InvalidEncoderStream,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), capacity_updates);
+    try std.testing.expectEqual(@as(u64, 1), decoder.insertCount());
+    const inserted = decoder.table.getRelative(0).?;
+    try std.testing.expectEqualStrings("x-long-token", inserted.name);
+    try std.testing.expectEqualStrings(dynamic_response_value, inserted.value);
+
+    // Response 1 inserts but is static-only: the peer advertised zero blocked
+    // streams, so the fresh insert cannot be referenced yet.
+    var first_headers = try decoder.decodeBlock(first_payload);
+    defer first_headers.deinit();
+    try std.testing.expectEqual(@as(u64, 0), first_headers.required_insert_count);
+    try std.testing.expectEqualStrings(
+        dynamic_response_value,
+        first_headers.get("x-long-token").?,
+    );
+
+    // Response 2, after the Increment, carries an indexed dynamic reference
+    // and a Required Insert Count of one.
+    var second_headers = try decoder.decodeBlock(second_payload);
+    defer second_headers.deinit();
+    try std.testing.expectEqual(@as(u64, 1), second_headers.required_insert_count);
+    try std.testing.expectEqualStrings(
+        dynamic_response_value,
+        second_headers.get("x-long-token").?,
+    );
+}
+
+test "native HTTP/3: Insert Count Increment over-count closes with 0x0203" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    try qtls.setServerCert(@embedFile("../test_cert.pem"), @embedFile("../test_key.pem"));
+    defer qtls.deinitServer();
+
+    try std.testing.expectEqual(
+        http3.qpack_decoder_stream_error,
+        try runQpackFault(allocator, .decoder_over_count),
+    );
+}
+
+test "native HTTP/3: Section Acknowledgment without a reference closes with 0x0203" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    try qtls.setServerCert(@embedFile("../test_cert.pem"), @embedFile("../test_key.pem"));
+    defer qtls.deinitServer();
+
+    try std.testing.expectEqual(
+        http3.qpack_decoder_stream_error,
+        try runQpackFault(allocator, .section_ack_unknown),
+    );
 }

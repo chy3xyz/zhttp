@@ -362,8 +362,8 @@ pub const Session = struct {
     started: bool = false,
     peer_settings_received: bool = false,
     /// QPACK limits advertised by the peer in its SETTINGS frame. They bound
-    /// the peer's decoder, so our static-only encoder must respect them. The
-    /// local advertised limits are qpack_table_capacity / qpack_blocked_streams.
+    /// the peer's decoder, so our encoder must respect them. The local
+    /// advertised limits are qpack_table_capacity / qpack_blocked_streams.
     peer_qpack_max_table_capacity: u64 = 0,
     peer_qpack_blocked_streams: u64 = 0,
     /// Zero when the peer did not advertise a field section size limit.
@@ -373,6 +373,11 @@ pub const Session = struct {
     /// entries. Our SETTINGS advertise 4096 bytes; Insert Count Increment and
     /// Section Acknowledgment bytes are queued on qpack_decoder_stream.
     decoder: qpack.Decoder,
+    /// Encoder-side dynamic table plus the peer's limits. It stages inserts
+    /// and field-section references; qpack_encoder_stream carries the staged
+    /// instructions. Until the peer's SETTINGS arrive its capacity is zero,
+    /// so field sections stay static-only.
+    encoder: qpack.Encoder,
     /// Highest insert count acknowledged to the peer on our decoder stream.
     /// Insert Count Increment always sends the delta to decoder.insertCount().
     decoder_acked_insert_count: u64 = 0,
@@ -441,8 +446,10 @@ pub const Session = struct {
             .handler_context = handler_context,
             .max_body_bytes = max_body_bytes,
             .decoder = qpack.Decoder.init(allocator, @intCast(qpack_table_capacity)),
+            .encoder = qpack.Encoder.init(allocator),
             .retired = retired,
         };
+        errdefer self.encoder.deinit();
         errdefer self.decoder.deinit();
         conn.handler = .{
             .context = self,
@@ -465,6 +472,7 @@ pub const Session = struct {
         while (it.next()) |entry| entry.value_ptr.*.deinit();
         self.streams.deinit(self.allocator);
         self.decoder.deinit();
+        self.encoder.deinit();
         self.retired.deinit();
         self.done_streams.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -574,6 +582,9 @@ pub const Session = struct {
         try writeVarint(&dec, self.allocator, qpack_decoder_stream_type);
         try self.conn.queueStreamData(self.qpack_decoder_stream, dec.items, false);
         self.started = true;
+        // The peer's SETTINGS may already have been applied when begin() runs
+        // late; flush any encoder instructions staged before startup.
+        try self.flushEncoderInstructions();
     }
 
     fn onStreamFrame(
@@ -738,6 +749,27 @@ pub const Session = struct {
         self.peer_qpack_blocked_streams = settings.qpack_blocked_streams;
         self.peer_max_field_section_size = settings.max_field_section_size orelse 0;
         self.peer_settings_received = true;
+        // Size the encoder table from the peer's SETTINGS and stage exactly
+        // one Set Dynamic Table Capacity instruction. A failed staging
+        // attempt leaves the encoder at capacity zero, which keeps encoding
+        // correct (static-only) rather than desynchronized.
+        self.encoder.configure(
+            settings.qpack_max_table_capacity,
+            settings.qpack_blocked_streams,
+        ) catch return;
+        self.flushEncoderInstructions() catch {};
+    }
+
+    /// Queue staged encoder-stream instructions on the local QPACK encoder
+    /// stream (type 0x02). Instructions are staged whole, so a failed queue
+    /// can be retried from service() without splitting one.
+    fn flushEncoderInstructions(self: *Session) !void {
+        if (!self.started or self.conn.isClosed()) return;
+        const pending = self.encoder.pendingInstructions();
+        if (pending.len == 0) return;
+        if (self.conn.pendingStreamBytes(self.qpack_encoder_stream) >= 64 * 1024) return;
+        try self.conn.queueStreamData(self.qpack_encoder_stream, pending, false);
+        self.encoder.clearPendingInstructions();
     }
 
     /// Parse and apply the peer's QPACK encoder-stream instructions. The local
@@ -776,14 +808,16 @@ pub const Session = struct {
         if (self.decoder.insertCount() > insert_count_before) self.retryBlockedStreams();
     }
 
-    /// The peer's QPACK decoder stream may only acknowledge instructions this
-    /// endpoint's encoder sent. That encoder is static-only and never sent a
-    /// dynamic-table instruction, so any complete instruction is
-    /// QPACK_DECODER_STREAM_ERROR.
+    /// Parse the peer's QPACK decoder stream. Section Acknowledgment releases
+    /// the dynamic references held by that stream, Insert Count Increment
+    /// advances known_received_count, and Stream Cancellation drops the
+    /// stream's references. A malformed instruction, an increment of zero or
+    /// beyond the outstanding insert count, or an acknowledgment for a stream
+    /// with nothing outstanding is QPACK_DECODER_STREAM_ERROR (0x0203).
     fn parseQpackDecoder(self: *Session, state: *StreamState) void {
         if (self.conn.isClosed()) return;
         const data = state.reassembler.buf.items[0..state.reassembler.contiguous];
-        const cursor = state.parse_offset;
+        var cursor = state.parse_offset;
         while (cursor < data.len) {
             switch (qpack.scanDecoderInstruction(data, cursor)) {
                 .incomplete => break,
@@ -793,13 +827,31 @@ pub const Session = struct {
                     return;
                 },
                 .complete => |done| {
-                    state.parse_offset = done.end;
-                    self.conn.close(qpack_decoder_stream_error, "unexpected QPACK decoder instruction");
-                    return;
+                    if (!self.applyDecoderInstruction(done.instruction, done.value)) {
+                        state.parse_offset = cursor;
+                        self.conn.close(qpack_decoder_stream_error, "invalid QPACK decoder instruction");
+                        return;
+                    }
+                    cursor = done.end;
                 },
             }
         }
         state.parse_offset = cursor;
+    }
+
+    /// Apply one complete peer decoder-stream instruction. False means a
+    /// protocol violation that maps to 0x0203.
+    fn applyDecoderInstruction(
+        self: *Session,
+        instruction: qpack.DecoderInstruction,
+        value: u64,
+    ) bool {
+        switch (instruction) {
+            .section_acknowledgment => self.encoder.onSectionAcknowledgment(value) catch return false,
+            .stream_cancellation => self.encoder.onStreamCancellation(value),
+            .insert_count_increment => self.encoder.onInsertCountIncrement(value) catch return false,
+        }
+        return true;
     }
 
     fn handleStreamError(self: *Session, state: *StreamState, err: anyerror) void {
@@ -1195,8 +1247,9 @@ pub const Session = struct {
             try fields.append(self.allocator, header);
         }
 
-        const block = try qpack.encode(self.allocator, fields.items);
+        const block = try self.encoder.encodeSection(self.allocator, stream_id, fields.items);
         defer self.allocator.free(block);
+        try self.flushEncoderInstructions();
         var frame: std.ArrayListUnmanaged(u8) = .empty;
         defer frame.deinit(self.allocator);
         try writeFrame(&frame, self.allocator, frame_headers, block);
@@ -1234,6 +1287,7 @@ pub const Session = struct {
     pub fn service(self: *Session) !void {
         self.reapRetired();
         if (!self.started and self.conn.isEstablished()) try self.begin();
+        try self.flushEncoderInstructions();
         self.expireBlockedStreams();
         self.queueInsertCountIncrement();
         self.flushPendingSectionAcks();
@@ -1317,8 +1371,9 @@ pub const Session = struct {
         try fields.append(self.allocator, .{ .name = ":path", .value = path });
         for (headers) |header| try fields.append(self.allocator, header);
 
-        const block = try qpack.encode(self.allocator, fields.items);
+        const block = try self.encoder.encodeSection(self.allocator, stream_id, fields.items);
         defer self.allocator.free(block);
+        try self.flushEncoderInstructions();
 
         var frame: std.ArrayListUnmanaged(u8) = .empty;
         defer frame.deinit(self.allocator);
