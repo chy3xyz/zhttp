@@ -690,8 +690,9 @@ try h3.quic.setServerCert(cert_pem, key_pem);
 
 ### QLog Debugging
 
-The `h3.quic.enableQLog`/`disableQLog` entry points remain for callers, but the
-native transport does not emit qlog yet; they are no-ops.
+Install `Server.Options.qlog` or `Client.Options.qlog` with a `qlog.Sink` to
+emit JSON-SEQ connection, packet, loss, Retry, and error events. The legacy
+`h3.quic.enableQLog`/`disableQLog` entry points remain as no-ops.
 
 ### Alt-Svc Advertisement (HTTP/3 Discovery)
 
@@ -719,19 +720,21 @@ var server = httpz.Server.init(.{
 - `Server.stats()` / `Client.stats()` snapshots for packets, bytes, retransmits,
   streams, flow-control updates, and ACKs
 - Optional qlog JSON-SEQ traces for connections, packets, loss, Retry, and errors
-- Frame-level retransmission: ack-eliciting packets are retained until ACKed
-  and resent under a new packet number after an RTT-derived timeout
-  (2×SRTT, clamped to 200 ms–1 s)
+- zquic-owned loss detection: lost plaintext is reported to the transport,
+  queued, and resent under a new packet number; ACK generation remains in the
+  transport
+- RFC 9000 3x anti-amplification before address validation, and congestion-
+  window enforcement for 1-RTT ack-eliciting packets
+- Retry enabled by default for public-internet address validation
 - Connection- and stream-level flow control, including MAX_DATA,
   MAX_STREAM_DATA, and MAX_STREAMS updates
-- Optional RFC 9000 Retry/address validation with stateless HMAC tokens
+- RFC 9000 Retry/address validation with stateless HMAC tokens
 - A single-threaded UDP event loop, no per-connection thread
 
-Not implemented yet: 0-RTT, connection migration, connection-ID rotation, and
-qlog. Retry/address validation is available opt-in and works in both
-directions. QPACK dynamic-table instructions are rejected
-rather than mis-decoded (SETTINGS advertises a zero-capacity table, which
-conforming peers honor).
+Not implemented yet: 0-RTT, connection migration, connection-ID rotation,
+HTTP/3 push, trailers, and WebSocket/extended CONNECT. qlog covers
+connection/packet/loss/Retry/error events; HTTP-level qlog and the qlog P2/P3
+event set are still pending.
 
 ### Dependencies
 

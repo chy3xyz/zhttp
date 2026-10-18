@@ -92,7 +92,10 @@ duplicate instructions, resolves pre-/post-base dynamic references, parks
 request streams waiting for future inserts, and emits Insert Count Increment,
 Section Acknowledgment, and Stream Cancellation on the local decoder stream.
 A missing insert beyond the blocked limit/timeout is
-QPACK_DECOMPRESSION_FAILED (0x0201). Our encoder remains static-only.
+QPACK_DECOMPRESSION_FAILED (0x0201). The encoder also owns a dynamic table
+bounded by the peer's SETTINGS, with per-field-section reference tracking,
+Insert Count Increment/Section Ack/Stream Cancellation handling, and a 2s
+blocked-section timeout.
 
 ### Connection ID (CID) Routing
 
@@ -139,12 +142,14 @@ enforces the peer's send windows, sends `MAX_DATA`/`MAX_STREAM_DATA` as data
 arrives, and issues `MAX_STREAMS` as peer-initiated streams close. The server
 sets `original_destination_connection_id` and
 `initial_source_connection_id`; the client sets only its own source CID.
-Both sides advertise a zero-capacity QPACK dynamic table.
+Both sides advertise a 4096-byte QPACK decoder dynamic table and 16 blocked
+streams.
 
 ### Retry and Address Validation
 
-`Server.Options.retry` makes the listener challenge a tokenless Initial with
-an HMAC-authenticated Retry before allocating a Connection or Session. The
+`Server.Options.retry` (default true) makes the listener challenge a tokenless
+Initial with an HMAC-authenticated Retry before allocating a Connection or
+Session. The
 token is bound to the client address, retry SCID, client SCID, and original
 DCID, with a 30-second lifetime. After Retry, Initial keys derive from the
 Retry SCID while the transport parameters carry both
