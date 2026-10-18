@@ -845,7 +845,7 @@ test "native HTTP/3: completed requests do not accumulate" {
         }
         // Three locally-created control/QPACK streams remain open; request
         // send/flow entries must not accumulate.
-        try std.testing.expect(client_conn.stream_send.count() <= 4);
+        try std.testing.expect(client_conn.streams.stream_send.count() <= 4);
         try std.testing.expect(client_conn.flow.stream_flow.count() <= 6);
     }
 }

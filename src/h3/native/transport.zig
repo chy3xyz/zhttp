@@ -17,6 +17,7 @@ const retry = @import("retry.zig");
 const stats = @import("stats.zig");
 const qlog = @import("qlog.zig");
 const flow_control = @import("flow_control.zig");
+const stream_table = @import("stream_table.zig");
 
 /// Re-exported so callers can name a snapshot without importing stats.zig.
 pub const Stats = stats.Stats;
@@ -105,54 +106,6 @@ pub const Reassembler = @import("reassembly.zig").Reassembler;
 
 const AckState = ack.AckState;
 
-const StreamSend = struct {
-    buf: std.ArrayListUnmanaged(u8) = .empty,
-    sent: u64 = 0,
-    fin: bool = false,
-    fin_sent: bool = false,
-
-    fn deinit(self: *StreamSend, allocator: std.mem.Allocator) void {
-        self.buf.deinit(allocator);
-    }
-
-    fn pending(self: *const StreamSend) []const u8 {
-        if (self.sent >= self.buf.items.len) return &.{};
-        return self.buf.items[@intCast(self.sent)..];
-    }
-};
-
-/// One STREAM frame selected for a 1-RTT data batch. A claim only becomes
-/// visible in StreamSend.sent / FlowControl.sent_data after the packet carrying
-/// it has been scheduled successfully.
-const StreamClaim = struct {
-    stream_id: u64,
-    offset: u64,
-    len: usize,
-    fin: bool,
-};
-
-/// A stream with work available when a batch was built. `pending` is a slice of
-/// StreamSend.buf taken while no send state is being mutated, `planned` counts
-/// bytes already claimed by this batch, and `credit` is the peer's stream
-/// limit minus the stream's current sent offset.
-const BatchStream = struct {
-    stream_id: u64,
-    pending: []const u8,
-    base: u64,
-    credit: u64,
-    fin_pending: bool,
-    planned: usize = 0,
-    fin_planned: bool = false,
-    claimed: bool = false,
-};
-
-/// Result of assembling one candidate batch.
-const BatchBuild = struct {
-    budget: usize = 0,
-    used: usize = 0,
-    stream_count: usize = 0,
-};
-
 /// 1-RTT control frames gathered for the current service pass, in the order
 /// they are placed ahead of STREAM data. The transport's ACK ranges, flow
 /// limits, and stream-limit counters are advanced by commitControlFrames()
@@ -169,6 +122,62 @@ const ControlBatch = struct {
     fn deinit(self: *ControlBatch, allocator: std.mem.Allocator) void {
         if (self.ack) |ack_frame| ack_frame.deinit(allocator);
         self.frames.deinit(allocator);
+    }
+};
+
+/// Adapts ControlBatch to stream_table.ControlBatch. StreamTable learns only
+/// whether controls are pending, their serialized size, and how to append,
+/// send, or commit them; frame collection and commit stay in this file.
+const ControlBatchBridge = struct {
+    connection: *Connection,
+    batch: *ControlBatch,
+
+    const vtable: stream_table.ControlBatch.VTable = .{
+        .isPending = isPending,
+        .payloadLen = payloadLen,
+        .appendFrames = appendFrames,
+        .sendStandalone = sendStandalone,
+        .commitCoalesced = commitCoalesced,
+    };
+
+    fn interface(self: *ControlBatchBridge) stream_table.ControlBatch {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    fn isPending(raw: *anyopaque) bool {
+        const self: *ControlBatchBridge = @ptrCast(@alignCast(raw));
+        return !self.batch.sent and self.batch.frames.items.len > 0;
+    }
+
+    fn payloadLen(raw: *anyopaque, allocator: std.mem.Allocator) anyerror!usize {
+        const self: *ControlBatchBridge = @ptrCast(@alignCast(raw));
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        for (self.batch.frames.items) |frame| {
+            frame.serialize(&out.writer) catch return error.OutOfMemory;
+        }
+        return out.written().len;
+    }
+
+    fn appendFrames(
+        raw: *anyopaque,
+        allocator: std.mem.Allocator,
+        frames: *std.ArrayListUnmanaged(QuicFrames.Frame),
+    ) anyerror!void {
+        const self: *ControlBatchBridge = @ptrCast(@alignCast(raw));
+        for (self.batch.frames.items) |frame| try frames.append(allocator, frame);
+    }
+
+    fn sendStandalone(raw: *anyopaque, sender: stream_table.Sender) anyerror!void {
+        const self: *ControlBatchBridge = @ptrCast(@alignCast(raw));
+        try self.connection.sendStandaloneControl(self.batch, sender);
+    }
+
+    fn commitCoalesced(raw: *anyopaque) void {
+        const self: *ControlBatchBridge = @ptrCast(@alignCast(raw));
+        self.connection.countCoalescedControl(self.batch);
+        for (self.batch.frames.items) |frame| self.connection.commitControlFrame(frame);
+        self.batch.sent = true;
     }
 };
 
@@ -240,37 +249,6 @@ fn summarizeFrame(summary: *qlog.FrameSummary, frame: QuicFrames.Frame) void {
         .ping, .reset_stream, .stop_sending, .new_token, .new_connection_id, .retire_connection_id, .path_challenge, .path_response, .connection_close, .connection_close_app, .handshake_done => summary.control +|= 1,
         else => summary.other +|= 1,
     }
-}
-
-/// Minimal QUIC varint size for `value`, matching zquic's writeVarint.
-fn varintSize(value: u64) usize {
-    if (value < 0x40) return 1;
-    if (value < 0x4000) return 2;
-    if (value < 0x40000000) return 4;
-    return 8;
-}
-
-/// Serialized STREAM frame bytes excluding `data.len`: frame type, stream ID,
-/// offset, and payload length.
-fn streamFrameOverhead(stream_id: u64, offset: u64, data_len: usize) usize {
-    return 1 + varintSize(stream_id) + varintSize(offset) + varintSize(@intCast(data_len));
-}
-
-/// Largest take whose frame header and data fit in `budget_left`. The length
-/// varint grows at 64/16384, so shrink and re-check until it fits.
-fn streamFrameDataThatFits(fixed_overhead: usize, budget_left: usize, max_take: usize) usize {
-    if (budget_left <= fixed_overhead) return 0;
-    const available = budget_left - fixed_overhead;
-    var take = @min(max_take, available);
-    while (take > 0) {
-        const length_size = varintSize(@intCast(take));
-        if (length_size + take <= available) return take;
-        if (length_size >= available) return 0;
-        const next = available - length_size;
-        if (next >= take) return 0;
-        take = next;
-    }
-    return 0;
 }
 
 /// Maximum lost payloads resent in one service pass. Anything beyond this stays
@@ -465,12 +443,10 @@ pub const Connection = struct {
     qlog: ?*qlog.Writer = null,
     qlog_pending: ?*PendingSends = null,
 
-    stream_send: std.AutoHashMapUnmanaged(u64, StreamSend) = .empty,
+    /// Per-stream send buffers, batching, and retired-stream bookkeeping.
+    streams: stream_table.StreamTable = .{},
     /// Stream windows, connection windows, and stream-count bookkeeping.
     flow: FlowControl,
-    finished_streams: std.ArrayListUnmanaged(u64) = .empty,
-    closed_streams: std.DynamicBitSet = undefined,
-    closed_streams_ready: bool = false,
     /// Plaintexts zquic declared lost, copied out of its callback and awaiting
     /// a new packet number in service. Bounded; oldest entries are evicted.
     lost_queue: std.ArrayListUnmanaged(LostPayload) = .empty,
@@ -765,12 +741,8 @@ pub const Connection = struct {
         self.freeQlog();
         self.retry_token.deinit(self.allocator);
         self.initial_crypto.deinit(self.allocator);
-        var it = self.stream_send.iterator();
-        while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
-        self.stream_send.deinit(self.allocator);
+        self.streams.deinit(self.allocator);
         self.flow.deinit();
-        self.finished_streams.deinit(self.allocator);
-        if (self.closed_streams_ready) self.closed_streams.deinit();
         self.clearLostQueue();
         self.lost_queue.deinit(self.allocator);
         self.tls.destroy();
@@ -907,7 +879,7 @@ pub const Connection = struct {
                 .stream, .stream_fin, .stream_len, .stream_len_fin, .stream_off, .stream_off_fin, .stream_off_len, .stream_off_len_fin => |stream| {
                     ack_eliciting = true;
                     rx_has_stream = true;
-                    if (self.isStreamClosed(stream.stream_id)) continue;
+                    if (self.streams.isStreamClosed(stream.stream_id)) continue;
                     const end = std.math.add(u64, stream.offset, @intCast(stream.data.len)) catch {
                         self.close(0x3, "flow control");
                         return;
@@ -930,7 +902,7 @@ pub const Connection = struct {
                         return;
                     };
                     if (stream.fin and flow.send_fin) {
-                        self.finished_streams.append(self.allocator, stream.stream_id) catch {};
+                        self.streams.finishStream(self.streamContext(), stream.stream_id);
                     }
                     if (self.handler) |handler| {
                         handler.on_stream_frame(
@@ -1197,12 +1169,31 @@ pub const Connection = struct {
         self.handshake_done_pending = true;
     }
 
+    /// Flow-control/statistics context for the stream table. The table never
+    /// receives the Connection itself, only the state it is allowed to touch.
+    fn streamContext(self: *Connection) stream_table.Context {
+        return .{
+            .allocator = self.allocator,
+            .stats = &self.stats,
+            .flow = &self.flow,
+            .local_is_client = self.role == .client,
+            .send_blocked = &test_send_blocked,
+            .batch_observer = .{ .context = null, .record = recordStreamBatch },
+        };
+    }
+
+    fn streamSender(self: *Connection) stream_table.Sender {
+        return .{ .context = self, .schedule = scheduleStreamPacket };
+    }
+
+    fn peerMaxUdpPayload(self: *const Connection) ?u64 {
+        return if (self.peer_params) |params| params.max_udp_payload_size else null;
+    }
+
     /// Find or create flow state; a created entry counts toward
-    /// Stats.streams_opened. The statistics counter stays with Connection.
+    /// Stats.streams_opened. The statistics counter stays with StreamTable.
     fn ensureStreamFlow(self: *Connection, stream_id: u64) !*flow_control.StreamFlow {
-        const ensured = try self.flow.ensureStream(stream_id, self.role == .client);
-        if (ensured.created) self.stats.streams_opened +|= 1;
-        return ensured.flow;
+        return stream_table.ensureStreamFlow(self.streamContext(), stream_id);
     }
 
     fn refreshStreamSendLimits(self: *Connection) void {
@@ -1211,39 +1202,21 @@ pub const Connection = struct {
 
     /// Append stream data and schedule it on the next service pass.
     pub fn queueStreamData(self: *Connection, stream_id: u64, data: []const u8, fin: bool) !void {
-        _ = try self.ensureStreamFlow(stream_id);
-        const entry = try self.stream_send.getOrPut(self.allocator, stream_id);
-        if (!entry.found_existing) entry.value_ptr.* = .{};
-        try entry.value_ptr.buf.appendSlice(self.allocator, data);
-        if (fin) entry.value_ptr.fin = true;
+        return self.streams.queueStreamData(self.streamContext(), stream_id, data, fin);
     }
 
     /// Bytes queued for a stream but not yet written to the socket.
     pub fn pendingStreamBytes(self: *const Connection, stream_id: u64) usize {
-        const send = self.stream_send.get(stream_id) orelse return 0;
-        return send.pending().len;
+        return self.streams.pendingStreamBytes(stream_id);
     }
 
     /// Test-visible copy of one stream's send cursor. The private StreamSend
     /// type stays private; batching tests use this to prove that a failed
     /// schedule advances nothing and a retransmit never advances twice.
-    pub const StreamSendSnapshot = struct {
-        sent: u64,
-        pending: usize,
-        buf_len: usize,
-        fin: bool,
-        fin_sent: bool,
-    };
+    pub const StreamSendSnapshot = stream_table.StreamSendSnapshot;
 
     pub fn streamSendSnapshot(self: *const Connection, stream_id: u64) ?StreamSendSnapshot {
-        const send = self.stream_send.get(stream_id) orelse return null;
-        return .{
-            .sent = send.sent,
-            .pending = send.pending().len,
-            .buf_len = send.buf.items.len,
-            .fin = send.fin,
-            .fin_sent = send.fin_sent,
-        };
+        return self.streams.streamSendSnapshot(stream_id);
     }
 
     /// Test-visible peer stream send limit, or null when the stream has no flow
@@ -1322,243 +1295,30 @@ pub const Connection = struct {
         }
     }
 
-    /// Conservative plaintext budget for one 1-RTT STREAM frame. The QUIC
-    /// header, packet number, AEAD tag, and STREAM frame varints are reserved;
-    /// this replaces the old hardcoded 1000-byte chunk without requiring a
-    /// full packet builder yet.
-    /// Plaintext bytes available in one 1-RTT packet after the short header,
-    /// packet number, and AEAD tag. 24 more bytes are reserved for a STREAM
-    /// frame's type/stream-id/offset/length varints by maxStreamFramePayload.
-    fn maxPacketPayload(self: *const Connection) usize {
-        const advertised = if (self.peer_params) |params| params.max_udp_payload_size else 1472;
-        const mtu: usize = @intCast(std.math.clamp(advertised, 1200, 1472));
-        const overhead: usize = 1 + self.destinationCid(3).len + 4 + 16;
-        if (mtu <= overhead) return 0;
-        return mtu - overhead;
-    }
-
-    fn maxStreamFramePayload(self: *const Connection) usize {
-        const payload = self.maxPacketPayload();
-        if (payload <= 24) return 0;
-        return payload - 24;
-    }
-
-    /// Build one candidate 1-RTT data batch. The caller schedules the frames as
-    /// a single protected packet and only then commits the claims, so a failure
-    /// leaves every stream byte-identical.
-    fn collectStreamBatch(
-        self: *Connection,
-        streams: *std.ArrayListUnmanaged(BatchStream),
-        frames: *std.ArrayListUnmanaged(QuicFrames.Frame),
-        claims: *std.ArrayListUnmanaged(StreamClaim),
-        budget_limit: usize,
-    ) !BatchBuild {
-        var build = BatchBuild{};
-        build.budget = budget_limit;
-        if (build.budget == 0) return build;
-
-        // Snapshot sendable work. No send state is mutated here; flow entries
-        // created by ensureStreamFlow only affect the receive/send limit maps.
-        var it = self.stream_send.iterator();
-        while (it.next()) |entry| {
-            const stream_id = entry.key_ptr.*;
-            if (self.isStreamClosed(stream_id)) continue;
-            const send = entry.value_ptr;
-            const pending = send.pending();
-            if (pending.len == 0) {
-                if (send.fin and !send.fin_sent) {
-                    try streams.append(self.allocator, .{
-                        .stream_id = stream_id,
-                        .pending = &.{},
-                        .base = send.sent,
-                        .credit = 0,
-                        .fin_pending = true,
-                    });
-                }
-                continue;
-            }
-            // A stream whose FIN was already scheduled has no bytes left; be
-            // defensive rather than resend at a stale offset.
-            if (send.fin_sent) continue;
-            const flow = try self.ensureStreamFlow(stream_id);
-            const credit = flow.send_limit -| send.sent;
-            if (credit == 0 or self.flow.sent_data >= self.flow.peer_max_data) {
-                test_send_blocked += 1;
-                continue;
-            }
-            try streams.append(self.allocator, .{
-                .stream_id = stream_id,
-                .pending = pending,
-                .base = send.sent,
-                .credit = credit,
-                .fin_pending = send.fin,
-            });
-        }
-        if (streams.items.len == 0) return build;
-
-        var budget_left = build.budget;
-
-        // FIN-only frames are tiny and latency-sensitive: reserve them before a
-        // large stream can consume the whole shared budget. `fin_planned` keeps
-        // the later data pass from emitting a duplicate FIN.
-        for (streams.items) |*s| {
-            if (s.pending.len != 0 or !s.fin_pending or s.fin_planned) continue;
-            const overhead = streamFrameOverhead(s.stream_id, s.base, 0);
-            if (overhead > budget_left) continue;
-            _ = try self.appendStreamFrame(frames, claims, s, 0, true);
-            budget_left -= overhead;
-        }
-
-        var connection_credit = self.flow.peer_max_data -| self.flow.sent_data;
-        while (budget_left > 0) {
-            var remaining: usize = 0;
-            for (streams.items) |*s| {
-                if (s.planned < s.pending.len) {
-                    if (s.planned < s.credit and connection_credit > 0) remaining += 1;
-                } else if (s.fin_pending and !s.fin_planned) {
-                    remaining += 1;
-                }
-            }
-            if (remaining == 0) break;
-
-            var progressed = false;
-            for (streams.items) |*s| {
-                if (budget_left == 0) break;
-                const data_left = s.pending.len - s.planned;
-                if (data_left == 0) {
-                    if (s.fin_pending and !s.fin_planned) {
-                        const overhead = streamFrameOverhead(s.stream_id, s.base + s.planned, 0);
-                        if (overhead <= budget_left) {
-                            _ = try self.appendStreamFrame(frames, claims, s, 0, true);
-                            budget_left -= overhead;
-                            progressed = true;
-                        }
-                    }
-                    continue;
-                }
-                if (connection_credit == 0) continue;
-                const credit_left = s.credit -| s.planned;
-                if (credit_left == 0) continue;
-
-                // Equal share per active stream keeps a large stream from
-                // monopolizing the packet. Leftover budget goes to a later
-                // round, which is how one stream can contribute several chunks
-                // to the same packet next to other streams.
-                const share = @max(@as(usize, 1), budget_left / remaining);
-                const demand: u64 = @min(@as(u64, @intCast(data_left)), credit_left);
-                const max_take: usize = @intCast(@min(demand, @min(connection_credit, @as(u64, @intCast(share)))));
-                if (max_take == 0) continue;
-                const offset = s.base + s.planned;
-                const fixed = 1 + varintSize(s.stream_id) + varintSize(offset);
-                const take = streamFrameDataThatFits(fixed, budget_left, max_take);
-                if (take == 0) continue;
-                const fin = s.fin_pending and s.planned + take == s.pending.len;
-                const used = try self.appendStreamFrame(frames, claims, s, take, fin);
-                budget_left -= used;
-                connection_credit -= take;
-                progressed = true;
-            }
-            if (!progressed) break;
-        }
-
-        build.used = build.budget - budget_left;
-        for (streams.items) |*s| {
-            if (s.claimed) build.stream_count += 1;
-        }
-        return build;
-    }
-
-    /// Append a STREAM frame and its claim. Offsets are send.sent plus the bytes
-    /// already planned for this stream in this batch, so repeated frames form a
-    /// contiguous range. Never call this after schedule has failed.
-    fn appendStreamFrame(
-        self: *Connection,
-        frames: *std.ArrayListUnmanaged(QuicFrames.Frame),
-        claims: *std.ArrayListUnmanaged(StreamClaim),
-        s: *BatchStream,
-        take: usize,
-        fin: bool,
-    ) !usize {
-        const offset = s.base + s.planned;
-        const data = s.pending[s.planned..][0..take];
-        try frames.append(self.allocator, .{
-            .stream = QuicFrames.StreamFrame.init(s.stream_id, offset, data, fin, true, true),
-        });
-        try claims.append(self.allocator, .{
-            .stream_id = s.stream_id,
-            .offset = offset,
-            .len = take,
-            .fin = fin,
-        });
-        s.planned += take;
-        if (fin) s.fin_planned = true;
-        s.claimed = true;
-        return streamFrameOverhead(s.stream_id, offset, take) + take;
-    }
-
-    /// Commit a scheduled batch. This is the only place send offsets, the
-    /// connection send counter, and FIN state advance.
-    fn commitStreamBatch(self: *Connection, claims: []const StreamClaim) void {
-        for (claims) |claim| {
-            const send = self.stream_send.getPtr(claim.stream_id) orelse continue;
-            // The batch was built from this exact offset. Do not advance twice
-            // if state ever disagrees; the bytes stay queued for a later pass.
-            if (send.sent != claim.offset) continue;
-            if (claim.len > 0) {
-                send.sent = claim.offset + claim.len;
-                self.flow.sent_data += claim.len;
-            }
-            if (claim.fin) {
-                send.fin_sent = true;
-                self.flow.markSendFin(claim.stream_id, self.role == .client);
-                self.finished_streams.append(self.allocator, claim.stream_id) catch {};
-            }
-            if (send.fin_sent and send.sent >= send.buf.items.len) {
-                // zquic retains the protected plaintext until ACK/loss and the
-                // lost-payload queue copies it before a resend, so the stream's
-                // own copy can be released after the FIN frame was successfully
-                // scheduled and committed.
-                send.buf.clearRetainingCapacity();
-                send.sent = 0;
-            }
-        }
-    }
-
     /// Serialized size of a control frame this file emits. Only the coalescible
     /// frame types are handled; callers never pass anything else.
     fn controlFrameLen(frame: QuicFrames.Frame) usize {
         return switch (frame) {
             .ack => |ack_frame| blk: {
                 var len: usize = 1 +
-                    varintSize(ack_frame.largest_acknowledged) +
-                    varintSize(ack_frame.ack_delay) +
-                    varintSize(ack_frame.ack_range_count) +
-                    varintSize(ack_frame.first_ack_range);
+                    stream_table.varintSize(ack_frame.largest_acknowledged) +
+                    stream_table.varintSize(ack_frame.ack_delay) +
+                    stream_table.varintSize(ack_frame.ack_range_count) +
+                    stream_table.varintSize(ack_frame.first_ack_range);
                 for (ack_frame.ack_ranges) |range| {
-                    len += varintSize(range.gap) + varintSize(range.ack_range_length);
+                    len += stream_table.varintSize(range.gap) + stream_table.varintSize(range.ack_range_length);
                 }
                 break :blk len;
             },
-            .max_data => |max_data| 1 + varintSize(max_data.maximum_data),
+            .max_data => |max_data| 1 + stream_table.varintSize(max_data.maximum_data),
             .max_stream_data => |max_stream| 1 +
-                varintSize(max_stream.stream_id) +
-                varintSize(max_stream.maximum_stream_data),
+                stream_table.varintSize(max_stream.stream_id) +
+                stream_table.varintSize(max_stream.maximum_stream_data),
             .max_streams_bidi, .max_streams_uni => |max_streams| 1 +
-                varintSize(max_streams.maximum_streams),
+                stream_table.varintSize(max_streams.maximum_streams),
             .handshake_done => 1,
             else => 0,
         };
-    }
-
-    /// Exact serialized size of the gathered control frames. Used to reserve
-    /// room in the first data packet without an extra frame-size table.
-    fn controlPayloadLen(self: *Connection, control: *const ControlBatch) !usize {
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        for (control.frames.items) |frame| {
-            frame.serialize(&out.writer) catch return error.OutOfMemory;
-        }
-        return out.written().len;
     }
 
     fn countCoalescedControl(self: *Connection, control: *const ControlBatch) void {
@@ -1616,9 +1376,16 @@ pub const Connection = struct {
     /// protected packet stays within the plaintext budget. Each successfully
     /// scheduled chunk is committed immediately; a later failure leaves only
     /// the not-yet-sent frames for the next service pass.
-    fn sendStandaloneControl(self: *Connection, control: *ControlBatch) !void {
+    fn sendStandaloneControl(
+        self: *Connection,
+        control: *ControlBatch,
+        sender: stream_table.Sender,
+    ) !void {
         var start: usize = 0;
-        const limit = self.maxPacketPayload();
+        const limit = stream_table.maxPacketPayload(
+            self.peerMaxUdpPayload(),
+            self.destinationCid(3).len,
+        );
         while (start < control.frames.items.len) {
             var end = start;
             var used: usize = 0;
@@ -1630,7 +1397,7 @@ pub const Connection = struct {
                 if (used >= limit) break;
             }
             if (end == start) end += 1; // a single frame larger than one packet
-            try self.schedule(3, .one_rtt, control.frames.items[start..end]);
+            try sender.scheduleFrames(control.frames.items[start..end]);
 
             var has_ack = false;
             for (control.frames.items[start..end]) |frame| {
@@ -1650,7 +1417,7 @@ pub const Connection = struct {
     fn finishControlFrames(self: *Connection, control: *ControlBatch) !void {
         if (control.sent or control.frames.items.len == 0) return;
         if (!self.application_keys or self.closed) return;
-        try self.sendStandaloneControl(control);
+        try self.sendStandaloneControl(control, self.streamSender());
     }
 
     /// Gather the 1-RTT control frame set for this service pass. Nothing is
@@ -1691,128 +1458,31 @@ pub const Connection = struct {
         try self.flow.collectStreamLimitFrames(&control.frames);
     }
 
-    /// Build and schedule 1-RTT packets. control is the same set gathered at
-    /// the start of the service pass; when it fits, its frames are placed
-    /// before the first STREAM frame of the first packet. Bookkeeping for both
-    /// the controls and the stream claims is committed only after schedule()
-    /// succeeds, and the control set is sent at most once per pass.
+    /// Thin forwarding wrapper: the batch builder and its transactional commit
+    /// live in stream_table.zig. Controls are passed through an opaque interface
+    /// so ACK/flow collection and commit stay in this file.
     fn flushStreams(self: *Connection, control: ?*ControlBatch) !void {
         if (!self.application_keys) return;
 
-        var frames: std.ArrayListUnmanaged(QuicFrames.Frame) = .empty;
-        defer frames.deinit(self.allocator);
-        var claims: std.ArrayListUnmanaged(StreamClaim) = .empty;
-        defer claims.deinit(self.allocator);
-        var streams: std.ArrayListUnmanaged(BatchStream) = .empty;
-        defer streams.deinit(self.allocator);
-
-        var control_pending = if (control) |batch|
-            !batch.sent and batch.frames.items.len > 0
-        else
-            false;
-        const packet_budget = self.maxStreamFramePayload();
-
-        // At most 64 protected data packets per service pass. Each packet is a
-        // transaction: build, schedule, then commit. schedule() failures leave
-        // every claim and control frame uncommitted, so the next service pass
-        // retries the same bytes at the same offsets and does not resend an
-        // ACK/MAX_* that was never scheduled.
-        var guard: usize = 0;
-        while (guard < 64) : (guard += 1) {
-            frames.clearRetainingCapacity();
-            claims.clearRetainingCapacity();
-            streams.clearRetainingCapacity();
-
-            var control_len: usize = 0;
-            if (control_pending) control_len = try self.controlPayloadLen(control.?);
-
-            // Reserve the control bytes only when at least a minimal STREAM
-            // frame still fits; otherwise the controls go out alone first.
-            const reserve_control = control_pending and
-                control_len < packet_budget and
-                packet_budget - control_len > 26;
-            if (reserve_control) {
-                for (control.?.frames.items) |frame| {
-                    try frames.append(self.allocator, frame);
-                }
-            }
-
-            const budget = if (reserve_control) packet_budget - control_len else packet_budget;
-            const build = try self.collectStreamBatch(&streams, &frames, &claims, budget);
-
-            if (claims.items.len == 0) {
-                if (control_pending) {
-                    // No STREAM data to coalesce with: send the control set on
-                    // its own (split if necessary), then rebuild with the full
-                    // budget in case streams became sendable in between.
-                    if (reserve_control) frames.clearRetainingCapacity();
-                    try self.sendStandaloneControl(control.?);
-                    control_pending = false;
-                    continue;
-                }
-                break;
-            }
-            if (control_pending and !reserve_control) {
-                // The control set does not fit next to data. Sending it once
-                // first keeps ACK/flow state timely and guarantees it is not
-                // duplicated into a later data packet in this pass.
-                try self.sendStandaloneControl(control.?);
-                control_pending = false;
-                continue;
-            }
-
-            try self.schedule(3, .one_rtt, frames.items);
-
-            if (reserve_control) {
-                self.countCoalescedControl(control.?);
-                for (control.?.frames.items) |frame| self.commitControlFrame(frame);
-                control.?.sent = true;
-                control_pending = false;
-            }
-            self.commitStreamBatch(claims.items);
-
-            test_batch_packets +|= 1;
-            test_batch_stream_frames +|= @intCast(claims.items.len);
-            if (claims.items.len > 1) test_batch_multi_frame_packets +|= 1;
-            if (build.stream_count > 1) test_batch_multi_stream_packets +|= 1;
-            const plaintext_used = build.used + control_len;
-            test_batch_largest_payload = @max(test_batch_largest_payload, plaintext_used);
-            test_batch_budget = packet_budget;
+        var bridge: ControlBatchBridge = undefined;
+        var iface: stream_table.ControlBatch = undefined;
+        var table_control: ?*stream_table.ControlBatch = null;
+        if (control) |batch| {
+            bridge = .{ .connection = self, .batch = batch };
+            iface = bridge.interface();
+            table_control = &iface;
         }
-        self.reapFinishedStreams();
-    }
 
-    fn markStreamClosed(self: *Connection, stream_id: u64) void {
-        const index: usize = @intCast(stream_id >> 2);
-        if (!self.closed_streams_ready) {
-            self.closed_streams = std.DynamicBitSet.initEmpty(self.allocator, 0) catch return;
-            self.closed_streams_ready = true;
-        }
-        if (index >= self.closed_streams.capacity()) {
-            self.closed_streams.resize(index + 64, false) catch return;
-        }
-        self.closed_streams.set(index);
-    }
-
-    fn isStreamClosed(self: *const Connection, stream_id: u64) bool {
-        if (!self.closed_streams_ready) return false;
-        const index: usize = @intCast(stream_id >> 2);
-        return index < self.closed_streams.capacity() and self.closed_streams.isSet(index);
-    }
-
-    fn reapFinishedStreams(self: *Connection) void {
-        for (self.finished_streams.items) |stream_id| {
-            if (self.stream_send.fetchRemove(stream_id)) |entry| {
-                var send = entry.value;
-                send.deinit(self.allocator);
-            }
-            if (self.flow.isFinished(stream_id)) {
-                self.markStreamClosed(stream_id);
-                self.flow.removeStream(stream_id);
-                self.stats.streams_closed +|= 1;
-            }
-        }
-        self.finished_streams.clearRetainingCapacity();
+        const packet_budget = stream_table.maxStreamFramePayload(
+            self.peerMaxUdpPayload(),
+            self.destinationCid(3).len,
+        );
+        try self.streams.flushStreams(
+            self.streamContext(),
+            self.streamSender(),
+            table_control,
+            packet_budget,
+        );
     }
 
     fn schedule(
@@ -2182,7 +1852,7 @@ pub const Connection = struct {
 
         try self.flushStreams(&control);
         try self.finishControlFrames(&control);
-        self.reapFinishedStreams();
+        self.streams.reapFinishedStreams(self.streamContext());
 
         try self.sendAcks();
         try self.flush();
@@ -2238,6 +1908,24 @@ pub const Connection = struct {
         return 10 * std.time.ns_per_ms;
     }
 };
+
+/// Sender adapter used by StreamTable. It always schedules a 1-RTT packet.
+fn scheduleStreamPacket(context: *anyopaque, frames: []const QuicFrames.Frame) anyerror!void {
+    const self: *Connection = @ptrCast(@alignCast(context));
+    try self.schedule(3, .one_rtt, frames);
+}
+
+/// Keep the process-wide batching counters owned by transport.zig; StreamTable
+/// reports each successful batch without importing test state.
+fn recordStreamBatch(_: ?*anyopaque, observation: stream_table.BatchObservation) void {
+    test_batch_packets +|= 1;
+    test_batch_stream_frames +|= @intCast(observation.frame_count);
+    if (observation.frame_count > 1) test_batch_multi_frame_packets +|= 1;
+    if (observation.stream_count > 1) test_batch_multi_stream_packets +|= 1;
+    const plaintext_used = observation.payload_used + observation.control_len;
+    test_batch_largest_payload = @max(test_batch_largest_payload, plaintext_used);
+    test_batch_budget = observation.packet_budget;
+}
 
 /// UDP listener that routes datagrams by destination connection ID.
 pub const Listener = struct {
