@@ -5,6 +5,7 @@ test {
     _ = @import("h3/native/qpack.zig");
     _ = @import("h3/native/qtls.zig");
     _ = @import("h3/native/transport.zig");
+    _ = @import("h3/native/crypto_stream_test.zig");
     _ = @import("h3/native/stream_table_test.zig");
     _ = @import("h3/native/flow_control_test.zig");
     _ = @import("h3/native/stats_test.zig");

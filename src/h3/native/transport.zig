@@ -18,6 +18,7 @@ const stats = @import("stats.zig");
 const qlog = @import("qlog.zig");
 const flow_control = @import("flow_control.zig");
 const stream_table = @import("stream_table.zig");
+const crypto_stream = @import("crypto_stream.zig");
 
 /// Re-exported so callers can name a snapshot without importing stats.zig.
 pub const Stats = stats.Stats;
@@ -25,13 +26,10 @@ pub const Stats = stats.Stats;
 const FlowControl = flow_control.FlowControl;
 
 const Packet = zquic.Packet;
-const PacketCrypto = zquic.PacketCrypto;
 const QuicFrames = zquic.core.QuicFrames;
 const TransportParametersMod = zquic.core.TransportParameters;
 const TransportParameters = TransportParametersMod.TransportParameters;
 const NegotiationContext = TransportParametersMod.NegotiationContext;
-const Tls13KeySchedule = zquic.Tls13KeySchedule;
-const EnhancedTlsContext = zquic.EnhancedCrypto.EnhancedTlsContext;
 
 pub const Error = error{
     QuicError,
@@ -382,6 +380,17 @@ fn observeZquicLostPacket(
     self.queueLostPayload(level, packet_number, payload);
 }
 
+/// Packet-scheduling adapter for crypto_stream.Sender.
+fn scheduleCryptoPacket(
+    context: *anyopaque,
+    level: usize,
+    ptype: Packet.PacketType,
+    frames: []const QuicFrames.Frame,
+) anyerror!void {
+    const self: *Connection = @ptrCast(@alignCast(context));
+    return self.schedule(level, ptype, frames);
+}
+
 pub const Connection = struct {
     allocator: std.mem.Allocator,
     role: Role,
@@ -391,9 +400,8 @@ pub const Connection = struct {
     local_addr: posix.sockaddr.in,
 
     quic: zquic.Connection.Connection,
-    tls_ctx: EnhancedTlsContext,
-    packet_crypto: PacketCrypto,
-    tls: *qtls.Tls,
+    /// TLS context, packet protection, CRYPTO reassembly, and RFC 9001 keys.
+    crypto: crypto_stream.CryptoStream,
 
     local_cid: [20]u8 = @splat(0),
     local_cid_len: u8 = cid_len,
@@ -409,18 +417,9 @@ pub const Connection = struct {
     /// Token from the accepted Retry, copied out of the datagram so it stays
     /// valid for every Initial this connection sends afterwards.
     retry_token: std.ArrayListUnmanaged(u8) = .empty,
-    /// Plaintext CRYPTO bytes TLS produced at the Initial level. A Retry must
-    /// resend the identical ClientHello without resetting the TLS transcript,
-    /// so the bytes are kept instead of relying on TLS to emit them again.
-    initial_crypto: std.ArrayListUnmanaged(u8) = .empty,
 
     largest_pn: [4]?u64 = .{ null, null, null, null },
     acks: [4]AckState = .{ .{}, .{}, .{}, .{} },
-    crypto_rx: [4]Reassembler,
-    crypto_tx_offset: [4]u64 = .{ 0, 0, 0, 0 },
-    secrets: [qtls.level_count]qtls.SecretSet = .{ .{}, .{}, .{}, .{} },
-    handshake_keys: bool = false,
-    application_keys: bool = false,
     peer_params_applied: bool = false,
     peer_params: ?TransportParameters = null,
     local_params: []u8 = &.{},
@@ -500,10 +499,7 @@ pub const Connection = struct {
             .remote_addr = remote,
             .local_addr = .{ .family = posix.AF.INET, .port = 0, .addr = 0, .zero = @splat(0) },
             .quic = undefined,
-            .tls_ctx = undefined,
-            .packet_crypto = undefined,
-            .tls = undefined,
-            .crypto_rx = undefined,
+            .crypto = undefined,
             .flow = FlowControl.init(
                 allocator,
                 options.initial_max_data,
@@ -528,10 +524,10 @@ pub const Connection = struct {
         self.local_params = try allocator.dupe(u8, params);
         errdefer allocator.free(self.local_params);
 
-        self.tls = try qtls.Tls.initClient(allocator, host, self.local_params, options);
-        errdefer self.tls.destroy();
+        const tls = try qtls.Tls.initClient(allocator, host, self.local_params, options);
+        self.crypto.attachTls(tls);
 
-        try self.tls.drive();
+        try self.crypto.drive();
         try self.afterTlsProgress();
         try self.flushCrypto();
         try self.flush();
@@ -598,10 +594,7 @@ pub const Connection = struct {
             .remote_addr = remote_addr,
             .local_addr = local_addr,
             .quic = undefined,
-            .tls_ctx = undefined,
-            .packet_crypto = undefined,
-            .tls = undefined,
-            .crypto_rx = undefined,
+            .crypto = undefined,
             .flow = FlowControl.init(allocator, local_max_data, local_max_stream_data),
             .last_activity_us = nowMicros(),
             .handshake_started_us = nowMicros(),
@@ -630,8 +623,8 @@ pub const Connection = struct {
         self.local_params = try allocator.dupe(u8, params);
         errdefer allocator.free(self.local_params);
 
-        self.tls = try qtls.Tls.initServer(allocator, self.local_params);
-        errdefer self.tls.destroy();
+        const tls = try qtls.Tls.initServer(allocator, self.local_params);
+        self.crypto.attachTls(tls);
         return self;
     }
 
@@ -691,15 +684,20 @@ pub const Connection = struct {
         );
     }
 
+    /// Packet-scheduling seam for the CRYPTO state. CRYPTO framing lives in
+    /// crypto_stream.zig; packet construction stays here.
+    fn cryptoSender(self: *Connection) crypto_stream.Sender {
+        return .{ .context = self, .schedule_fn = scheduleCryptoPacket };
+    }
+
     fn initCrypto(self: *Connection, initial_dcid: []const u8) !void {
+        try self.crypto.init(self.allocator, self.role == .server, initial_dcid);
+        errdefer self.crypto.deinit();
+
         const role: ConnRole = switch (self.role) {
             .client => .client,
             .server => .server,
         };
-        self.tls_ctx = try EnhancedTlsContext.init(self.allocator, self.role == .server, .aes_128_gcm_sha256);
-        errdefer self.tls_ctx.deinit();
-        self.packet_crypto = try PacketCrypto.init(self.allocator, &self.tls_ctx, null);
-        errdefer self.packet_crypto.deinit();
         self.quic = try zquic.Connection.Connection.init(self.allocator, role, .{});
         errdefer self.quic.deinit();
         // zquic owns loss detection and names the lost plaintexts; the observer
@@ -707,25 +705,11 @@ pub const Connection = struct {
         // enabled so a tail loss (no later packet to ACK) still elicits an ACK,
         // which lets zquic's detector surface the original packet.
         self.quic.super_connection.setLostPacketObserver(observeZquicLostPacket, self);
-
-        var initialized: usize = 0;
-        errdefer for (self.crypto_rx[0..initialized]) |*r| r.deinit();
-        for (&self.crypto_rx) |*r| {
-            r.* = try Reassembler.init(self.allocator);
-            initialized += 1;
-        }
-        if (self.role == .client) {
-            try self.packet_crypto.installRfc9001ClientInitialKeys(initial_dcid);
-        } else {
-            try self.packet_crypto.installRfc9001ServerInitialKeys(initial_dcid);
-        }
     }
 
     fn deinitCrypto(self: *Connection) void {
-        for (&self.crypto_rx) |*r| r.deinit();
         self.quic.deinit();
-        self.packet_crypto.deinit();
-        self.tls_ctx.deinit();
+        self.crypto.deinit();
     }
 
     pub fn deinit(self: *Connection) void {
@@ -740,12 +724,10 @@ pub const Connection = struct {
         }
         self.freeQlog();
         self.retry_token.deinit(self.allocator);
-        self.initial_crypto.deinit(self.allocator);
         self.streams.deinit(self.allocator);
         self.flow.deinit();
         self.clearLostQueue();
         self.lost_queue.deinit(self.allocator);
-        self.tls.destroy();
         self.deinitCrypto();
         if (self.local_params.len > 0) self.allocator.free(self.local_params);
         if (self.owns_socket) closeSocket(self.socket);
@@ -843,7 +825,7 @@ pub const Connection = struct {
         }
 
         const idx = levelIndexForPacketType(header.packet_type);
-        var processed = self.packet_crypto.processProtectedRawPacket(packet, self.largest_pn[idx]) catch return;
+        var processed = self.crypto.packet_crypto.processProtectedRawPacket(packet, self.largest_pn[idx]) catch return;
         defer processed.deinit(self.allocator);
         self.largest_pn[idx] = processed.packet_number;
         // 0-RTT is not implemented; never let replayable early data reach the
@@ -868,11 +850,10 @@ pub const Connection = struct {
                 .crypto => |crypto| {
                     if (processed.encryption_level == .early_data) continue;
                     const tls_level = tlsLevel(processed.encryption_level);
-                    const fresh = self.crypto_rx[idx].insert(crypto.offset, crypto.data, false) catch continue;
-                    if (fresh.len > 0) {
-                        try self.tls.pushCrypto(tls_level, fresh);
-                        try self.tls.drive();
-                        try self.afterTlsProgress();
+                    switch (try self.crypto.feed(tls_level, crypto.offset, crypto.data)) {
+                        .skipped => continue,
+                        .buffered => {},
+                        .advanced => try self.afterTlsProgress(),
                     }
                     ack_eliciting = true;
                 },
@@ -1021,12 +1002,8 @@ pub const Connection = struct {
 
         // Prepare every fallible allocation before committing the retried
         // state, so a failure leaves the original Initial key set usable.
-        var fresh_crypto_rx = try Reassembler.init(self.allocator);
-        var fresh_rx_owned = true;
-        errdefer if (fresh_rx_owned) fresh_crypto_rx.deinit();
         try self.retry_token.resize(self.allocator, retry_packet.token.len);
         @memcpy(self.retry_token.items, retry_packet.token);
-        try self.packet_crypto.installRfc9001ClientInitialKeys(retry_packet.src_conn_id.bytes());
 
         self.retry_received = true;
         self.retry_scid_len = @intCast(retry_packet.src_conn_id.bytes().len);
@@ -1042,63 +1019,24 @@ pub const Connection = struct {
         // Initial keys. zquic owns sent-packet retention now; queued lost
         // Initial payloads from before the Retry must never be resent with the
         // new keys.
-        self.packet_crypto.resetInitialPacketNumberState();
-        self.packet_crypto.initial_token = self.retry_token.items;
         self.clearLostQueue();
         self.quic.super_connection.discardPacketNumberSpace(.initial);
-        self.crypto_tx_offset[0] = 0;
         self.largest_pn[0] = null;
         self.acks[0] = .{};
-        self.crypto_rx[0].deinit();
-        self.crypto_rx[0] = fresh_crypto_rx;
-        fresh_rx_owned = false;
 
         test_retry_accepted += 1;
-        try self.resendInitialCrypto();
+        try self.crypto.retryInitial(retry_packet.src_conn_id.bytes(), self.retry_token.items, self.cryptoSender());
         try self.flush();
     }
 
-    /// Resend the cached Initial CRYPTO bytes after a Retry.
-    ///
-    /// The payload is identical to the original flight (same ClientHello,
-    /// same chunking, same offsets); only the packet protection keys, the
-    /// destination CID, and the header token change.
-    fn resendInitialCrypto(self: *Connection) !void {
-        const bytes = self.initial_crypto.items;
-        if (bytes.len == 0) return error.QuicError;
-        var offset: usize = 0;
-        while (offset < bytes.len) {
-            const take: usize = @min(bytes.len - offset, 1000);
-            const frame = [_]QuicFrames.Frame{
-                .{ .crypto = QuicFrames.CryptoFrame.init(offset, bytes[offset .. offset + take]) },
-            };
-            try self.schedule(0, .initial, &frame);
-            offset += take;
-        }
-        self.crypto_tx_offset[0] = bytes.len;
-    }
-
     fn afterTlsProgress(self: *Connection) !void {
-        for ([_]usize{ 2, 3 }) |level| {
-            const incoming = self.tls.takeSecrets(level);
-            if (incoming.local) |secret| self.secrets[level].local = secret;
-            if (incoming.remote) |secret| self.secrets[level].remote = secret;
+        const progress = try self.crypto.progress(self.cryptoSender());
+
+        if (!self.peer_params_applied) {
+            if (progress.peer_params) |encoded| self.applyPeerParams(encoded) catch {};
         }
 
-        if (!self.handshake_keys and self.secrets[2].complete()) {
-            try self.installLevelKeys(2);
-        }
-        if (!self.application_keys and self.secrets[3].complete()) {
-            try self.installLevelKeys(3);
-        }
-
-        if (!self.peer_params_applied and self.tls.peerParams().len > 0) {
-            self.applyPeerParams(self.tls.peerParams()) catch {};
-        }
-
-        try self.flushCrypto();
-
-        if (!self.established and self.tls.isFinished()) {
+        if (!self.established and progress.finished) {
             self.established = true;
             self.quic.super_connection.state = .established;
             if (self.role == .server and !self.handshake_done_sent) {
@@ -1110,21 +1048,6 @@ pub const Connection = struct {
                     handler.on_established(handler.context) catch {};
                 }
             }
-        }
-    }
-
-    fn installLevelKeys(self: *Connection, level: usize) !void {
-        const secrets = self.secrets[level];
-        const local_secret = secrets.local orelse return;
-        const remote_secret = secrets.remote orelse return;
-        const local_keys = try Tls13KeySchedule.deriveQuicPacketKeys(&local_secret);
-        const remote_keys = try Tls13KeySchedule.deriveQuicPacketKeys(&remote_secret);
-        if (level == 2) {
-            try self.packet_crypto.installRfc9001HandshakeKeys(&local_keys, &remote_keys);
-            self.handshake_keys = true;
-        } else {
-            try self.packet_crypto.installRfc9001ApplicationKeys(&local_keys, &remote_keys);
-            self.application_keys = true;
         }
     }
 
@@ -1165,7 +1088,7 @@ pub const Connection = struct {
     /// it ahead of STREAM data when the packet has room; otherwise the
     /// standalone control path sends it before flush() drains the datagrams.
     fn sendHandshakeDone(self: *Connection) !void {
-        if (!self.application_keys) return;
+        if (!self.crypto.application_keys) return;
         self.handshake_done_pending = true;
     }
 
@@ -1249,50 +1172,10 @@ pub const Connection = struct {
         return stream.id;
     }
 
+    /// Flush TLS handshake output. Chunking, padding, and the Initial replay
+    /// cache live in crypto_stream.zig; scheduling stays with the transport.
     fn flushCrypto(self: *Connection) !void {
-        for (0..qtls.level_count) |level| {
-            if (level == 1) {
-                // 0-RTT is not implemented; discard anything TLS produced for it.
-                self.tls.clearOut(level);
-                continue;
-            }
-            const data = self.tls.takeOut(level);
-            if (data.len == 0) continue;
-            if (level == 0) {
-                // Keep a copy so an accepted Retry can replay the exact same
-                // CRYPTO stream under new Initial keys and a token.
-                try self.initial_crypto.appendSlice(self.allocator, data);
-            }
-            var offset: usize = 0;
-            while (offset < data.len) {
-                const take: usize = @min(data.len - offset, 1000);
-                var frames_buf: [2]QuicFrames.Frame = undefined;
-                frames_buf[0] = .{ .crypto = QuicFrames.CryptoFrame.init(self.crypto_tx_offset[level], data[offset .. offset + take]) };
-                var frame_count: usize = 1;
-                // RFC 9000 Section 14.1: every datagram carrying an Initial
-                // packet must be at least 1200 bytes. A ClientHello larger than
-                // one packet is split above, so each piece needs its own pad.
-                if (level == 0) {
-                    const overhead: usize = 40; // header + AEAD tag, with slack
-                    if (take + overhead < 1200) {
-                        const padding_len: usize = 1200 - overhead - take;
-                        if (padding_len > 0) {
-                            frames_buf[1] = .{ .padding = QuicFrames.PaddingFrame.init(padding_len) };
-                            frame_count = 2;
-                        }
-                    }
-                }
-                const ptype: Packet.PacketType = switch (level) {
-                    0 => .initial,
-                    2 => .handshake,
-                    else => .one_rtt,
-                };
-                try self.schedule(level, ptype, frames_buf[0..frame_count]);
-                self.crypto_tx_offset[level] += take;
-                offset += take;
-            }
-            self.tls.clearOut(level);
-        }
+        try self.crypto.flush(self.cryptoSender());
     }
 
     /// Serialized size of a control frame this file emits. Only the coalescible
@@ -1416,7 +1299,7 @@ pub const Connection = struct {
     /// Send any control frames flushStreams() could not place in a data packet.
     fn finishControlFrames(self: *Connection, control: *ControlBatch) !void {
         if (control.sent or control.frames.items.len == 0) return;
-        if (!self.application_keys or self.closed) return;
+        if (!self.crypto.application_keys or self.closed) return;
         try self.sendStandaloneControl(control, self.streamSender());
     }
 
@@ -1424,7 +1307,7 @@ pub const Connection = struct {
     /// committed here: ACK ranges stay required, recv limits stay put, and
     /// MAX_STREAMS bookkeeping is untouched until a packet is scheduled.
     fn collectControlFrames(self: *Connection, control: *ControlBatch) !void {
-        if (!self.application_keys or self.closed) return;
+        if (!self.crypto.application_keys or self.closed) return;
         try self.collectAckFrame(control);
         try self.collectFlowControlFrames(control);
         try self.collectStreamLimitFrames(control);
@@ -1462,7 +1345,7 @@ pub const Connection = struct {
     /// live in stream_table.zig. Controls are passed through an opaque interface
     /// so ACK/flow collection and commit stay in this file.
     fn flushStreams(self: *Connection, control: ?*ControlBatch) !void {
-        if (!self.application_keys) return;
+        if (!self.crypto.application_keys) return;
 
         var bridge: ControlBatchBridge = undefined;
         var iface: stream_table.ControlBatch = undefined;
@@ -1522,7 +1405,7 @@ pub const Connection = struct {
         if (log_packet) {
             for (frames) |frame| summarizeFrame(&frame_summary, frame);
         }
-        const packet_number = self.packet_crypto.nextPacketNumberForLevel(switch (level) {
+        const packet_number = self.crypto.packet_crypto.nextPacketNumberForLevel(switch (level) {
             0 => .initial,
             2 => .handshake,
             else => .application,
@@ -1534,7 +1417,7 @@ pub const Connection = struct {
         const plaintext = payload.toOwnedSlice() catch return error.OutOfMemory;
         const plaintext_ptr = plaintext.ptr;
         self.quic.super_connection.sendProtectedRawPacketOwnedPlaintext(
-            &self.packet_crypto,
+            &self.crypto.packet_crypto,
             switch (level) {
                 0 => .initial,
                 2 => .handshake,
@@ -1643,7 +1526,7 @@ pub const Connection = struct {
             return .retry;
         }
         const src: []const u8 = if (packet_type == .one_rtt) &.{} else self.local_cid[0..self.local_cid_len];
-        const packet_number = self.packet_crypto.nextPacketNumberForLevel(switch (lost.level) {
+        const packet_number = self.crypto.packet_crypto.nextPacketNumberForLevel(switch (lost.level) {
             0 => .initial,
             2 => .handshake,
             else => .application,
@@ -1658,7 +1541,7 @@ pub const Connection = struct {
         }
         const send_result = switch (lost.level) {
             0 => self.quic.super_connection.sendProtectedRawPacket(
-                &self.packet_crypto,
+                &self.crypto.packet_crypto,
                 .initial,
                 packet_type,
                 dest,
@@ -1666,7 +1549,7 @@ pub const Connection = struct {
                 lost.payload,
             ),
             2 => self.quic.super_connection.sendProtectedRawPacket(
-                &self.packet_crypto,
+                &self.crypto.packet_crypto,
                 .handshake,
                 packet_type,
                 dest,
@@ -1674,7 +1557,7 @@ pub const Connection = struct {
                 lost.payload,
             ),
             else => self.quic.super_connection.sendProtectedRawPacket(
-                &self.packet_crypto,
+                &self.crypto.packet_crypto,
                 .application,
                 packet_type,
                 dest,
@@ -1835,7 +1718,7 @@ pub const Connection = struct {
         // the transport for this milestone.
         const recovery_now: u64 = @intCast(@max(zquic.Time.nowMicros(), 0));
         _ = self.quic.super_connection.pollLossRecovery(
-            &self.packet_crypto,
+            &self.crypto.packet_crypto,
             recovery_now,
             self.destinationCid(0),
             self.local_cid[0..self.local_cid_len],
@@ -1863,7 +1746,7 @@ pub const Connection = struct {
     fn sendAcks(self: *Connection) !void {
         for ([_]usize{ 0, 2 }) |level| {
             if (!self.acks[level].ack_required or self.acks[level].count == 0) continue;
-            if (level == 2 and !self.handshake_keys) continue;
+            if (level == 2 and !self.crypto.handshake_keys) continue;
             var ack_frame = self.acks[level].buildFrame(self.allocator) catch continue;
             defer ack_frame.deinit(self.allocator);
             const ptype: Packet.PacketType = if (level == 0) .initial else .handshake;
@@ -1878,7 +1761,7 @@ pub const Connection = struct {
         if (self.closed or self.closing) return;
         self.closing = true;
         self.close_code = code;
-        const level: usize = if (self.application_keys) 3 else if (self.handshake_keys) 2 else 0;
+        const level: usize = if (self.crypto.application_keys) 3 else if (self.crypto.handshake_keys) 2 else 0;
         const ptype: Packet.PacketType = switch (level) {
             0 => .initial,
             2 => .handshake,
